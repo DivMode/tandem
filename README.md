@@ -15,6 +15,19 @@ Sessions are real interactive Claude Code TUIs running inside **tmux** (`ccm-<na
 - **Turn-completion detection** — `send_to_session` holds open until the turn finishes (detected via Claude Code's "esc to interrupt" marker plus screen-stability); if a turn runs long it returns `status:"running"` and you poll `read_session` until `idle:true`.
 - **Autonomous lead/worker relay** — two interactive sessions message each other with no human in the loop: a lead strategist hands one step at a time to a worker and reviews results, relaying until the lead emits `RELAY_DONE` or a turn cap is hit. Steer it live with `inject_to_relay`.
 
+## What this can't do (honest limits)
+
+- **It cannot wake the claude.ai chat tab.** A remote MCP connector is
+  request/response; the stateless Streamable-HTTP transport here holds no
+  standing server→client channel. tandem can **emit** a completion signal
+  (`events.log` + optional webhook) and **ping a device** (your phone, via ntfy),
+  but it cannot make the claude.ai chat send an unprompted reply. See
+  *Completion events / waking the client* below.
+- **The ntfy push reaches a device, not the chat.** It tells *you* the work is
+  done so you can return to the chat — it does not resume the conversation.
+- **It is not a hosted/multi-tenant service.** Each user runs their own local
+  bridge and their own tunnel; there is no shared server.
+
 ## Prerequisites
 
 - **Node ≥ 22.6** (the bridge runs TypeScript directly via native type-stripping)
@@ -133,7 +146,8 @@ can't be woken by a server-initiated signal (see below).
 
 ## Security
 
-Read this before exposing the bridge.
+Read this before exposing the bridge. For the full trust model and how to report
+a vulnerability, see [SECURITY.md](SECURITY.md).
 
 - **The bridge runs real commands on your machine.** Anyone with your tunnel URL **and** token can drive Claude Code sessions in your allowlisted folders. Treat the token like a password.
 - **A token is mandatory.** The server refuses to start without `TANDEM_TOKEN`, and rejects (HTTP 401) every request whose token doesn't match — via `Authorization: Bearer`, `?token=`, or the `/<token>/mcp` path.

@@ -14,6 +14,10 @@ tunnel.url
 tunnel.pid
 connector.json
 
+# Internal autonomous build-loop briefs — not part of the public bridge
+REVIEWER.md
+REVIEW_LOG.md
+
 # Logs
 logs
 *.log

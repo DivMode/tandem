@@ -3,8 +3,25 @@
   "version": "0.1.0",
   "private": false,
   "license": "MIT",
+  "author": "Max Medawar",
   "type": "module",
   "description": "An MCP bridge that lets a chat AI drive interactive Claude Code sessions on your own machine, over your own free Cloudflare quick tunnel.",
+  "keywords": [
+    "mcp",
+    "claude",
+    "claude-code",
+    "tmux",
+    "cloudflare-tunnel",
+    "bridge"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Maxmedawar/tandem.git"
+  },
+  "homepage": "https://github.com/Maxmedawar/tandem#readme",
+  "bugs": {
+    "url": "https://github.com/Maxmedawar/tandem/issues"
+  },
   "engines": {
     "node": ">=22.6"
   },
