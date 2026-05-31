@@ -61,12 +61,14 @@ function buildMcpServer(): McpServer {
 
   server.tool(
     "open_session",
-    `${BLAST_RADIUS}\n\nSpawn a fresh, visible, INTERACTIVE Claude Code session in tmux ("ccm-<name>") in the given working directory; returns { name, cwd, attachHint }. Idempotent. cwd must be on the bridge allowlist.`,
+    `${BLAST_RADIUS}\n\nSpawn a fresh, visible, INTERACTIVE Claude Code session in tmux ("ccm-<name>") in the given working directory; returns { name, cwd, attachHint }. Idempotent. cwd must be on the bridge allowlist. Launches in skip-permissions (autonomous) mode by default so turns don't stall on allow-prompts (set TANDEM_SKIP_PERMISSIONS=0 to disable); the cwd allowlist is enforced BEFORE spawn regardless, so this never widens reachable directories. Optional model/effort are session-scoped (claude --model / --effort).`,
     {
       name: z.string().optional().describe("Short name (A-Z a-z 0-9 . _ -); auto-generated if omitted."),
       cwd: z.string().optional().describe("Working dir; must be on the allowlist (default the configured cwd)."),
+      model: z.string().optional().describe("Session model: alias (default|opus|sonnet|haiku) or a full claude-* id. Session-scoped; unsupported values are rejected (400)."),
+      effort: z.string().optional().describe("Thinking effort: low|medium|high|xhigh|max. Session-scoped; unsupported values are rejected (400)."),
     },
-    async ({ name, cwd }) => call("POST", "/sessions/open", { name, cwd }),
+    async ({ name, cwd, model, effort }) => call("POST", "/sessions/open", { name, cwd, model, effort }),
   );
 
   server.tool(
@@ -78,14 +80,16 @@ function buildMcpServer(): McpServer {
 
   server.tool(
     "send_to_session",
-    `${BLAST_RADIUS}\n\nSend a prompt to a live session and wait (BOUNDED by TANDEM_WAIT_MS) for the turn to finish, returning { status, report, cursor }. If the turn is still running at the cap it returns { status:"running", cursor } — call again to keep waiting (never an infinite internal loop). POLL MODE: omit/empty 'text' to just fetch new output since 'cursor' without sending a new instruction → { text, cursor, idle } (idle:true means the turn is done). When a turn finishes the bridge ALSO emits a completion event (see README "Completion events"), so polling is optional.`,
+    `${BLAST_RADIUS}\n\nSend a prompt to a live session and wait (BOUNDED by TANDEM_WAIT_MS) for the turn to finish, returning { status, report, cursor }. If the turn is still running at the cap it returns { status:"running", cursor } — call again to keep waiting (never an infinite internal loop). POLL MODE: omit/empty 'text' to just fetch new output since 'cursor' without sending a new instruction → { text, cursor, idle } (idle:true means the turn is done). When a turn finishes the bridge ALSO emits a completion event (see README "Completion events"), so polling is optional.\n\nSLASH COMMANDS: any slash command sent as 'text' reaches the TUI verbatim and executes — e.g. "/status", "/mcp", "/model opus", "/goal ...", and custom commands. PER-TURN OVERRIDE: optional model/effort set the model/thinking effort for this turn via in-session controls applied before the prompt (these also persist as the saved default for new sessions; for strictly session-scoped control set them at open_session instead).`,
     {
       name: z.string(),
-      text: z.string().optional().describe("Instruction to send. Omit/empty = poll mode (read new output only)."),
+      text: z.string().optional().describe("Instruction OR a slash command (verbatim). Omit/empty = poll mode (read new output only)."),
       cursor: z.number().int().nonnegative().optional().describe("Poll mode: byte cursor from a previous result; returns only newer output."),
+      model: z.string().optional().describe("Override model for this turn: default|opus|sonnet|haiku or a full claude-* id. Unsupported values rejected (400)."),
+      effort: z.string().optional().describe("Override thinking effort for this turn: low|medium|high|xhigh|max. Unsupported values rejected (400)."),
     },
-    async ({ name, text, cursor }) =>
-      call("POST", `/sessions/${encodeURIComponent(name)}/send`, { text: text ?? "", cursor }),
+    async ({ name, text, cursor, model, effort }) =>
+      call("POST", `/sessions/${encodeURIComponent(name)}/send`, { text: text ?? "", cursor, model, effort }),
   );
 
   server.tool(

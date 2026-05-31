@@ -62,11 +62,62 @@ const SPAWN_WARMUP_MS = 20_000 // max wait for the TUI to become ready on spawn
 const PANE_WIDTH = 200
 const PANE_HEIGHT = 50
 
+/** Marker on the first-run "Bypass Permissions mode" acceptance dialog (distinct
+ *  from the normal "bypass permissions on (shift+tab…)" running footer). */
+const BYPASS_ACCEPT_MARKER = 'yes, i accept'
+
+/**
+ * Skip-permissions ("autonomous"/no-confirm) is the DEFAULT so turns don't stall
+ * on Claude Code's allow-prompts. Disable per host via TANDEM_SKIP_PERMISSIONS set
+ * to one of: 0 / false / no / off.
+ *
+ * SECURITY: this ONLY suppresses Claude Code's in-session tool-permission prompts.
+ * It does NOT touch cwd and CANNOT widen which directories are reachable — the cwd
+ * allowlist is enforced BEFORE spawn (in spawn() below AND again in
+ * router.handleOpen), and the pane is created with `-c <already-validated cwd>`.
+ */
+export function skipPermissionsEnabled(): boolean {
+  const v = (process.env.TANDEM_SKIP_PERMISSIONS ?? '').trim().toLowerCase()
+  return !(v === '0' || v === 'false' || v === 'no' || v === 'off')
+}
+
+/** Accepted `--effort` levels (mirrors `claude --effort`). */
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export type EffortLevel = (typeof EFFORT_LEVELS)[number]
+
+/** Accepted model ALIASES; a full model id (claude-*) is also accepted as-is. */
+export const MODEL_ALIASES = ['default', 'opus', 'sonnet', 'haiku'] as const
+
+/** Validate/normalize a model value; throws a CLEAR error if unsupported (never
+ *  silently ignored). Accepts an alias or a full `claude-*` id (incl. `[1m]`). */
+export function validateModel(model: string): string {
+  const m = model.trim()
+  if (!m) throw new Error('model must be a non-empty string')
+  if ((MODEL_ALIASES as readonly string[]).includes(m.toLowerCase())) return m.toLowerCase()
+  if (/^claude-[a-z0-9._[\]-]+$/i.test(m)) return m
+  throw new Error(
+    `unsupported model: "${model}". Use an alias (${MODEL_ALIASES.join(', ')}) or a full claude-* model id.`,
+  )
+}
+
+/** Validate/normalize an effort value; throws a CLEAR error if unsupported. */
+export function validateEffort(effort: string): EffortLevel {
+  const e = effort.trim().toLowerCase()
+  if ((EFFORT_LEVELS as readonly string[]).includes(e)) return e as EffortLevel
+  throw new Error(`unsupported effort: "${effort}". Use one of: ${EFFORT_LEVELS.join(', ')}.`)
+}
+
 export interface SpawnOptions {
   name: string
   cwd: string
   /** Allowlist roots; cwd is validated against this before spawning. */
   allowlist: string[]
+  /** Optional model alias/id → session-scoped `claude --model`. Validated. */
+  model?: string
+  /** Optional effort level → session-scoped `claude --effort`. Validated. */
+  effort?: string
+  /** Override the skip-permissions default for this spawn (else env/default). */
+  skipPermissions?: boolean
 }
 
 export interface SendResult {
@@ -199,9 +250,20 @@ export class TerminalSession {
     // Truncate any stale transcript so the byte cursor starts clean.
     await (await open(logPath, 'w')).close()
 
+    // Build the `claude` argv. cwd was ALREADY allowlist-checked above (and again
+    // in router.handleOpen) BEFORE we reach here; none of these flags touch cwd, so
+    // skip-permissions/model/effort can never widen which directory is reachable.
+    // Validation (model/effort) runs here, pre-spawn, so a bad value fails clearly
+    // instead of launching a misconfigured session.
+    const skip = opts.skipPermissions ?? skipPermissionsEnabled()
+    const claudeArgv: string[] = ['claude']
+    if (skip) claudeArgv.push('--dangerously-skip-permissions')
+    if (opts.model !== undefined) claudeArgv.push('--model', validateModel(opts.model))
+    if (opts.effort !== undefined) claudeArgv.push('--effort', validateEffort(opts.effort))
+
     // Inject text injection-safe — but here the args are all bridge-controlled
-    // constants, so this is a normal new-session. `claude` is the command run
-    // INSIDE the pane; the cwd is set via -c.
+    // (constants + validated flags), so this is a normal new-session. `claude` is
+    // the command run INSIDE the pane; the cwd is set via -c.
     await tmux([
       'new-session',
       '-d',
@@ -213,7 +275,7 @@ export class TerminalSession {
       String(PANE_HEIGHT),
       '-c',
       cwd,
-      'claude',
+      ...claudeArgv,
     ])
 
     // Attach the append-only transcript pipe. Single-quote the redirect target;
@@ -292,12 +354,27 @@ export class TerminalSession {
   private async warmup(): Promise<void> {
     const deadline = Date.now() + SPAWN_WARMUP_MS
     let trusted = false
+    let bypassAccepted = false
     while (Date.now() < deadline) {
       const pane = await this.capture()
-      if (!trusted && pane.toLowerCase().includes(TRUST_PROMPT_MARKER)) {
+      const lower = pane.toLowerCase()
+      if (!trusted && lower.includes(TRUST_PROMPT_MARKER)) {
         // Confirm "Yes, I trust this folder" (the highlighted default) with Enter.
         await tmux(['send-keys', '-t', this.tmuxTarget, 'Enter'])
         trusted = true
+        await sleep(POLL_MS)
+        continue
+      }
+      // First-run "Bypass Permissions mode" acceptance dialog (only when
+      // --dangerously-skip-permissions is used AND the host hasn't accepted it
+      // before / lacks settings.skipDangerousModePermissionPrompt). Best-effort:
+      // the affirmative ("Yes, I accept") sits below the default "No, exit", so
+      // move down once and confirm. Hosts that auto-skip this never hit it.
+      if (!bypassAccepted && lower.includes(BYPASS_ACCEPT_MARKER)) {
+        await tmux(['send-keys', '-t', this.tmuxTarget, 'Down'])
+        await sleep(150)
+        await tmux(['send-keys', '-t', this.tmuxTarget, 'Enter'])
+        bypassAccepted = true
         await sleep(POLL_MS)
         continue
       }
@@ -391,6 +468,44 @@ export class TerminalSession {
       }
       await sleep(POLL_MS)
     }
+  }
+
+  /**
+   * Apply per-turn model/effort overrides to this LIVE session via its in-session
+   * slash controls (`/effort <v>`, `/model <v>`), submitted as a preamble BEFORE
+   * the next prompt. Values are validated (throws clearly on unsupported). Returns
+   * the controls applied (e.g. ["effort=high","model=opus"]).
+   *
+   * NOTE (Claude Code behavior): these in-session controls also persist as the
+   * saved default for NEW sessions. For strictly session-scoped control with no
+   * global side effect, set model/effort at OPEN time instead — they map to the
+   * session-scoped `claude --model` / `--effort` flags.
+   */
+  async applyControls(controls: { model?: string; effort?: string }): Promise<string[]> {
+    const applied: string[] = []
+    if (controls.effort !== undefined) {
+      const e = validateEffort(controls.effort)
+      await this.submitControl(`/effort ${e}`)
+      applied.push(`effort=${e}`)
+    }
+    if (controls.model !== undefined) {
+      const m = validateModel(controls.model)
+      await this.submitControl(`/model ${m}`)
+      applied.push(`model=${m}`)
+    }
+    return applied
+  }
+
+  /**
+   * Submit a single slash control line (e.g. "/effort high") and let the TUI apply
+   * it. A slash control is a UI action, not a model turn — it doesn't raise the
+   * "esc to interrupt" marker — so we just inject, Enter, and pause briefly to let
+   * the autocomplete's exact match resolve and the setting take effect.
+   */
+  private async submitControl(line: string): Promise<void> {
+    await this.injectMultiline(line)
+    await tmux(['send-keys', '-t', this.tmuxTarget, 'Enter'])
+    await sleep(POLL_MS)
   }
 
   /** Current transcript byte length = the read cursor. */

@@ -50,6 +50,7 @@ All config lives in `.env` (copied from `.env.example`, git-ignored):
 | `TANDEM_TOKEN` | ✅ | Shared secret; every request must present it. |
 | `TANDEM_CWD_ALLOWLIST` | recommended | Colon-separated absolute paths the bridge may operate in. If empty, defaults to `$HOME` and its immediate child dirs — narrow this. |
 | `TANDEM_DEFAULT_CWD` | — | Default working dir when a call omits `cwd` (default `$HOME`). |
+| `TANDEM_SKIP_PERMISSIONS` | — | Spawn `claude` in skip-permissions (autonomous) mode so turns don't stall on allow-prompts. **Default on**; set `0`/`false`/`no`/`off` to require normal prompts. Only suppresses in-session tool prompts — the cwd allowlist is still enforced **before** every spawn, so it never widens reachable dirs. |
 | `TANDEM_HOST` / `TANDEM_PORT` | — | Local bind address (the tunnel points here). Default `127.0.0.1:8787`. |
 
 Runtime artifacts (session transcripts, audit log) are written to `~/.tandem/`.
@@ -58,14 +59,38 @@ Runtime artifacts (session transcripts, audit log) are written to `~/.tandem/`.
 
 Six tools:
 
-- `open_session` — spawn an interactive session in an allowlisted dir.
+- `open_session` — spawn an interactive session in an allowlisted dir. Skip-permissions (autonomous) by default; optional `model` / `effort` set the session model and thinking effort (session-scoped, via `claude --model` / `--effort`).
 - `list_sessions` — list live + recent sessions.
-- `send_to_session` — send a prompt and wait (bounded by `TANDEM_WAIT_MS`) for the turn; returns the report, or `status:"running"` to call again. **Omit `text` for poll mode** (fetch new output since `cursor` without sending) — this replaces the old `read_session`.
+- `send_to_session` — send a prompt and wait (bounded by `TANDEM_WAIT_MS`) for the turn; returns the report, or `status:"running"` to call again. **Omit `text` for poll mode** (fetch new output since `cursor` without sending) — this replaces the old `read_session`. Accepts **slash commands** verbatim (see below) and optional per-turn `model` / `effort` overrides.
 - `interrupt_session` — Ctrl-C the current turn, keep the session.
 - `close_session` — kill the session.
 - `relay` — one tool with `action: start | read | inject | stop` for the autonomous lead/worker relay (replaces the old `start_relay` / `read_relay` / `inject_to_relay` / `stop_relay`).
 
 Consolidated from 10 → 6; no capability was removed (the underlying routes are unchanged and still reachable).
+
+## Autonomy & control
+
+**Skip-permissions by default.** Spawned sessions launch with `--dangerously-skip-permissions` so autonomous turns don't stall on allow-prompts. Disable per host with `TANDEM_SKIP_PERMISSIONS=0`. This is contained: it only suppresses Claude Code's in-session tool prompts. The **cwd allowlist is enforced before every spawn** (in `open_session`/`relay` *and* again inside the engine's `spawn`), and the pane is created in the already-validated cwd — so skipping prompts can never widen which directories are reachable. (On a host that has never accepted bypass mode and lacks `skipDangerousModePermissionPrompt`, Claude Code shows a one-time acceptance dialog; the engine auto-accepts it on warmup.)
+
+**Model & effort.** Set them per session at open time, or override per turn on send:
+
+| Param | Accepted values |
+|---|---|
+| `model` | alias `default` / `opus` / `sonnet` / `haiku`, or a full `claude-*` id (e.g. `claude-opus-4-8`) |
+| `effort` | `low` / `medium` / `high` / `xhigh` / `max` |
+
+- **`open_session{ model?, effort? }`** → session-scoped `claude --model` / `--effort` flags (no global side effect).
+- **`send_to_session{ model?, effort? }`** → applied to that turn via in-session `/model` / `/effort` controls (these also persist as Claude Code's saved default for new sessions — prefer open-time for strictly session-scoped control).
+- Unsupported values are **rejected with a clear 400**, never silently ignored.
+
+**Slash-command passthrough.** Any slash command sent as `send_to_session`'s `text` reaches the TUI verbatim and executes — the autocomplete's exact match resolves on the submit. Examples:
+
+```jsonc
+send_to_session { "name": "s1", "text": "/status" }     // session/model/account status
+send_to_session { "name": "s1", "text": "/mcp" }        // MCP server status
+send_to_session { "name": "s1", "text": "/model opus" } // switch model
+send_to_session { "name": "s1", "text": "/goal ship the parser" } // custom command
+```
 
 ## Completion events / waking the client
 
@@ -90,7 +115,7 @@ Read this before exposing the bridge.
 
 - **The bridge runs real commands on your machine.** Anyone with your tunnel URL **and** token can drive Claude Code sessions in your allowlisted folders. Treat the token like a password.
 - **A token is mandatory.** The server refuses to start without `TANDEM_TOKEN`, and rejects (HTTP 401) every request whose token doesn't match — via `Authorization: Bearer`, `?token=`, or the `/<token>/mcp` path.
-- **Directory allowlist.** Sessions and relays can only be opened inside the allowlist. Paths are realpath-canonicalized and boundary-checked, so `../` traversal, symlink escapes, and prefix look-alikes (`/code-evil` vs `/code`) are rejected. Keep the list as narrow as possible.
+- **Directory allowlist.** Sessions and relays can only be opened inside the allowlist. Paths are realpath-canonicalized and boundary-checked, so `../` traversal, symlink escapes, and prefix look-alikes (`/code-evil` vs `/code`) are rejected. Keep the list as narrow as possible. **Skip-permissions does not relax this** — the allowlist check runs before spawn whether or not prompts are skipped, and a cwd outside it still returns `403`.
 - **Only `ccm-*` tmux sessions are drivable**, and relay-owned sessions are isolated from the generic session tools. Every spawn/send/interrupt/close/relay action is appended to `~/.tandem/bridge.log`.
 - **You run your own tunnel.** The quick tunnel is started locally by you and is anonymous; nothing routes through the author's machine or cloud. Stop the tunnel to take the bridge offline instantly.
 - **No secrets in the repo.** Tokens and URLs come only from `.env` / generated runtime files, all git-ignored.

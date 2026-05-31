@@ -31,7 +31,7 @@
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { TerminalSession } from './terminal-session.ts'
+import { TerminalSession, validateModel, validateEffort } from './terminal-session.ts'
 import {
   buildAllowlist,
   isCwdAllowed,
@@ -204,6 +204,17 @@ async function handleOpen(req: RpcRequest): Promise<RpcResult> {
   }
   const cwd = safeResolve(cwdInput)
 
+  // Per-session model/effort (optional). Validate up front so a bad value fails as
+  // a clean 400 rather than a generic 500 from spawn.
+  let model: string | undefined
+  let effort: string | undefined
+  try {
+    if (req.body['model'] !== undefined) model = validateModel(String(req.body['model']))
+    if (req.body['effort'] !== undefined) effort = validateEffort(String(req.body['effort']))
+  } catch (e) {
+    return err(400, e instanceof Error ? e.message : String(e))
+  }
+
   // Idempotent: reuse a session already live under this name.
   const existing = getLive(name)
   if (existing) {
@@ -223,9 +234,9 @@ async function handleOpen(req: RpcRequest): Promise<RpcResult> {
   }
 
   try {
-    const session = await TerminalSession.spawn({ name, cwd, allowlist: ALLOWLIST })
+    const session = await TerminalSession.spawn({ name, cwd, allowlist: ALLOWLIST, model, effort })
     registerLive(session)
-    audit({ route: 'POST /sessions/open', name: session.name, cwd })
+    audit({ route: 'POST /sessions/open', name: session.name, cwd, model, effort })
     return ok({ name: session.name, cwd: session.cwd, attachHint: session.attachHint() })
   } catch (e) {
     return err(500, `failed to open session: ${e instanceof Error ? e.message : String(e)}`)
@@ -239,15 +250,30 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
 
   // POLL MODE: empty text means "don't send a new instruction, just fetch new
   // output since the cursor". This folds the former read_session into this one
-  // tool so the normal path never needs a separate poll tool.
+  // tool so the normal path never needs a separate poll tool. (Per-send
+  // model/effort overrides are ignored here — there is no turn to apply them to.)
   if (!text) {
     const cursor = req.body['cursor'] !== undefined ? Number(req.body['cursor']) : 0
     return readSession(name, cursor)
   }
 
-  audit({ route: 'POST /sessions/:name/send', name, cwd: session.cwd, text })
+  // Optional per-send model/effort override. Validate up front → clean 400.
+  let model: string | undefined
+  let effort: string | undefined
+  try {
+    if (req.body['model'] !== undefined) model = validateModel(String(req.body['model']))
+    if (req.body['effort'] !== undefined) effort = validateEffort(String(req.body['effort']))
+  } catch (e) {
+    return err(400, e instanceof Error ? e.message : String(e))
+  }
+
+  audit({ route: 'POST /sessions/:name/send', name, cwd: session.cwd, text, model, effort })
 
   try {
+    // Apply per-turn controls (if any) as an in-session slash preamble first.
+    if (model !== undefined || effort !== undefined) {
+      await session.applyControls({ model, effort })
+    }
     // session.send() is already BOUNDED by the engine's soft cap (TANDEM_WAIT_MS):
     // it returns status:'done' with the report once idle, or status:'running' at
     // the cap so the caller can call again — never an infinite internal loop.
