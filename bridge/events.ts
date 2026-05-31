@@ -54,6 +54,42 @@ export function summarize(s: string, max = 200): string {
   return t.length > max ? t.slice(0, max - 3) + '...' : t
 }
 
+/** A ready-to-send ntfy notification (pure; no I/O — unit-testable). */
+export interface NtfyPayload {
+  title: string
+  body: string
+  priority: string
+  tags: string
+}
+
+/**
+ * Build the ntfy notification for an event. A normal completion is a quiet
+ * "<id> done"; an escalation (the manager is stuck and needs the human) is an
+ * URGENT "<id> NEEDS YOU" carrying the blocking reason, so the two are
+ * unmistakable on the phone. Pure: returns the payload, sends nothing.
+ */
+export function ntfyPayload(
+  event: CompletionEvent,
+  opts?: { escalation?: boolean; reason?: string },
+): NtfyPayload {
+  if (opts?.escalation) {
+    const reason = (opts.reason ?? event.reason ?? event.summary ?? '').trim()
+    return {
+      title: `tandem: ${event.id} NEEDS YOU`,
+      body: summarize(`${event.type} ${event.id} is BLOCKED — ${reason || 'needs your input'}`),
+      priority: 'urgent',
+      tags: 'warning,sos',
+    }
+  }
+  return {
+    // One-line human summary: id, status, cursor, then the short summary text.
+    title: `tandem: ${event.id} done`,
+    body: summarize(`${event.type} ${event.id} ${event.status} @${event.cursor} — ${event.summary}`),
+    priority: 'default',
+    tags: 'white_check_mark',
+  }
+}
+
 /**
  * Push a phone notification via ntfy (https://ntfy.sh or self-hosted). Disabled
  * unless TANDEM_NTFY_TOPIC is set. Fire-and-forget: a network failure is caught
@@ -61,28 +97,19 @@ export function summarize(s: string, max = 200): string {
  *
  * NOTE: this reaches a DEVICE (your phone/the ntfy app), not the chat client.
  */
-function notifyNtfy(event: CompletionEvent): void {
+function notifyNtfy(event: CompletionEvent, opts?: { escalation?: boolean; reason?: string }): void {
   const topic = process.env.TANDEM_NTFY_TOPIC
   if (!topic) return // ntfy off unless a topic is configured
 
   const server = (process.env.TANDEM_NTFY_SERVER || 'https://ntfy.sh').replace(/\/+$/, '')
   const url = `${server}/${encodeURIComponent(topic)}`
-
-  // One-line human summary: id, status, cursor, then the short summary text.
-  const body = summarize(
-    `${event.type} ${event.id} ${event.status} @${event.cursor} — ${event.summary}`,
-  )
-  // Header must be ASCII/single-line; the id matches NAME_RE so this is safe.
-  const title = `tandem: ${event.id} done`
+  const { title, body, priority, tags } = ntfyPayload(event, opts)
 
   try {
     void fetch(url, {
       method: 'POST',
-      headers: {
-        Title: title,
-        Priority: 'default',
-        Tags: 'white_check_mark',
-      },
+      // Headers must be ASCII/single-line; the id matches NAME_RE so this is safe.
+      headers: { Title: title, Priority: priority, Tags: tags },
       body,
     }).catch((e) => logBridge({ event: 'ntfy', ok: false, topic, error: String(e) }))
   } catch (e) {
@@ -122,4 +149,41 @@ export function emitCompletion(ev: Omit<CompletionEvent, 'status' | 'ts'>): void
 
   // 3) Optional phone push via ntfy (env-gated, fire-and-forget).
   notifyNtfy(event)
+}
+
+/**
+ * Emit an ESCALATION: the manager is stuck and needs the human. Same sinks as
+ * emitCompletion (durable log + ntfy), but the log line is tagged
+ * `event:"escalation"` and the ntfy push is URGENT and carries the blocking
+ * reason. This is the one place a device-push is the right primitive: the human
+ * is the only node at the top that can actually be woken. Never throws/blocks.
+ */
+export function emitEscalation(ev: Omit<CompletionEvent, 'status'> & { reason: string }): void {
+  const event = { ts: new Date().toISOString(), status: 'done' as const, ...ev }
+  const line = JSON.stringify({ event: 'escalation', ...event }) + '\n'
+
+  // 1) Durable local log (tagged so watchers can distinguish from completions).
+  try {
+    mkdirSync(EVENTS_DIR, { recursive: true })
+    appendFileSync(EVENTS_LOG, line)
+  } catch (e) {
+    process.stderr.write(`[events] escalation log write failed: ${e instanceof Error ? e.message : String(e)}\n`)
+  }
+
+  // 2) Optional outbound webhook (same raw JSON line).
+  const url = process.env.TANDEM_DONE_WEBHOOK
+  if (url) {
+    try {
+      void fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: line,
+      }).catch((e) => process.stderr.write(`[events] webhook POST failed: ${e}\n`))
+    } catch (e) {
+      process.stderr.write(`[events] webhook error: ${e instanceof Error ? e.message : String(e)}\n`)
+    }
+  }
+
+  // 3) Urgent phone push via ntfy (env-gated, fire-and-forget).
+  notifyNtfy(event, { escalation: true, reason: ev.reason })
 }

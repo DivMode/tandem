@@ -32,7 +32,15 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { TerminalSession } from './terminal-session.ts'
-import { emitCompletion } from './events.ts'
+import { emitCompletion, emitEscalation } from './events.ts'
+import {
+  managerDir,
+  initManagerMemory,
+  appendDecision,
+  updateState,
+  regroundPreamble,
+  parseBlocked,
+} from './manager.ts'
 
 const HOME = homedir()
 const RELAY_DIR = join(HOME, '.tandem', 'relay')
@@ -102,6 +110,8 @@ interface RelayLoop {
   lead: TerminalSession
   worker: TerminalSession
   logPath: string
+  /** disk-backed manager memory dir (MISSION/STATE/LOG) — survives restarts. */
+  memDir: string
   running: boolean
   /** Set by inject(): overrides the next message fed to the lead. */
   pendingInjection?: string
@@ -194,6 +204,11 @@ export async function startRelay(opts: StartRelayOptions): Promise<StartRelayRes
     throw e
   }
 
+  // Seed the manager's disk-backed memory (mission/state/log) so the loop is
+  // resumable and can escalate; failures here never block the loop.
+  const memDir = managerDir(loopId)
+  initManagerMemory(memDir, { goal: opts.goal, context: opts.context })
+
   const loop: RelayLoop = {
     loopId,
     leadName: lead.name,
@@ -201,6 +216,7 @@ export async function startRelay(opts: StartRelayOptions): Promise<StartRelayRes
     lead,
     worker,
     logPath: join(RELAY_DIR, `${loopId}.log`),
+    memDir,
     running: true,
     deadline: Date.now() + wallClockMs,
     finished: Promise.resolve(),
@@ -268,6 +284,8 @@ async function runLoop(
 ): Promise<void> {
   let nextLeadMessage = leadSeed(goal, context)
   let endReason = 'completed'
+  // Set when the lead emits the BLOCKED sentinel — drives escalation in finally.
+  let blockedReason: string | null = null
 
   try {
     for (let turn = 1; turn <= maxTurns; turn++) {
@@ -286,9 +304,15 @@ async function runLoop(
         loop.pendingInjection = undefined
       }
 
-      // --- LEAD turn: produce one instruction (or DONE) ---
+      // Re-ground the lead from disk every turn (mission + recent decisions), so
+      // it stays on-mission across context compaction, and record the turn.
+      updateState(loop.memDir, { turn })
+      const preamble = regroundPreamble(loop.memDir)
+      const leadMessage = preamble ? `${preamble}\n${nextLeadMessage}` : nextLeadMessage
+
+      // --- LEAD turn: produce one instruction (or DONE/BLOCKED) ---
       transcript(loop, 'SYS', `--- turn ${turn}/${maxTurns} ---`)
-      const leadRes = await sendRaced(loop, loop.lead, nextLeadMessage)
+      const leadRes = await sendRaced(loop, loop.lead, leadMessage)
       if (leadRes.kind === 'deadline') {
         endReason = 'wall-clock cap reached'
         break
@@ -300,10 +324,28 @@ async function runLoop(
       const leadInstruction = leadRes.report
       transcript(loop, 'LEAD', leadInstruction)
 
-      if (isDone(leadInstruction)) {
-        endReason = 'lead reported DONE'
+      // The manager is stuck and wants the human — escalate, don't burn turns.
+      // Checked BEFORE DONE so "BLOCKED" is never misread as completion.
+      const blk = parseBlocked(leadInstruction)
+      if (blk !== null) {
+        blockedReason = blk || 'manager requested human input'
+        endReason = `blocked: ${blockedReason}`
+        appendDecision(loop.memDir, `turn ${turn}: BLOCKED — ${blockedReason}`)
+        updateState(loop.memDir, { status: 'blocked', blockedReason })
         break
       }
+
+      if (isDone(leadInstruction)) {
+        endReason = 'lead reported DONE'
+        appendDecision(loop.memDir, `turn ${turn}: lead reported DONE`)
+        updateState(loop.memDir, { status: 'done', task: 'complete' })
+        break
+      }
+
+      // Record the instruction as this turn's decision (one tidy line).
+      const oneLine = leadInstruction.replace(/\s+/g, ' ').trim().slice(0, 160)
+      appendDecision(loop.memDir, `turn ${turn}: instructed worker — ${oneLine}`)
+      updateState(loop.memDir, { task: oneLine })
 
       if (!loop.running) {
         endReason = 'stopped'
@@ -332,14 +374,20 @@ async function runLoop(
   } finally {
     loop.running = false
     transcript(loop, 'SYS', `relay finished · reason: ${endReason}`)
-    // Relay reached done — EMIT a completion event (push), not just stop quietly.
+    // Relay reached an end — EMIT (push), not just stop quietly.
     let cursor = 0
     try {
       cursor = statSync(loop.logPath).size
     } catch {
       /* log may not exist yet */
     }
-    emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay finished: ${endReason}`, reason: endReason })
+    if (blockedReason !== null) {
+      // The manager is stuck: escalate to the human (urgent push). This is the
+      // terminal event for a blocked run — no duplicate completion ping.
+      emitEscalation({ type: 'relay', id: loop.loopId, cursor, summary: `relay blocked: ${blockedReason}`, reason: blockedReason })
+    } else {
+      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay finished: ${endReason}`, reason: endReason })
+    }
     // Tear the tmux sessions down so they don't linger.
     await loop.lead.close().catch(() => {})
     await loop.worker.close().catch(() => {})

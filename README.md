@@ -142,6 +142,30 @@ bridge keeps running.
 *you* the work is done so you can go back to the chat; the chat client still
 can't be woken by a server-initiated signal (see below).
 
+### Persistent manager: disk-backed memory + escalation
+
+The autonomous `relay` runs a lead ("manager") session that drives a worker. To
+make that manager **resumable** — surviving context compaction and bridge
+restarts — its working state lives on disk, not just in a context window, under
+`~/.tandem/manager/<loopId>/`:
+
+- `MISSION.md` — the standing definition of "done" (written once, re-read each turn).
+- `STATE.json` — the working set: `status` (`running` / `blocked` / `done`), `turn`, current `task`, and `blockedReason`.
+- `LOG.md` — an append-only decision log, one line per turn.
+
+Each turn the manager is **re-grounded** from these files (mission + recent
+decisions are re-fed into the lead), so continuity comes from re-reading disk
+rather than from a process "staying alive."
+
+**Escalation.** When the manager genuinely can't proceed without you — repeated
+worker failure, a call that needs your authority, or an irreversible action — it
+emits `BLOCKED: <reason>` on its own line. tandem then fires an **urgent** ntfy
+push titled `tandem: <id> NEEDS YOU` (priority `urgent`, the blocking reason in
+the body) and writes an `event:"escalation"` line to `events.log` — instead of
+silently burning turns until a cap. This is the one place a device-push is the
+right primitive: **you** are the only node at the top that can actually be woken.
+Normal completions are unchanged (quiet `done` push); escalation is the loud one.
+
 **The missing piece (client side, out of scope / not under our control):** turning a completion event into an *unprompted* chat reply requires the chat client to be woken by it. Today **claude.ai chat cannot be woken this way** — a remote MCP connector is request/response, and the stateless Streamable-HTTP transport here holds no standing server→client channel to deliver a server-initiated notification to the chat UI. So tandem gives you the reliable signal (`events.log` + webhook); bridging that into an automatic message would need a client that polls `events.log`/the webhook and re-prompts the model — which only works in a harness you control, not in claude.ai chat as it exists now.
 
 ## Security
