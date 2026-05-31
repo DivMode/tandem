@@ -12,6 +12,11 @@
  *   - ?token=<token>                  (query string)
  *   - /<token>/mcp                    (path prefix, handy for connector configs)
  * Any request without a matching token gets 401 and never reaches a tool.
+ *
+ * Tool surface is consolidated (phase 3): 6 tools. read_session is folded into
+ * send_to_session (empty text = poll mode); the four relay tools are folded into
+ * one `relay` tool with an `action`. The underlying routes are unchanged, so the
+ * full capability set remains reachable.
  */
 import http from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -52,14 +57,7 @@ async function call(
 function buildMcpServer(): McpServer {
   const server = new McpServer({ name: "tandem", version: "0.1.0" });
 
-  /* ---- drive a local interactive Claude Code session ---- */
-
-  server.tool(
-    "list_sessions",
-    `${BLAST_RADIUS}\n\nList Claude Code sessions: LIVE tmux sessions the bridge is driving (with a "tmux attach -t ccm-<name>" hint) first, then recent local history. Read-only.`,
-    { limit: z.number().int().positive().optional(), project: z.string().optional() },
-    async ({ limit, project }) => call("GET", "/sessions", {}, q({ limit, project }).slice(1)),
-  );
+  /* ---- sessions ---- */
 
   server.tool(
     "open_session",
@@ -72,23 +70,22 @@ function buildMcpServer(): McpServer {
   );
 
   server.tool(
-    "send_to_session",
-    `${BLAST_RADIUS}\n\nType a prompt into a live session and wait (held open) for the turn to finish, returning { status, report, cursor }. If it runs past the window the bridge returns { status: "running", cursor } — then poll read_session with that cursor until idle:true.`,
-    {
-      name: z.string(),
-      text: z.string(),
-      waitForTurn: z.boolean().optional(),
-    },
-    async ({ name, text, waitForTurn }) =>
-      call("POST", `/sessions/${encodeURIComponent(name)}/send`, { text, waitForTurn }),
+    "list_sessions",
+    `${BLAST_RADIUS}\n\nList Claude Code sessions: LIVE tmux sessions the bridge is driving (with a "tmux attach -t ccm-<name>" hint) first, then recent local history. Read-only.`,
+    { limit: z.number().int().positive().optional(), project: z.string().optional() },
+    async ({ limit, project }) => call("GET", "/sessions", {}, q({ limit, project }).slice(1)),
   );
 
   server.tool(
-    "read_session",
-    `${BLAST_RADIUS}\n\nRead a live session's transcript WITHOUT sending anything (the poll primitive). Returns { text, cursor, idle }: idle:true means the turn is DONE. Pass the returned cursor back as sinceCursor to page incrementally.`,
-    { name: z.string(), sinceCursor: z.number().int().nonnegative().optional() },
-    async ({ name, sinceCursor }) =>
-      call("GET", `/sessions/${encodeURIComponent(name)}/read`, {}, q({ cursor: sinceCursor }).slice(1)),
+    "send_to_session",
+    `${BLAST_RADIUS}\n\nSend a prompt to a live session and wait (BOUNDED by TANDEM_WAIT_MS) for the turn to finish, returning { status, report, cursor }. If the turn is still running at the cap it returns { status:"running", cursor } — call again to keep waiting (never an infinite internal loop). POLL MODE: omit/empty 'text' to just fetch new output since 'cursor' without sending a new instruction → { text, cursor, idle } (idle:true means the turn is done). When a turn finishes the bridge ALSO emits a completion event (see README "Completion events"), so polling is optional.`,
+    {
+      name: z.string(),
+      text: z.string().optional().describe("Instruction to send. Omit/empty = poll mode (read new output only)."),
+      cursor: z.number().int().nonnegative().optional().describe("Poll mode: byte cursor from a previous result; returns only newer output."),
+    },
+    async ({ name, text, cursor }) =>
+      call("POST", `/sessions/${encodeURIComponent(name)}/send`, { text: text ?? "", cursor }),
   );
 
   server.tool(
@@ -105,40 +102,33 @@ function buildMcpServer(): McpServer {
     async ({ name }) => call("POST", `/sessions/${encodeURIComponent(name)}/close`),
   );
 
-  /* ---- zero-API two-session autonomous relay ---- */
+  /* ---- relay (one tool, four actions) ---- */
 
   server.tool(
-    "start_relay",
-    `${BLAST_RADIUS}\n\nKick off a NO-HUMAN-IN-THE-LOOP relay: TWO interactive Claude Code sessions (a "lead" strategist/reviewer and a "worker" that does the hands-on work) message each other until the lead says RELAY_DONE, a max-turn cap is hit, or it is stopped. Returns { status:"running", loopId, leadName, workerName, cursor }. Watch with read_relay; steer with inject_to_relay; halt with stop_relay.`,
+    "relay",
+    `${BLAST_RADIUS}\n\nControl the autonomous, NO-HUMAN-IN-THE-LOOP lead/worker relay (two interactive Claude Code sessions that message each other until the lead says RELAY_DONE, a max-turn cap is hit, or it is stopped). action:\n- "start": begin a relay — needs { goal, cwd?, maxTurns? } → { status:"running", loopId, leadName, workerName }\n- "read": fetch the lead<->worker transcript — needs { loopId, cursor? } → { text, cursor, running } (running:false = finished)\n- "inject": steer the lead mid-run — needs { loopId, message }\n- "stop": halt promptly — needs { loopId }\nWhen a relay finishes the bridge emits a completion event (see README "Completion events").`,
     {
-      goal: z.string(),
-      cwd: z.string().optional(),
-      maxTurns: z.number().int().positive().optional(),
+      action: z.enum(["start", "read", "inject", "stop"]),
+      goal: z.string().optional().describe('action=start: the relay objective.'),
+      cwd: z.string().optional().describe('action=start: working dir (allowlisted).'),
+      maxTurns: z.number().int().positive().optional().describe('action=start: hard cap on turns.'),
+      loopId: z.string().optional().describe('action=read|inject|stop: the loop id from start.'),
+      cursor: z.number().int().nonnegative().optional().describe('action=read: byte cursor to page from.'),
+      message: z.string().optional().describe('action=inject: message to deliver to the lead.'),
     },
-    async ({ goal, cwd, maxTurns }) => call("POST", "/relay/start", { goal, cwd, maxTurns }),
-  );
-
-  server.tool(
-    "read_relay",
-    `${BLAST_RADIUS}\n\nRead the lead<->worker conversation WITHOUT sending anything. Returns { text, cursor, running }: running:false means finished. Pass the cursor back as sinceCursor to page incrementally.`,
-    { loopId: z.string(), sinceCursor: z.number().int().nonnegative().optional() },
-    async ({ loopId, sinceCursor }) =>
-      call("GET", `/relay/${encodeURIComponent(loopId)}/read`, {}, q({ cursor: sinceCursor }).slice(1)),
-  );
-
-  server.tool(
-    "inject_to_relay",
-    `${BLAST_RADIUS}\n\nBarge in on a running relay: deliver a message to the lead (course-correct, add a constraint, answer a question) that it sees at the top of its next turn. The loop keeps running. Returns { ok }.`,
-    { loopId: z.string(), message: z.string() },
-    async ({ loopId, message }) =>
-      call("POST", `/relay/${encodeURIComponent(loopId)}/inject`, { message }),
-  );
-
-  server.tool(
-    "stop_relay",
-    `${BLAST_RADIUS}\n\nHalt a running relay loop and interrupt the session mid-turn so it stops promptly. Returns { ok, running }.`,
-    { loopId: z.string() },
-    async ({ loopId }) => call("POST", `/relay/${encodeURIComponent(loopId)}/stop`),
+    async ({ action, goal, cwd, maxTurns, loopId, cursor, message }) => {
+      const id = encodeURIComponent(loopId ?? "");
+      switch (action) {
+        case "start":
+          return call("POST", "/relay/start", { goal, cwd, maxTurns });
+        case "read":
+          return call("GET", `/relay/${id}/read`, {}, q({ cursor }).slice(1));
+        case "inject":
+          return call("POST", `/relay/${id}/inject`, { message });
+        case "stop":
+          return call("POST", `/relay/${id}/stop`);
+      }
+    },
   );
 
   return server;
@@ -168,7 +158,7 @@ export async function startServer(opts: ServerOpts): Promise<void> {
   const allowlist = getAllowlist();
   if (allowlist.length === 0) {
     console.error(
-      "⚠  cwd allowlist is empty — open_session/start_relay will refuse every directory.\n" +
+      "⚠  cwd allowlist is empty — open_session/relay will refuse every directory.\n" +
         "   Set TANDEM_CWD_ALLOWLIST to the folders the bridge may work in.",
     );
   }

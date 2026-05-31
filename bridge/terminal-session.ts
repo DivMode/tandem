@@ -52,7 +52,11 @@ const TRUST_PROMPT_MARKER = 'trust this folder'
 
 const POLL_MS = 750
 const IDLE_STABLE_POLLS = 3 // consecutive stable polls required to call it idle
-const SEND_SOFT_CAP_MS = 25_000 // below the 30s tunnel frame cap -> status:'running'
+// Soft cap for a single send() wait, configurable via env TANDEM_WAIT_MS (ms).
+// At the cap, send() returns status:'running' so the caller can call again — the
+// proven idle/done detection below is unchanged; only this bound is tunable.
+const SEND_SOFT_CAP_MS =
+  Number(process.env.TANDEM_WAIT_MS) > 0 ? Number(process.env.TANDEM_WAIT_MS) : 25_000
 const SEND_HARD_CAP_MS = 180_000 // a send() can never hang past this
 const SPAWN_WARMUP_MS = 20_000 // max wait for the TUI to become ready on spawn
 const PANE_WIDTH = 200

@@ -56,7 +56,33 @@ Runtime artifacts (session transcripts, audit log) are written to `~/.tandem/`.
 
 ## Tools
 
-`open_session`, `list_sessions`, `send_to_session`, `read_session`, `interrupt_session`, `close_session`, `start_relay`, `read_relay`, `inject_to_relay`, `stop_relay`.
+Six tools:
+
+- `open_session` — spawn an interactive session in an allowlisted dir.
+- `list_sessions` — list live + recent sessions.
+- `send_to_session` — send a prompt and wait (bounded by `TANDEM_WAIT_MS`) for the turn; returns the report, or `status:"running"` to call again. **Omit `text` for poll mode** (fetch new output since `cursor` without sending) — this replaces the old `read_session`.
+- `interrupt_session` — Ctrl-C the current turn, keep the session.
+- `close_session` — kill the session.
+- `relay` — one tool with `action: start | read | inject | stop` for the autonomous lead/worker relay (replaces the old `start_relay` / `read_relay` / `inject_to_relay` / `stop_relay`).
+
+Consolidated from 10 → 6; no capability was removed (the underlying routes are unchanged and still reachable).
+
+## Completion events / waking the client
+
+tandem **emits** a completion event the moment a turn or relay finishes — you don't have to keep polling to learn that work is done. Detection reuses the engine's proven idle/done logic (the "esc to interrupt" marker + screen-stability for turns; `RELAY_DONE` / cap for relays).
+
+**What is emitted** — a JSON object:
+
+```json
+{ "ts": "…", "type": "session", "status": "done", "id": "<session|loopId>", "cursor": 12345, "summary": "…", "reason": "…" }
+```
+
+**Where it goes (the EMIT side, which this repo implements):**
+
+1. **`~/.tandem/events.log`** — one JSON line is appended per completion. Durable; `tail -f` it or have any local process watch it.
+2. **`TANDEM_DONE_WEBHOOK`** — if set, the same JSON is `POST`ed to that URL (fire-and-forget, no deps). Point it at any local listener, notifier, or automation.
+
+**The missing piece (client side, out of scope / not under our control):** turning a completion event into an *unprompted* chat reply requires the chat client to be woken by it. Today **claude.ai chat cannot be woken this way** — a remote MCP connector is request/response, and the stateless Streamable-HTTP transport here holds no standing server→client channel to deliver a server-initiated notification to the chat UI. So tandem gives you the reliable signal (`events.log` + webhook); bridging that into an automatic message would need a client that polls `events.log`/the webhook and re-prompts the model — which only works in a harness you control, not in claude.ai chat as it exists now.
 
 ## Security
 

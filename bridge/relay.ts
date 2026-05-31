@@ -32,9 +32,10 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { TerminalSession } from './terminal-session.ts'
+import { emitCompletion } from './events.ts'
 
 const HOME = homedir()
-const RELAY_DIR = join(HOME, 'cloud-code-mcp', 'relay')
+const RELAY_DIR = join(HOME, '.tandem', 'relay')
 
 /** Defaults + hard ceilings. Client-supplied values are clamped to these. */
 const DEFAULT_MAX_TURNS = 24
@@ -331,6 +332,14 @@ async function runLoop(
   } finally {
     loop.running = false
     transcript(loop, 'SYS', `relay finished · reason: ${endReason}`)
+    // Relay reached done — EMIT a completion event (push), not just stop quietly.
+    let cursor = 0
+    try {
+      cursor = statSync(loop.logPath).size
+    } catch {
+      /* log may not exist yet */
+    }
+    emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay finished: ${endReason}`, reason: endReason })
     // Tear the tmux sessions down so they don't linger.
     await loop.lead.close().catch(() => {})
     await loop.worker.close().catch(() => {})

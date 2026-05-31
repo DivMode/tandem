@@ -42,6 +42,7 @@ import {
   listSessions,
 } from './sessions.ts'
 import * as relay from './relay.ts'
+import { emitCompletion, summarize } from './events.ts'
 
 // ---- config ---------------------------------------------------------------
 
@@ -235,11 +236,26 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
   const session = getLive(name)
   if (!session) return err(409, `session "${name}" is not live; call open_session first`)
   const text = String(req.body['text'] ?? '')
-  if (!text) return err(400, 'text is required')
+
+  // POLL MODE: empty text means "don't send a new instruction, just fetch new
+  // output since the cursor". This folds the former read_session into this one
+  // tool so the normal path never needs a separate poll tool.
+  if (!text) {
+    const cursor = req.body['cursor'] !== undefined ? Number(req.body['cursor']) : 0
+    return readSession(name, cursor)
+  }
+
   audit({ route: 'POST /sessions/:name/send', name, cwd: session.cwd, text })
 
   try {
+    // session.send() is already BOUNDED by the engine's soft cap (TANDEM_WAIT_MS):
+    // it returns status:'done' with the report once idle, or status:'running' at
+    // the cap so the caller can call again — never an infinite internal loop.
     const result = await session.send(text)
+    if (result.status === 'done') {
+      // Turn finished — EMIT a completion event (push), not just return it.
+      emitCompletion({ type: 'session', id: name, cursor: result.cursor, summary: summarize(result.report) })
+    }
     return ok({
       status: result.status,
       name,
@@ -252,19 +268,29 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
   }
 }
 
-async function handleRead(name: string, req: RpcRequest): Promise<RpcResult> {
+/** Shared read used by GET /sessions/:name/read AND send poll-mode. Emits a
+ *  completion event when a previously-running turn is observed to have finished
+ *  (now idle AND produced fresh output since the cursor). */
+async function readSession(name: string, cursor: number): Promise<RpcResult> {
   const session = getLive(name)
-  const cursor = req.query.get('cursor') ? Number(req.query.get('cursor')) : 0
   if (!session) {
     // Not live: nothing to stream. idle:true so a poll loop terminates cleanly.
     return ok({ text: '', cursor, idle: true, live: false })
   }
   try {
     const page = await session.readSince(cursor)
+    if (page.idle && page.text.trim().length > 0) {
+      emitCompletion({ type: 'session', id: name, cursor: page.cursor, summary: summarize(page.text) })
+    }
     return ok({ ...page, live: true, attachHint: session.attachHint() })
   } catch (e) {
     return err(500, `read failed: ${e instanceof Error ? e.message : String(e)}`)
   }
+}
+
+async function handleRead(name: string, req: RpcRequest): Promise<RpcResult> {
+  const cursor = req.query.get('cursor') ? Number(req.query.get('cursor')) : 0
+  return readSession(name, cursor)
 }
 
 async function handleInterrupt(name: string): Promise<RpcResult> {
