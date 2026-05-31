@@ -106,27 +106,30 @@ function buildMcpServer(): McpServer {
     async ({ name }) => call("POST", `/sessions/${encodeURIComponent(name)}/close`),
   );
 
-  /* ---- relay (one tool, four actions) ---- */
+  /* ---- relay (one tool, five actions) ---- */
 
   server.tool(
     "relay",
-    `${BLAST_RADIUS}\n\nControl the autonomous, NO-HUMAN-IN-THE-LOOP lead/worker relay (two interactive Claude Code sessions that message each other until the lead says RELAY_DONE, a max-turn cap is hit, or it is stopped). action:\n- "start": begin a relay — needs { goal, cwd?, maxTurns? } → { status:"running", loopId, leadName, workerName }\n- "read": fetch the lead<->worker transcript — needs { loopId, cursor? } → { text, cursor, running } (running:false = finished)\n- "inject": steer the lead mid-run — needs { loopId, message }\n- "stop": halt promptly — needs { loopId }\nWhen a relay finishes the bridge emits a completion event (see README "Completion events").`,
+    `${BLAST_RADIUS}\n\nControl the autonomous, NO-HUMAN-IN-THE-LOOP lead/worker relay (two interactive Claude Code sessions that message each other until the lead says RELAY_DONE, a max-turn cap is hit, or it is stopped). The lead is a PERSISTENT manager: when a task finishes it PARKS (stays alive, idle) and waits for the next task instead of dying; it tears down on stop, an idle-timeout, or when it escalates "BLOCKED". action:\n- "start": begin a relay — needs { goal, cwd?, maxTurns? } → { status:"running", loopId, leadName, workerName }\n- "read": fetch the lead<->worker transcript — needs { loopId, cursor? } → { text, cursor, running } (running:false = finished)\n- "enqueue": hand the parked/running manager the NEXT task — needs { loopId, task } → { ok, queued }\n- "inject": steer the lead mid-task — needs { loopId, message }\n- "stop": halt promptly — needs { loopId }\nEach finished task and the final teardown emit a completion event; an unresolvable block emits an urgent escalation (see README "Completion events").`,
     {
-      action: z.enum(["start", "read", "inject", "stop"]),
+      action: z.enum(["start", "read", "inject", "stop", "enqueue"]),
       goal: z.string().optional().describe('action=start: the relay objective.'),
       cwd: z.string().optional().describe('action=start: working dir (allowlisted).'),
-      maxTurns: z.number().int().positive().optional().describe('action=start: hard cap on turns.'),
-      loopId: z.string().optional().describe('action=read|inject|stop: the loop id from start.'),
+      maxTurns: z.number().int().positive().optional().describe('action=start: per-task hard cap on turns.'),
+      loopId: z.string().optional().describe('action=read|inject|stop|enqueue: the loop id from start.'),
       cursor: z.number().int().nonnegative().optional().describe('action=read: byte cursor to page from.'),
       message: z.string().optional().describe('action=inject: message to deliver to the lead.'),
+      task: z.string().optional().describe('action=enqueue: the next task for the parked manager.'),
     },
-    async ({ action, goal, cwd, maxTurns, loopId, cursor, message }) => {
+    async ({ action, goal, cwd, maxTurns, loopId, cursor, message, task }) => {
       const id = encodeURIComponent(loopId ?? "");
       switch (action) {
         case "start":
           return call("POST", "/relay/start", { goal, cwd, maxTurns });
         case "read":
           return call("GET", `/relay/${id}/read`, {}, q({ cursor }).slice(1));
+        case "enqueue":
+          return call("POST", `/relay/${id}/enqueue`, { task });
         case "inject":
           return call("POST", `/relay/${id}/inject`, { message });
         case "stop":

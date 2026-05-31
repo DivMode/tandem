@@ -180,6 +180,12 @@ export async function route(req: RpcRequest): Promise<RpcResult> {
       audit({ route: 'POST /relay/:loopId/inject', loopId, text: message })
       return ok(relay.inject(loopId, message))
     }
+    if (m === 'POST' && action === 'enqueue') {
+      const task = String(req.body['task'] ?? req.body['message'] ?? '')
+      if (!task.trim()) return err(400, 'task is required')
+      audit({ route: 'POST /relay/:loopId/enqueue', loopId, task })
+      return ok(relay.enqueue(loopId, task))
+    }
   }
 
   return err(404, `no route for ${m} ${req.path}`)

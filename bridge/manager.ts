@@ -4,9 +4,11 @@
  * The relay's lead session is a real OS process, but its working memory today is
  * a single rolling string held in the bridge process (relay.ts `nextLeadMessage`)
  * plus whatever survives the lead's own context window — both volatile. This
- * module gives the manager a real mind on disk so it is RESUMABLE across context
- * compaction and bridge restarts: continuity comes from re-reading files, not
- * from a process "staying alive".
+ * module gives the manager a real mind on disk so it survives context
+ * compaction WITHIN a run: continuity comes from re-reading files each turn, not
+ * from a process "staying alive". (The files are also durable across a bridge
+ * restart, but auto-resuming a parked manager on restart is not yet wired —
+ * Phase 6c; see the README "Limitation" note.)
  *
  * Three files per manager, under ~/.tandem/manager/<loopId>/:
  *   MISSION.md   — the standing definition of "done". Written once, re-read each turn.
@@ -25,7 +27,13 @@ const MANAGER_ROOT = join(homedir(), '.tandem', 'manager')
 
 /** The manager's working set, persisted to STATE.json. */
 export interface ManagerState {
-  status: 'running' | 'blocked' | 'done'
+  /**
+   * running  — actively driving the worker on the current task.
+   * parked   — idle, alive, waiting for the next task (Phase 6b).
+   * blocked  — stuck; escalated to the human, loop halted.
+   * done     — fully finished and torn down.
+   */
+  status: 'running' | 'parked' | 'blocked' | 'done'
   /** last completed lead turn. */
   turn: number
   /** short description of the current task/focus. */
@@ -117,6 +125,59 @@ export function updateState(dir: string, patch: Partial<ManagerState>): ManagerS
     process.stderr.write(`[manager] state write failed: ${e instanceof Error ? e.message : String(e)}\n`)
   }
   return next
+}
+
+function queuePath(dir: string): string {
+  return join(dir, 'QUEUE.json')
+}
+
+/**
+ * The pending task queue, persisted to QUEUE.json (FIFO) so the backlog is
+ * durable on disk. Tasks are plain instruction strings. (NOTE: the bridge does
+ * not yet re-read this on restart to auto-resume a parked manager — that's
+ * Phase 6c; see the README "Limitation" note.) All helpers never throw — a
+ * broken queue file degrades to empty.
+ */
+export function readQueue(dir: string): string[] {
+  try {
+    const parsed = JSON.parse(readFileSync(queuePath(dir), 'utf8'))
+    return Array.isArray(parsed?.pending) ? parsed.pending.filter((t: unknown) => typeof t === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function writeQueue(dir: string, pending: string[]): void {
+  try {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(queuePath(dir), JSON.stringify({ pending }, null, 2) + '\n')
+  } catch (e) {
+    process.stderr.write(`[manager] queue write failed: ${e instanceof Error ? e.message : String(e)}\n`)
+  }
+}
+
+/**
+ * Append a task to the queue. Blank tasks are ignored, and the queue is bounded
+ * by `maxDepth` (default unbounded) so an authenticated caller can't grow it
+ * without limit. Returns true if the task was accepted, false otherwise. Never
+ * throws.
+ */
+export function enqueueTask(dir: string, task: string, maxDepth = Infinity): boolean {
+  const t = task.trim()
+  if (!t) return false // never let an empty enqueue wake a parked manager
+  const q = readQueue(dir)
+  if (q.length >= maxDepth) return false // queue full — reject rather than grow unbounded
+  writeQueue(dir, [...q, t])
+  return true
+}
+
+/** Pop and return the first pending task (FIFO), persisting the rest. Null if empty. */
+export function dequeueTask(dir: string): string | null {
+  const q = readQueue(dir)
+  if (q.length === 0) return null
+  const [head, ...rest] = q
+  writeQueue(dir, rest)
+  return head
 }
 
 /** Read the manager's memory. Missing/corrupt files degrade gracefully. */

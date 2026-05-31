@@ -10,6 +10,9 @@ import {
   updateState,
   regroundPreamble,
   managerDir,
+  enqueueTask,
+  dequeueTask,
+  readQueue,
 } from "../bridge/manager.ts";
 
 describe("parseBlocked (the escalation sentinel)", () => {
@@ -94,5 +97,76 @@ describe("managerDir", () => {
   it("namespaces each loop under ~/.tandem/manager/<loopId>", () => {
     const d = managerDir("abc123");
     expect(d).toMatch(/[/\\]\.tandem[/\\]manager[/\\]abc123$/);
+  });
+});
+
+describe("task queue (disk-persisted, so a restart resumes pending work)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "tandem-q-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("enqueue then read returns the task", () => {
+    enqueueTask(dir, "write the lexer");
+    expect(readQueue(dir)).toEqual(["write the lexer"]);
+  });
+
+  it("preserves FIFO order across multiple enqueues", () => {
+    enqueueTask(dir, "task one");
+    enqueueTask(dir, "task two");
+    enqueueTask(dir, "task three");
+    expect(readQueue(dir)).toEqual(["task one", "task two", "task three"]);
+  });
+
+  it("dequeue returns the FIRST task and persists the remainder", () => {
+    enqueueTask(dir, "first");
+    enqueueTask(dir, "second");
+    expect(dequeueTask(dir)).toBe("first");
+    // the remainder must survive on disk (resumable after a crash)
+    expect(readQueue(dir)).toEqual(["second"]);
+    expect(dequeueTask(dir)).toBe("second");
+    expect(readQueue(dir)).toEqual([]);
+  });
+
+  it("dequeue on an empty/missing queue returns null (no throw)", () => {
+    expect(dequeueTask(dir)).toBeNull();
+    expect(readQueue(dir)).toEqual([]);
+  });
+
+  it("ignores blank tasks so an empty enqueue can't wake a parked manager", () => {
+    enqueueTask(dir, "   ");
+    enqueueTask(dir, "real task");
+    expect(readQueue(dir)).toEqual(["real task"]);
+  });
+
+  it("reports acceptance via the return value (true accepted, false rejected)", () => {
+    expect(enqueueTask(dir, "real")).toBe(true);
+    expect(enqueueTask(dir, "   ")).toBe(false); // blank rejected
+  });
+
+  it("respects a max-depth cap so the queue can't grow unbounded", () => {
+    expect(enqueueTask(dir, "a", 2)).toBe(true);
+    expect(enqueueTask(dir, "b", 2)).toBe(true);
+    expect(enqueueTask(dir, "c", 2)).toBe(false); // full -> rejected
+    expect(readQueue(dir)).toEqual(["a", "b"]);
+  });
+});
+
+describe("parked status round-trips (the persistent-manager idle state)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "tandem-park-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("persists status 'parked' so a restart knows it was idle, not finished", () => {
+    initManagerMemory(dir, { goal: "g" });
+    updateState(dir, { status: "parked", task: "(idle)" });
+    expect(readMemory(dir).state?.status).toBe("parked");
   });
 });

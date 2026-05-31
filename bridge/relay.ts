@@ -40,6 +40,9 @@ import {
   updateState,
   regroundPreamble,
   parseBlocked,
+  enqueueTask,
+  dequeueTask,
+  readQueue,
 } from './manager.ts'
 
 const HOME = homedir()
@@ -48,7 +51,16 @@ const RELAY_DIR = join(HOME, '.tandem', 'relay')
 /** Defaults + hard ceilings. Client-supplied values are clamped to these. */
 const DEFAULT_MAX_TURNS = 24
 const MAX_TURNS_CEILING = 50
-const DEFAULT_WALL_CLOCK_MS = 30 * 60_000 // 30 minutes
+const DEFAULT_WALL_CLOCK_MS = 30 * 60_000 // 30 minutes — now PER TASK (Phase 6b)
+/**
+ * Phase 6b: how long a manager stays PARKED (idle, alive) awaiting the next task
+ * before it tears itself down. Bounded so an abandoned manager never lingers
+ * forever holding two tmux sessions.
+ */
+const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000 // 15 minutes
+const IDLE_TIMEOUT_CEILING_MS = 60 * 60_000 // 1 hour
+/** Hard cap on pending queued tasks, so enqueue can't grow the backlog unbounded. */
+const MAX_QUEUE_DEPTH = 64
 
 /** The seed that turns the lead session into the strategist/reviewer. */
 function leadSeed(goal: string, context?: string): string {
@@ -110,16 +122,28 @@ interface RelayLoop {
   lead: TerminalSession
   worker: TerminalSession
   logPath: string
-  /** disk-backed manager memory dir (MISSION/STATE/LOG) — survives restarts. */
+  /** disk-backed manager memory dir (MISSION/STATE/LOG/QUEUE) — durable on disk. */
   memDir: string
   running: boolean
   /** Set by inject(): overrides the next message fed to the lead. */
   pendingInjection?: string
   /** The session currently inside an awaited send(), so stop() can interrupt it. */
   active?: TerminalSession
-  /** Absolute wall-clock deadline (ms epoch). */
+  /** Absolute wall-clock deadline (ms epoch) for the CURRENT task. */
   deadline: number
   finished: Promise<void>
+  // ---- Phase 6b: park-and-wait ----
+  /** Per-task hard caps, reset for each new task. */
+  maxTurns: number
+  perTaskWallClockMs: number
+  /** How long to stay parked before tearing down. */
+  idleTimeoutMs: number
+  /** True while the manager is parked (idle, awaiting the next task). */
+  parked: boolean
+  /** Resolver armed only while parked; enqueue()/stop() call it to wake the loop. */
+  wake?: (reason: 'task' | 'stop' | 'idle') => void
+  /** The active idle-timeout timer while parked (cleared on wake). */
+  idleTimer?: ReturnType<typeof setTimeout>
 }
 
 const loops = new Map<string, RelayLoop>()
@@ -148,8 +172,10 @@ export interface StartRelayOptions {
   cwd: string
   /** Clamped to [1, MAX_TURNS_CEILING]; defaults to DEFAULT_MAX_TURNS. */
   maxTurns?: number
-  /** Optional wall-clock cap override (ms); clamped to <= DEFAULT_WALL_CLOCK_MS. */
+  /** Optional per-task wall-clock cap override (ms); clamped to <= DEFAULT_WALL_CLOCK_MS. */
   wallClockMs?: number
+  /** Optional idle-park timeout (ms); clamped to <= IDLE_TIMEOUT_CEILING_MS. */
+  idleTimeoutMs?: number
   /** Spec/context text seeded into the lead. */
   context?: string
   /** cwd allowlist passed straight through to TerminalSession.spawn. */
@@ -209,6 +235,11 @@ export async function startRelay(opts: StartRelayOptions): Promise<StartRelayRes
   const memDir = managerDir(loopId)
   initManagerMemory(memDir, { goal: opts.goal, context: opts.context })
 
+  const idleTimeoutMs = Math.min(
+    opts.idleTimeoutMs && opts.idleTimeoutMs > 0 ? opts.idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS,
+    IDLE_TIMEOUT_CEILING_MS,
+  )
+
   const loop: RelayLoop = {
     loopId,
     leadName: lead.name,
@@ -220,13 +251,17 @@ export async function startRelay(opts: StartRelayOptions): Promise<StartRelayRes
     running: true,
     deadline: Date.now() + wallClockMs,
     finished: Promise.resolve(),
+    maxTurns,
+    perTaskWallClockMs: wallClockMs,
+    idleTimeoutMs,
+    parked: false,
   }
   loops.set(loopId, loop)
 
-  transcript(loop, 'SYS', `relay started · goal: ${opts.goal}\ncwd: ${opts.cwd}\nmaxTurns: ${maxTurns} · wallClock: ${Math.round(wallClockMs / 60_000)}min`)
+  transcript(loop, 'SYS', `relay started · goal: ${opts.goal}\ncwd: ${opts.cwd}\nmaxTurns: ${maxTurns}/task · wallClock: ${Math.round(wallClockMs / 60_000)}min/task · idle park: ${Math.round(idleTimeoutMs / 60_000)}min`)
   transcript(loop, 'SYS', `attach lead:   ${lead.attachHint()}\nattach worker: ${worker.attachHint()}`)
 
-  loop.finished = runLoop(loop, opts.goal, opts.context, maxTurns)
+  loop.finished = runManager(loop, opts.goal, opts.context)
 
   return { loopId, leadName: lead.name, workerName: worker.name }
 }
@@ -275,106 +310,216 @@ async function sendRaced(
   }
 }
 
-/** The autonomous lead<->worker loop. Runs in the background; never throws. */
-async function runLoop(
-  loop: RelayLoop,
-  goal: string,
-  context: string | undefined,
-  maxTurns: number,
-): Promise<void> {
-  let nextLeadMessage = leadSeed(goal, context)
+/** The terminal outcome of a single task's inner loop. */
+type TaskOutcome =
+  | { kind: 'done' }
+  | { kind: 'blocked'; reason: string }
+  | { kind: 'stopped' }
+  | { kind: 'deadline' } // this task hit its wall-clock cap (not fatal — park after)
+  | { kind: 'maxturns' } // this task hit its per-task turn cap (not fatal — park after)
+
+/** How a follow-up task (after the first) is framed for the already-seeded lead. */
+function taskSeed(task: string): string {
+  return [
+    'A NEW TASK has arrived. You are still the same lead/strategist — your mission',
+    'and decision log are in the standing memory above. Drive the worker to achieve',
+    'this task: reply with ONE concrete instruction at a time, review each report,',
+    'and output DONE on its own line when THIS task is complete (or "BLOCKED:',
+    '<reason>" on its own line if you need the human).',
+    `\nNEW TASK: ${task}`,
+    '\nReply now with your FIRST instruction for the worker.',
+  ].join('\n')
+}
+
+/**
+ * Run ONE task to a terminal outcome: the lead<->worker turn loop. Bounded by the
+ * per-task turn cap and the per-task wall-clock deadline (loop.deadline, reset by
+ * the caller). Returns the outcome; never tears anything down (the outer manager
+ * loop owns lifecycle). Does not throw — a thrown send surfaces as a turn report.
+ */
+async function runTask(loop: RelayLoop, firstLeadMessage: string, maxTurns: number): Promise<TaskOutcome> {
+  let nextLeadMessage = firstLeadMessage
+
+  for (let turn = 1; turn <= maxTurns; turn++) {
+    if (!loop.running) return { kind: 'stopped' }
+    if (Date.now() >= loop.deadline) return { kind: 'deadline' }
+
+    // An inject() takes precedence as the next thing the lead hears.
+    if (loop.pendingInjection !== undefined) {
+      nextLeadMessage = `Operator injected a message: ${loop.pendingInjection}\n\n${nextLeadMessage}`
+      loop.pendingInjection = undefined
+    }
+
+    // Re-ground the lead from disk every turn (mission + recent decisions) so it
+    // stays on-mission across context compaction, and record the turn.
+    updateState(loop.memDir, { turn, status: 'running' })
+    const preamble = regroundPreamble(loop.memDir)
+    const leadMessage = preamble ? `${preamble}\n${nextLeadMessage}` : nextLeadMessage
+
+    // --- LEAD turn: produce one instruction (or DONE/BLOCKED) ---
+    transcript(loop, 'SYS', `--- turn ${turn}/${maxTurns} ---`)
+    const leadRes = await sendRaced(loop, loop.lead, leadMessage)
+    if (leadRes.kind === 'deadline') return { kind: 'deadline' }
+    if (leadRes.kind === 'stopped') return { kind: 'stopped' }
+    const leadInstruction = leadRes.report
+    transcript(loop, 'LEAD', leadInstruction)
+
+    // Stuck and wants the human — escalate. Checked BEFORE DONE so "BLOCKED" is
+    // never misread as completion.
+    const blk = parseBlocked(leadInstruction)
+    if (blk !== null) {
+      const reason = blk || 'manager requested human input'
+      appendDecision(loop.memDir, `turn ${turn}: BLOCKED — ${reason}`)
+      updateState(loop.memDir, { status: 'blocked', blockedReason: reason })
+      return { kind: 'blocked', reason }
+    }
+
+    if (isDone(leadInstruction)) {
+      appendDecision(loop.memDir, `turn ${turn}: lead reported DONE`)
+      return { kind: 'done' }
+    }
+
+    // Record the instruction as this turn's decision (one tidy line).
+    const oneLine = leadInstruction.replace(/\s+/g, ' ').trim().slice(0, 160)
+    appendDecision(loop.memDir, `turn ${turn}: instructed worker — ${oneLine}`)
+    updateState(loop.memDir, { task: oneLine })
+
+    if (!loop.running) return { kind: 'stopped' }
+
+    // --- WORKER turn: carry out the instruction, report back ---
+    const workerRes = await sendRaced(loop, loop.worker, leadInstruction)
+    if (workerRes.kind === 'deadline') return { kind: 'deadline' }
+    if (workerRes.kind === 'stopped') return { kind: 'stopped' }
+    transcript(loop, 'WORKER', workerRes.report)
+
+    // Feed the worker's report back to the lead for the next round.
+    nextLeadMessage = wrapWorkerReport(workerRes.report)
+  }
+  return { kind: 'maxturns' }
+}
+
+/**
+ * Park-and-wait for the next task (Phase 6b). Returns the next task string, or
+ * null when the manager should terminate (explicit stop or idle-timeout).
+ *
+ * Concurrency contract (the wake protocol — designed to never drop a wakeup or
+ * busy-spin): enqueue() PERSISTS the task first, THEN calls loop.wake if armed.
+ * Here we (1) drain any already-queued task immediately, then (2) arm loop.wake
+ * and, inside the same synchronous executor, RE-CHECK the queue and the running
+ * flag before awaiting — so a task enqueued in the gap between the drain and the
+ * arm is still seen. We never await with a stale empty view.
+ */
+// Exported for tests: this is the race-critical core and touches no
+// TerminalSession, so it is exercised directly against a fake loop.
+export async function awaitNextTask(loop: RelayLoop): Promise<string | null> {
+  while (loop.running) {
+    const queued = dequeueTask(loop.memDir)
+    if (queued !== null) return queued
+
+    const woken = await new Promise<'task' | 'stop' | 'idle'>((resolve) => {
+      loop.wake = resolve
+      // Double-check inside the executor (synchronously, before any await) to
+      // close the lost-wakeup window between the dequeue above and arming wake.
+      if (readQueue(loop.memDir).length > 0) return resolve('task')
+      if (!loop.running) return resolve('stop')
+      loop.parked = true
+      updateState(loop.memDir, { status: 'parked', task: '(idle — awaiting next task)' })
+      transcript(loop, 'SYS', `parked · awaiting next task (idle timeout ${Math.round(loop.idleTimeoutMs / 60_000)}min)`)
+      loop.idleTimer = setTimeout(() => resolve('idle'), loop.idleTimeoutMs)
+    })
+
+    // Disarm before acting on the result (resolve is idempotent; first wins).
+    loop.parked = false
+    loop.wake = undefined
+    if (loop.idleTimer) {
+      clearTimeout(loop.idleTimer)
+      loop.idleTimer = undefined
+    }
+
+    if (!loop.running || woken === 'stop') return null
+    // Either a task arrived, or idle fired — drain the queue either way (a task
+    // may have raced in just as idle fired). Empty + idle => terminate.
+    const next = dequeueTask(loop.memDir)
+    if (next !== null) return next
+    if (woken === 'idle') return null
+    // woken==='task' but nothing queued (e.g. a blank enqueue) — re-park.
+  }
+  return null
+}
+
+/**
+ * The persistent MANAGER loop (Phase 6b). Runs the initial goal, then PARKS and
+ * waits for more tasks (via enqueue) instead of dying — surviving idle between
+ * tasks, escalating when stuck, and tearing down only on stop / idle-timeout /
+ * block / fatal error. Runs in the background; never throws.
+ */
+async function runManager(loop: RelayLoop, goal: string, context: string | undefined): Promise<void> {
   let endReason = 'completed'
-  // Set when the lead emits the BLOCKED sentinel — drives escalation in finally.
   let blockedReason: string | null = null
+  let firstMessage: string | null = leadSeed(goal, context) // task 1 uses the full role seed
+  let taskNum = 0
 
   try {
-    for (let turn = 1; turn <= maxTurns; turn++) {
-      if (!loop.running) {
-        endReason = 'stopped'
-        break
-      }
-      if (Date.now() >= loop.deadline) {
-        endReason = 'wall-clock cap reached'
-        break
-      }
-
-      // An inject() takes precedence as the next thing the lead hears.
-      if (loop.pendingInjection !== undefined) {
-        nextLeadMessage = `Operator injected a message: ${loop.pendingInjection}\n\n${nextLeadMessage}`
+    while (loop.running) {
+      // Pick the next task: the seeded goal first, then queued/awaited tasks.
+      let leadMessage: string
+      if (firstMessage !== null) {
+        leadMessage = firstMessage
+        firstMessage = null
+        taskNum = 1
+        transcript(loop, 'SYS', `--- task ${taskNum} (initial goal) ---`)
+      } else {
+        const next = await awaitNextTask(loop)
+        if (next === null) {
+          endReason = loop.running ? 'idle timeout — no new tasks' : 'stopped'
+          break
+        }
+        // A fresh task must not inherit a leftover steer from the previous one.
         loop.pendingInjection = undefined
+        taskNum++
+        leadMessage = taskSeed(next)
+        appendDecision(loop.memDir, `task ${taskNum} received: ${next.slice(0, 160)}`)
+        transcript(loop, 'SYS', `--- task ${taskNum}: ${next.slice(0, 160)} ---`)
       }
 
-      // Re-ground the lead from disk every turn (mission + recent decisions), so
-      // it stays on-mission across context compaction, and record the turn.
-      updateState(loop.memDir, { turn })
-      const preamble = regroundPreamble(loop.memDir)
-      const leadMessage = preamble ? `${preamble}\n${nextLeadMessage}` : nextLeadMessage
+      // Fresh per-task budget (turn loop restarts at 1; wall-clock resets).
+      loop.deadline = Date.now() + loop.perTaskWallClockMs
+      const outcome = await runTask(loop, leadMessage, loop.maxTurns)
 
-      // --- LEAD turn: produce one instruction (or DONE/BLOCKED) ---
-      transcript(loop, 'SYS', `--- turn ${turn}/${maxTurns} ---`)
-      const leadRes = await sendRaced(loop, loop.lead, leadMessage)
-      if (leadRes.kind === 'deadline') {
-        endReason = 'wall-clock cap reached'
+      if (outcome.kind === 'blocked') {
+        blockedReason = outcome.reason
+        endReason = `blocked: ${outcome.reason}`
         break
       }
-      if (leadRes.kind === 'stopped') {
-        endReason = 'stopped'
-        break
-      }
-      const leadInstruction = leadRes.report
-      transcript(loop, 'LEAD', leadInstruction)
-
-      // The manager is stuck and wants the human — escalate, don't burn turns.
-      // Checked BEFORE DONE so "BLOCKED" is never misread as completion.
-      const blk = parseBlocked(leadInstruction)
-      if (blk !== null) {
-        blockedReason = blk || 'manager requested human input'
-        endReason = `blocked: ${blockedReason}`
-        appendDecision(loop.memDir, `turn ${turn}: BLOCKED — ${blockedReason}`)
-        updateState(loop.memDir, { status: 'blocked', blockedReason })
-        break
-      }
-
-      if (isDone(leadInstruction)) {
-        endReason = 'lead reported DONE'
-        appendDecision(loop.memDir, `turn ${turn}: lead reported DONE`)
-        updateState(loop.memDir, { status: 'done', task: 'complete' })
-        break
-      }
-
-      // Record the instruction as this turn's decision (one tidy line).
-      const oneLine = leadInstruction.replace(/\s+/g, ' ').trim().slice(0, 160)
-      appendDecision(loop.memDir, `turn ${turn}: instructed worker — ${oneLine}`)
-      updateState(loop.memDir, { task: oneLine })
-
-      if (!loop.running) {
+      if (outcome.kind === 'stopped') {
         endReason = 'stopped'
         break
       }
 
-      // --- WORKER turn: carry out the instruction, report back ---
-      const workerRes = await sendRaced(loop, loop.worker, leadInstruction)
-      if (workerRes.kind === 'deadline') {
-        endReason = 'wall-clock cap reached'
-        break
+      // done | deadline | maxturns => this task finished (possibly capped). Emit a
+      // per-task completion (so the phone/chat learns it), then PARK for the next.
+      const taskReason =
+        outcome.kind === 'done' ? 'task done' : outcome.kind === 'deadline' ? 'task wall-clock cap' : 'task max turns'
+      let cursor = 0
+      try {
+        cursor = statSync(loop.logPath).size
+      } catch {
+        /* log may not exist yet */
       }
-      if (workerRes.kind === 'stopped') {
-        endReason = 'stopped'
-        break
-      }
-      transcript(loop, 'WORKER', workerRes.report)
-
-      // Feed the worker's report back to the lead for the next round.
-      nextLeadMessage = wrapWorkerReport(workerRes.report)
-
-      if (turn === maxTurns) endReason = 'max turns reached'
+      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay task ${taskNum} ${taskReason}`, reason: taskReason })
+      appendDecision(loop.memDir, `task ${taskNum} ${taskReason} · parking`)
+      transcript(loop, 'SYS', `task ${taskNum} ${taskReason} · parking for next task`)
     }
   } catch (e) {
     endReason = `loop error: ${e instanceof Error ? e.message : String(e)}`
   } finally {
     loop.running = false
-    transcript(loop, 'SYS', `relay finished · reason: ${endReason}`)
-    // Relay reached an end — EMIT (push), not just stop quietly.
+    if (loop.idleTimer) {
+      clearTimeout(loop.idleTimer)
+      loop.idleTimer = undefined
+    }
+    loop.parked = false
+    transcript(loop, 'SYS', `manager finished · reason: ${endReason}`)
     let cursor = 0
     try {
       cursor = statSync(loop.logPath).size
@@ -382,11 +527,12 @@ async function runLoop(
       /* log may not exist yet */
     }
     if (blockedReason !== null) {
-      // The manager is stuck: escalate to the human (urgent push). This is the
-      // terminal event for a blocked run — no duplicate completion ping.
+      // Stuck: escalate to the human (urgent push). Terminal event for a block —
+      // no duplicate completion ping.
       emitEscalation({ type: 'relay', id: loop.loopId, cursor, summary: `relay blocked: ${blockedReason}`, reason: blockedReason })
     } else {
-      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay finished: ${endReason}`, reason: endReason })
+      updateState(loop.memDir, { status: 'done', task: 'manager stopped' })
+      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay manager finished: ${endReason}`, reason: endReason })
     }
     // Tear the tmux sessions down so they don't linger.
     await loop.lead.close().catch(() => {})
@@ -429,12 +575,34 @@ export function stop(loopId: string): { ok: boolean; running: boolean } {
   const loop = loops.get(loopId)
   if (!loop) return { ok: false, running: false }
   loop.running = false
+  // If parked, break the idle wait immediately so teardown is prompt.
+  if (loop.wake) loop.wake('stop')
   // Interrupt whatever is mid-await right now, plus both sessions defensively.
   const active = loop.active
   if (active) void active.interrupt().catch(() => {})
   void loop.lead.interrupt().catch(() => {})
   void loop.worker.interrupt().catch(() => {})
   return { ok: true, running: false }
+}
+
+/**
+ * Enqueue a new task for a running/parked manager (Phase 6b). Persists the task
+ * to disk FIRST (durable, so it's not lost on crash), THEN wakes the loop if it
+ * is parked. A blank task, or one past the queue-depth cap, is rejected. Returns
+ * whether it was accepted and the resulting queue depth.
+ */
+export function enqueue(loopId: string, task: string): { ok: boolean; queued: number } {
+  const loop = loops.get(loopId)
+  if (!loop || !loop.running) return { ok: false, queued: 0 }
+  const t = task.trim()
+  if (!t) return { ok: false, queued: readQueue(loop.memDir).length }
+  // Persist before signalling (no lost task on crash); bounded so the backlog
+  // can't grow without limit. accepted=false here means the queue is full.
+  const accepted = enqueueTask(loop.memDir, t, MAX_QUEUE_DEPTH)
+  if (!accepted) return { ok: false, queued: readQueue(loop.memDir).length }
+  transcript(loop, 'SYS', `task enqueued: ${t.slice(0, 160)}`)
+  if (loop.wake) loop.wake('task') // wake a parked loop; a running one drains it later
+  return { ok: true, queued: readQueue(loop.memDir).length }
 }
 
 /**
@@ -445,6 +613,10 @@ export function stop(loopId: string): { ok: boolean; running: boolean } {
 export function inject(loopId: string, message: string): { ok: boolean } {
   const loop = loops.get(loopId)
   if (!loop || !loop.running) return { ok: false }
+  // While PARKED there is no in-flight task to steer. Reject rather than stash a
+  // pending injection that would (a) silently leak into the NEXT, unrelated task,
+  // or (b) be dropped at idle teardown. To add the next task, use enqueue.
+  if (loop.parked) return { ok: false }
   loop.pendingInjection = message
   transcript(loop, 'SYS', `operator injected: ${message}`)
   return { ok: true }
@@ -453,8 +625,15 @@ export function inject(loopId: string, message: string): { ok: boolean } {
 /** Loop metadata (for status / list surfaces). undefined if unknown. */
 export function info(
   loopId: string,
-): { loopId: string; leadName: string; workerName: string; running: boolean } | undefined {
+): { loopId: string; leadName: string; workerName: string; running: boolean; parked: boolean; queued: number } | undefined {
   const loop = loops.get(loopId)
   if (!loop) return undefined
-  return { loopId: loop.loopId, leadName: loop.leadName, workerName: loop.workerName, running: loop.running }
+  return {
+    loopId: loop.loopId,
+    leadName: loop.leadName,
+    workerName: loop.workerName,
+    running: loop.running,
+    parked: loop.parked,
+    queued: readQueue(loop.memDir).length,
+  }
 }

@@ -13,7 +13,8 @@ Sessions are real interactive Claude Code TUIs running inside **tmux** (`ccm-<na
 - **Drive a live Claude Code session** — open, send turns to, and read back from an interactive `claude` session running locally in tmux.
 - **Shared live session** — you and the chat AI both interact with the same tmux session; `tmux attach` lets you watch or type alongside, and reads are incremental (cursor-based) so neither side blocks the other.
 - **Turn-completion detection** — `send_to_session` holds open until the turn finishes (detected via Claude Code's "esc to interrupt" marker plus screen-stability); if a turn runs long it returns `status:"running"` and you poll `read_session` until `idle:true`.
-- **Autonomous lead/worker relay** — two interactive sessions message each other with no human in the loop: a lead strategist hands one step at a time to a worker and reviews results, relaying until the lead emits `RELAY_DONE` or a turn cap is hit. Steer it live with `inject_to_relay`.
+- **Autonomous lead/worker relay** — two interactive sessions message each other with no human in the loop: a lead strategist hands one step at a time to a worker and reviews results, relaying until the lead emits `RELAY_DONE` or a turn cap is hit. Steer it live with `inject`.
+- **Persistent manager (park-and-wait)** — the lead doesn't die when a task finishes: it parks (idle, alive, keeping its on-disk memory) and waits for the next task you `enqueue`, running each under a fresh per-task budget, until you stop it, it sits idle past a timeout, or it escalates that it's stuck.
 
 ## What this can't do (honest limits)
 
@@ -77,7 +78,7 @@ Six tools:
 - `send_to_session` — send a prompt and wait (bounded by `TANDEM_WAIT_MS`) for the turn; returns the report, or `status:"running"` to call again. **Omit `text` for poll mode** (fetch new output since `cursor` without sending) — this replaces the old `read_session`. Accepts **slash commands** verbatim (see below) and optional per-turn `model` / `effort` overrides.
 - `interrupt_session` — Ctrl-C the current turn, keep the session.
 - `close_session` — kill the session.
-- `relay` — one tool with `action: start | read | inject | stop` for the autonomous lead/worker relay (replaces the old `start_relay` / `read_relay` / `inject_to_relay` / `stop_relay`).
+- `relay` — one tool with `action: start | read | enqueue | inject | stop` for the autonomous lead/worker relay (replaces the old `start_relay` / `read_relay` / `inject_to_relay` / `stop_relay`). The lead is a **persistent manager**: when a task finishes it parks and waits; `enqueue` hands it the next task (see *Persistent manager* below).
 
 Consolidated from 10 → 6; no capability was removed (the underlying routes are unchanged and still reachable).
 
@@ -144,18 +145,39 @@ can't be woken by a server-initiated signal (see below).
 
 ### Persistent manager: disk-backed memory + escalation
 
-The autonomous `relay` runs a lead ("manager") session that drives a worker. To
-make that manager **resumable** — surviving context compaction and bridge
-restarts — its working state lives on disk, not just in a context window, under
-`~/.tandem/manager/<loopId>/`:
+The autonomous `relay` runs a lead ("manager") session that drives a worker. Its
+working state lives on disk, not just in a context window, so it survives
+**context compaction** within a run, under `~/.tandem/manager/<loopId>/`:
 
 - `MISSION.md` — the standing definition of "done" (written once, re-read each turn).
-- `STATE.json` — the working set: `status` (`running` / `blocked` / `done`), `turn`, current `task`, and `blockedReason`.
+- `STATE.json` — the working set: `status` (`running` / `parked` / `blocked` / `done`), `turn`, current `task`, and `blockedReason`.
 - `LOG.md` — an append-only decision log, one line per turn.
+- `QUEUE.json` — pending tasks (FIFO), durable on disk.
 
 Each turn the manager is **re-grounded** from these files (mission + recent
 decisions are re-fed into the lead), so continuity comes from re-reading disk
 rather than from a process "staying alive."
+
+**Park-and-wait (the manager doesn't die).** When a task finishes (`DONE` or a
+per-task cap), the manager does **not** tear down — it emits a per-task
+completion event, sets `STATE.json` to `parked`, and waits, idle and alive, for
+the next task. Hand it one with `relay { action: "enqueue", loopId, task }`: the
+task is persisted to `QUEUE.json` (FIFO, bounded to 64 pending) and a parked
+manager wakes immediately and runs it under a **fresh per-task budget** (turn cap
++ wall-clock reset). The wait is a single awaited signal — no busy-polling, no
+burned turns. The manager only tears down (closing both tmux sessions) on an
+explicit `stop`, after sitting idle past a timeout (default 15 min, max 1 h),
+when it escalates `BLOCKED`, or on a fatal error. So one long-lived manager can
+take task after task while keeping its mission and decision history — instead of
+you spinning up a throwaway pair each time.
+
+> **Limitation (restart does not auto-resume).** The memory and queue files are
+> durable on disk, but the bridge does **not** yet re-adopt a parked manager
+> after a process restart: a fresh bridge mints new loop ids and does not scan
+> `~/.tandem/manager/*`, so a manager that was parked when the bridge died is
+> orphaned — its `relay-<id>-lead`/`-worker` tmux sessions keep running and must
+> be reaped by hand (`tmux kill-session`). Auto-resume + an orphan reaper are
+> Phase 6c.
 
 **Escalation.** When the manager genuinely can't proceed without you — repeated
 worker failure, a call that needs your authority, or an irreversible action — it
