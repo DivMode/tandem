@@ -107,6 +107,28 @@ tandem **emits** a completion event the moment a turn or relay finishes — you 
 1. **`~/.tandem/events.log`** — one JSON line is appended per completion. Durable; `tail -f` it or have any local process watch it.
 2. **`TANDEM_DONE_WEBHOOK`** — if set, the same JSON is `POST`ed to that URL (fire-and-forget, no deps). Point it at any local listener, notifier, or automation.
 
+### Phone notifications (ntfy)
+
+For a real buzz on your phone when a session finishes, tandem can push to
+[ntfy](https://ntfy.sh) (free, no account) on top of the event emit above. It's
+off until you set a topic. Three steps:
+
+1. **Install the ntfy app** (iOS App Store / Google Play), or use the web app.
+2. **Subscribe to a topic** in the app — pick a long, hard-to-guess name (anyone
+   who knows the topic can read it), e.g. `tandem-9f3a2c-done`.
+3. **Set `TANDEM_NTFY_TOPIC`** in your `.env` to that exact topic (and optionally
+   `TANDEM_NTFY_SERVER` if you self-host ntfy; default `https://ntfy.sh`).
+
+Now each completion sends a notification titled `tandem: <session id> done` with a
+one-line summary (id, status, cursor, summary text). The POST is fire-and-forget;
+if ntfy is unreachable the failure is logged to `~/.tandem/bridge.log` and the
+bridge keeps running.
+
+**Honest note:** this pings a **device** (your phone / the ntfy app) — it does
+**not** and **cannot** wake the claude.ai chat or post a reply there. It tells
+*you* the work is done so you can go back to the chat; the chat client still
+can't be woken by a server-initiated signal (see below).
+
 **The missing piece (client side, out of scope / not under our control):** turning a completion event into an *unprompted* chat reply requires the chat client to be woken by it. Today **claude.ai chat cannot be woken this way** — a remote MCP connector is request/response, and the stateless Streamable-HTTP transport here holds no standing server→client channel to deliver a server-initiated notification to the chat UI. So tandem gives you the reliable signal (`events.log` + webhook); bridging that into an automatic message would need a client that polls `events.log`/the webhook and re-prompts the model — which only works in a harness you control, not in claude.ai chat as it exists now.
 
 ## Security
