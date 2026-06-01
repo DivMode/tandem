@@ -14,6 +14,9 @@ import {
   enqueueTask,
   dequeueTask,
   readQueue,
+  setAnswer,
+  readAnswer,
+  takeAnswer,
 } from "../bridge/manager.ts";
 
 describe("parseBlocked (the escalation sentinel)", () => {
@@ -37,6 +40,10 @@ describe("parseBlocked (the escalation sentinel)", () => {
   });
   it("does NOT trip on the word blocked inside a sentence", () => {
     expect(parseBlocked("the path was blocked but I found another route")).toBeNull();
+  });
+  it("requires a separator — a line merely STARTING with 'blocked' (no colon) is not the sentinel", () => {
+    expect(parseBlocked("blocked by the rate limiter, retrying with backoff")).toBeNull();
+    expect(parseBlocked("Blocked threads were the cause; fixed the deadlock")).toBeNull();
   });
   it("returns null when there is no sentinel (e.g. a normal DONE)", () => {
     expect(parseBlocked("all good now\nDONE")).toBeNull();
@@ -64,6 +71,11 @@ describe("parseNeedsInput (the non-terminal 'ask the human a question' sentinel)
   });
   it("does NOT trip on the words inside a sentence", () => {
     expect(parseNeedsInput("this step needs input from the API team")).toBeNull();
+  });
+  it("requires a separator — common prose that merely starts with the keywords is NOT the sentinel", () => {
+    expect(parseNeedsInput("needs input validation on the form before submit")).toBeNull();
+    expect(parseNeedsInput("Question whether we should refactor auth first")).toBeNull();
+    expect(parseNeedsInput("Questions remain about the schema")).toBeNull();
   });
   it("returns null for a normal DONE", () => {
     expect(parseNeedsInput("all set\nDONE")).toBeNull();
@@ -172,6 +184,23 @@ describe("task queue (disk-persisted, so a restart resumes pending work)", () =>
     enqueueTask(dir, "   ");
     enqueueTask(dir, "real task");
     expect(readQueue(dir)).toEqual(["real task"]);
+  });
+
+  it("answer channel is SEPARATE from the task queue (no conflation)", () => {
+    enqueueTask(dir, "a pre-queued task"); // sits in QUEUE.json
+    setAnswer(dir, "use postgres"); // the answer to a question — separate slot
+    // The pre-queued task is untouched by setting an answer.
+    expect(readQueue(dir)).toEqual(["a pre-queued task"]);
+    expect(readAnswer(dir)).toBe("use postgres");
+    // takeAnswer consumes the answer but never the queued task.
+    expect(takeAnswer(dir)).toBe("use postgres");
+    expect(takeAnswer(dir)).toBeNull();
+    expect(readQueue(dir)).toEqual(["a pre-queued task"]);
+  });
+
+  it("setAnswer rejects blank and takeAnswer is null when empty", () => {
+    expect(setAnswer(dir, "   ")).toBe(false);
+    expect(takeAnswer(dir)).toBeNull();
   });
 
   it("reports acceptance via the return value (true accepted, false rejected)", () => {

@@ -19,7 +19,7 @@
  * unit-testable against a tmp dir, and they never throw — a broken memory file
  * must not take down the relay loop.
  */
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -63,11 +63,16 @@ export function parseBlocked(text: string): string | null {
       .replace(/^\s*(?:[>*\-+#]\s*)*/, '') // leading markdown bullets/quotes/headings
       .replace(/^[*_`"'(\[\s]+/, '') // leading emphasis/quote/bracket
       .trim()
-    const m = /^blocked\b[*_`"'\s]*[:\-—]?\s*(.*)$/i.exec(line)
+    // Populated form: keyword + optional emphasis + a REQUIRED separator + reason.
+    // The mandatory separator stops ordinary prose ("blocked by the rate limiter")
+    // from being misread as the sentinel.
+    const m = /^blocked\b[*_`"'\s]*[:\-—]\s*(.*)$/i.exec(line)
     if (m) {
       // Strip any trailing emphasis/punctuation noise from the captured reason.
       return m[1].replace(/[*_`"')\]\s]+$/, '').trim()
     }
+    // Bare form: the keyword alone on its own line (optionally emphasized).
+    if (/^blocked[*_`"'\s]*$/i.test(line)) return ''
   }
   return null
 }
@@ -86,10 +91,15 @@ export function parseNeedsInput(text: string): string | null {
       .replace(/^\s*(?:[>*\-+#]\s*)*/, '') // leading markdown bullets/quotes/headings
       .replace(/^[*_`"'(\[\s]+/, '') // leading emphasis/quote/bracket
       .trim()
-    const m = /^(?:needs[_\s]?input|question)\b[*_`"'\s]*[:\-—]?\s*(.*)$/i.exec(line)
+    // Populated form: keyword + optional emphasis + a REQUIRED separator + question.
+    // The mandatory separator stops natural prose ("needs input validation", a
+    // line starting "Question ...") from falsely tripping the sentinel.
+    const m = /^(?:needs[_\s]?input|question)\b[*_`"'\s]*[:\-—]\s*(.*)$/i.exec(line)
     if (m) {
       return m[1].replace(/[*_`"')\]\s]+$/, '').trim()
     }
+    // Bare form: the keyword alone on its own line (optionally emphasized).
+    if (/^(?:needs[_\s]?input|question)[*_`"'\s]*$/i.test(line)) return ''
   }
   return null
 }
@@ -202,6 +212,60 @@ export function dequeueTask(dir: string): string | null {
   const [head, ...rest] = q
   writeQueue(dir, rest)
   return head
+}
+
+function answerPath(dir: string): string {
+  return join(dir, 'ANSWER.json')
+}
+
+/**
+ * The ANSWER channel (Phase 6c) — SEPARATE from the task queue so an answer to a
+ * NEEDS_INPUT question can never be confused with a task that happened to be
+ * queued before the question was asked. Persisted to disk (durable, like the
+ * queue) and a single slot. Never throws.
+ */
+export function setAnswer(dir: string, answer: string): boolean {
+  const t = answer.trim()
+  if (!t) return false
+  try {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(answerPath(dir), JSON.stringify({ answer: t }, null, 2) + '\n')
+  } catch (e) {
+    process.stderr.write(`[manager] answer write failed: ${e instanceof Error ? e.message : String(e)}\n`)
+    return false
+  }
+  return true
+}
+
+/** Read the pending answer (non-destructive). Null if none. */
+export function readAnswer(dir: string): string | null {
+  try {
+    const parsed = JSON.parse(readFileSync(answerPath(dir), 'utf8'))
+    return typeof parsed?.answer === 'string' ? parsed.answer : null
+  } catch {
+    return null
+  }
+}
+
+/** Read and clear the pending answer. Null if none. */
+export function takeAnswer(dir: string): string | null {
+  const a = readAnswer(dir)
+  if (a === null) return null
+  try {
+    rmSync(answerPath(dir))
+  } catch {
+    /* already gone */
+  }
+  return a
+}
+
+/** Clear any pending answer (used at teardown). Never throws. */
+export function clearAnswer(dir: string): void {
+  try {
+    rmSync(answerPath(dir))
+  } catch {
+    /* nothing to clear */
+  }
 }
 
 /** Read the manager's memory. Missing/corrupt files degrade gracefully. */

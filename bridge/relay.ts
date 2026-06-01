@@ -44,6 +44,10 @@ import {
   enqueueTask,
   dequeueTask,
   readQueue,
+  setAnswer,
+  readAnswer,
+  takeAnswer,
+  clearAnswer,
 } from './manager.ts'
 
 const HOME = homedir()
@@ -401,25 +405,26 @@ async function runTask(loop: RelayLoop, firstLeadMessage: string, maxTurns: numb
     const leadInstruction = leadRes.report
     transcript(loop, 'LEAD', leadInstruction)
 
-    // Asked the human a question (non-terminal). Checked BEFORE BLOCKED/DONE so a
-    // question is never misread as a hard stop or completion. The manager will
-    // park ALIVE and resume on the answer (handled in runManager).
-    const q = parseNeedsInput(leadInstruction)
-    if (q !== null) {
-      const question = q || 'manager asked a question'
-      appendDecision(loop.memDir, `turn ${turn}: NEEDS_INPUT — ${question}`)
-      updateState(loop.memDir, { status: 'awaiting_input', blockedReason: question })
-      return { kind: 'needsinput', question }
-    }
-
-    // Stuck and wants the human — escalate (terminal). Checked BEFORE DONE so
-    // "BLOCKED" is never misread as completion.
+    // Terminal BLOCKED is checked FIRST: a real unrecoverable dead-end must win
+    // over a (non-terminal) NEEDS_INPUT or DONE appearing on another line — a
+    // genuine block must never be silently downgraded to a stay-alive park.
     const blk = parseBlocked(leadInstruction)
     if (blk !== null) {
       const reason = blk || 'manager requested human input'
       appendDecision(loop.memDir, `turn ${turn}: BLOCKED — ${reason}`)
       updateState(loop.memDir, { status: 'blocked', blockedReason: reason })
       return { kind: 'blocked', reason }
+    }
+
+    // Asked the human a question (non-terminal). Checked before DONE so a question
+    // is never misread as completion. The manager parks ALIVE and resumes on the
+    // answer (handled in runManager).
+    const q = parseNeedsInput(leadInstruction)
+    if (q !== null) {
+      const question = q || 'manager asked a question'
+      appendDecision(loop.memDir, `turn ${turn}: NEEDS_INPUT — ${question}`)
+      updateState(loop.memDir, { status: 'awaiting_input', blockedReason: question })
+      return { kind: 'needsinput', question }
     }
 
     if (isDone(leadInstruction)) {
@@ -461,20 +466,27 @@ async function runTask(loop: RelayLoop, firstLeadMessage: string, maxTurns: numb
 // TerminalSession, so it is exercised directly against a fake loop.
 export async function awaitNextTask(loop: RelayLoop): Promise<string | null> {
   while (loop.running) {
-    const queued = dequeueTask(loop.memDir)
-    if (queued !== null) return queued
+    // When awaiting an answer (a question is outstanding) we drain the SEPARATE
+    // answer channel — never the task queue — so a task queued before the question
+    // can never be consumed as the answer. Otherwise we drain the task queue.
+    const awaitingAnswer = loop.pendingQuestion !== undefined
+    const drain = () => (awaitingAnswer ? takeAnswer(loop.memDir) : dequeueTask(loop.memDir))
+    const ready = () => (awaitingAnswer ? readAnswer(loop.memDir) !== null : readQueue(loop.memDir).length > 0)
+
+    const first = drain()
+    if (first !== null) return first
 
     const woken = await new Promise<'task' | 'stop' | 'idle'>((resolve) => {
       loop.wake = resolve
       // Double-check inside the executor (synchronously, before any await) to
-      // close the lost-wakeup window between the dequeue above and arming wake.
-      if (readQueue(loop.memDir).length > 0) return resolve('task')
+      // close the lost-wakeup window between the drain above and arming wake.
+      if (ready()) return resolve('task')
       if (!loop.running) return resolve('stop')
       loop.parked = true
-      // Awaiting a human ANSWER (pendingQuestion set) gets the longer cap; a
-      // routine between-tasks park gets the short one.
-      const idleMs = loop.pendingQuestion ? loop.answerIdleTimeoutMs : loop.idleTimeoutMs
-      if (loop.pendingQuestion) {
+      // Awaiting a human ANSWER gets the longer cap; a routine between-tasks park
+      // gets the short one. Both are bounded so it always tears down eventually.
+      const idleMs = awaitingAnswer ? loop.answerIdleTimeoutMs : loop.idleTimeoutMs
+      if (awaitingAnswer) {
         updateState(loop.memDir, { status: 'awaiting_input' })
         transcript(loop, 'SYS', `parked ALIVE · awaiting human answer (timeout ${Math.round(idleMs / 60_000)}min)`)
       } else {
@@ -493,12 +505,12 @@ export async function awaitNextTask(loop: RelayLoop): Promise<string | null> {
     }
 
     if (!loop.running || woken === 'stop') return null
-    // Either a task arrived, or idle fired — drain the queue either way (a task
-    // may have raced in just as idle fired). Empty + idle => terminate.
-    const next = dequeueTask(loop.memDir)
+    // A task/answer arrived, or idle fired — drain either way (one may have raced
+    // in just as idle fired). Empty + idle => terminate.
+    const next = drain()
     if (next !== null) return next
     if (woken === 'idle') return null
-    // woken==='task' but nothing queued (e.g. a blank enqueue) — re-park.
+    // woken==='task' but nothing to drain (e.g. a blank enqueue) — re-park.
   }
   return null
 }
@@ -609,6 +621,7 @@ async function runManager(loop: RelayLoop, goal: string, context: string | undef
     }
     loop.parked = false
     loop.pendingQuestion = undefined // never let a stale question leak past teardown
+    clearAnswer(loop.memDir) // discard any unconsumed answer on teardown
     transcript(loop, 'SYS', `manager finished · reason: ${endReason}`)
     let cursor = 0
     try {
@@ -681,11 +694,20 @@ export function stop(loopId: string): { ok: boolean; running: boolean } {
  * is parked. A blank task, or one past the queue-depth cap, is rejected. Returns
  * whether it was accepted and the resulting queue depth.
  */
-export function enqueue(loopId: string, task: string): { ok: boolean; queued: number } {
+export function enqueue(loopId: string, task: string): { ok: boolean; queued: number; answered?: boolean } {
   const loop = loops.get(loopId)
   if (!loop || !loop.running) return { ok: false, queued: 0 }
   const t = task.trim()
   if (!t) return { ok: false, queued: readQueue(loop.memDir).length }
+  // If the manager is awaiting an ANSWER to a question, this enqueue IS the
+  // answer — route it to the separate answer channel so it can never be confused
+  // with a task that was already queued before the question was asked.
+  if (loop.pendingQuestion !== undefined) {
+    setAnswer(loop.memDir, t) // persist before signalling
+    transcript(loop, 'SYS', `answer received: ${t.slice(0, 160)}`)
+    if (loop.wake) loop.wake('task')
+    return { ok: true, answered: true, queued: readQueue(loop.memDir).length }
+  }
   // Persist before signalling (no lost task on crash); bounded so the backlog
   // can't grow without limit. accepted=false here means the queue is full.
   const accepted = enqueueTask(loop.memDir, t, MAX_QUEUE_DEPTH)

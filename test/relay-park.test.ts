@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { awaitNextTask } from "../bridge/relay.ts";
-import { enqueueTask } from "../bridge/manager.ts";
+import { enqueueTask, setAnswer, readQueue } from "../bridge/manager.ts";
 
 // awaitNextTask is the park-and-wait wake protocol (Phase 6b). It depends only on
 // loop.{memDir,logPath,running,parked,wake,idleTimer,idleTimeoutMs} — never on the
@@ -123,7 +123,20 @@ describe("awaitNextTask — the park-and-wait wake protocol", () => {
     const loop = fakeLoop(dir, { idleTimeoutMs: 5000, answerIdleTimeoutMs: 30, pendingQuestion: "which DB?" });
     const p = awaitNextTask(loop);
     await waitUntil(() => loop.parked === true);
-    enqueueTask(dir, "use postgres"); // the answer, persisted but wake NOT called
+    setAnswer(dir, "use postgres"); // the answer (separate channel), persisted, wake NOT called
     expect(await p).toBe("use postgres");
+  });
+
+  it("while awaiting an answer, a PRE-QUEUED task is NOT consumed as the answer", async () => {
+    // The conflation bug (review finding 1): a task queued before the question
+    // must not be mistaken for the answer.
+    enqueueTask(dir, "a different task queued earlier");
+    const loop = fakeLoop(dir, { idleTimeoutMs: 5000, answerIdleTimeoutMs: 40, pendingQuestion: "which DB?" });
+    const p = awaitNextTask(loop);
+    await waitUntil(() => loop.parked === true);
+    setAnswer(dir, "use postgres"); // the real answer
+    expect(await p).toBe("use postgres"); // NOT "a different task queued earlier"
+    // the pre-queued task is still in the queue, untouched
+    expect(readQueue(dir)).toEqual(["a different task queued earlier"]);
   });
 });
