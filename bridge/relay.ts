@@ -135,6 +135,8 @@ interface RelayLoop {
   lead: TerminalSession
   worker: TerminalSession
   logPath: string
+  /** the validated working directory both sessions run in (used for git handoff facts). */
+  cwd: string
   /** disk-backed manager memory dir (MISSION/STATE/LOG/QUEUE) — durable on disk. */
   memDir: string
   running: boolean
@@ -270,6 +272,7 @@ export async function startRelay(opts: StartRelayOptions): Promise<StartRelayRes
     lead,
     worker,
     logPath: join(RELAY_DIR, `${loopId}.log`),
+    cwd: opts.cwd,
     memDir,
     running: true,
     deadline: Date.now() + wallClockMs,
@@ -607,7 +610,7 @@ async function runManager(loop: RelayLoop, goal: string, context: string | undef
       } catch {
         /* log may not exist yet */
       }
-      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay task ${taskNum} ${taskReason}`, reason: taskReason, silent: true })
+      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay task ${taskNum} ${taskReason}`, reason: taskReason, silent: true, cwd: loop.cwd })
       appendDecision(loop.memDir, `task ${taskNum} ${taskReason} · parking`)
       transcript(loop, 'SYS', `task ${taskNum} ${taskReason} · parking for next task`)
     }
@@ -635,7 +638,7 @@ async function runManager(loop: RelayLoop, goal: string, context: string | undef
       emitEscalation({ type: 'relay', id: loop.loopId, cursor, summary: `relay blocked: ${blockedReason}`, reason: blockedReason })
     } else {
       updateState(loop.memDir, { status: 'done', task: 'manager stopped' })
-      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay manager finished: ${endReason}`, reason: endReason })
+      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay manager finished: ${endReason}`, reason: endReason, cwd: loop.cwd })
     }
     // Tear the tmux sessions down so they don't linger.
     await loop.lead.close().catch(() => {})

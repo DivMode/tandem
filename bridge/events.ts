@@ -17,6 +17,7 @@
  * events / waking the client" section for what a client would need to do.
  */
 import { appendFileSync, mkdirSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -46,6 +47,64 @@ export interface CompletionEvent {
   summary: string
   /** relay end reason, when applicable. */
   reason?: string
+  /**
+   * A chat-ready, copy-pasteable handoff block (plain text, multi-line). Pasting
+   * it into a claude.ai chat tells the chat Claude what finished, what to check,
+   * and what to do next. Computed by emitCompletion; absent on escalation /
+   * needs-input events.
+   */
+  handoff?: string
+}
+
+/** Git facts for the handoff block; both fall back to safe strings. */
+interface GitInfo {
+  commit: string
+  filesChanged: string
+}
+
+/**
+ * Best-effort, bounded git facts for the handoff. If `cwd` is a git repo, read
+ * the short HEAD hash and the count of files changed in the last commit. Each
+ * command is wrapped in try/catch with a hard 3s timeout and stderr silenced, so
+ * a missing git binary, a non-repo cwd, or a slow filesystem can never crash or
+ * hang the emit path — it just falls back ("none" / "unknown").
+ */
+function gitInfo(cwd?: string): GitInfo {
+  const fallback: GitInfo = { commit: 'none', filesChanged: 'unknown' }
+  if (!cwd) return fallback
+  const run = (args: string[]): string =>
+    execFileSync('git', args, { cwd, timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8' }).trim()
+  let commit = 'none'
+  try {
+    commit = run(['rev-parse', '--short', 'HEAD']) || 'none'
+  } catch {
+    return fallback // not a repo / no git — give up on both, stay fast.
+  }
+  let filesChanged = 'unknown'
+  try {
+    // --shortstat yields e.g. " 3 files changed, 40 insertions(+), 2 deletions(-)".
+    const stat = run(['diff', '--stat', 'HEAD~1', '--shortstat'])
+    const m = stat.match(/(\d+)\s+files?\s+changed/)
+    if (m) filesChanged = m[1]
+  } catch {
+    /* keep "unknown" */
+  }
+  return { commit, filesChanged }
+}
+
+/**
+ * Build the chat-ready handoff block. Worded so it can be pasted straight into a
+ * claude.ai chat: the chat Claude immediately knows what happened, what to check,
+ * and what to do next.
+ */
+export function buildHandoff(event: { id: string; status: string; summary: string }, git: GitInfo): string {
+  return [
+    `CC check — session "${event.id}" finished (${event.status}).`,
+    `Summary: ${event.summary}`,
+    `Commit: ${git.commit}`,
+    `Files changed: ${git.filesChanged}`,
+    `Next: Review the session output and decide the next step.`,
+  ].join('\n')
 }
 
 /** Collapse whitespace and clamp to a short single-line summary. */
@@ -60,6 +119,8 @@ export interface NtfyPayload {
   body: string
   priority: string
   tags: string
+  /** Optional ntfy Click URL — tapping the notification opens this on the phone. */
+  click?: string
 }
 
 /**
@@ -93,11 +154,15 @@ export function ntfyPayload(
     }
   }
   return {
-    // One-line human summary: id, status, cursor, then the short summary text.
+    // Short title; the BODY is the chat-ready handoff block (multi-line, NOT
+    // collapsed) so you can copy it straight from the notification into a chat.
+    // Falls back to the old one-line summary if no handoff was computed.
     title: `tandem: ${event.id} done`,
-    body: summarize(`${event.type} ${event.id} ${event.status} @${event.cursor} — ${event.summary}`),
+    body: event.handoff ?? summarize(`${event.type} ${event.id} ${event.status} @${event.cursor} — ${event.summary}`),
     priority: 'default',
     tags: 'white_check_mark',
+    // Tapping the notification opens claude.ai so you can paste the handoff.
+    click: 'https://claude.ai',
   }
 }
 
@@ -114,13 +179,14 @@ function notifyNtfy(event: CompletionEvent, opts?: { escalation?: boolean; needs
 
   const server = (process.env.TANDEM_NTFY_SERVER || 'https://ntfy.sh').replace(/\/+$/, '')
   const url = `${server}/${encodeURIComponent(topic)}`
-  const { title, body, priority, tags } = ntfyPayload(event, opts)
+  const { title, body, priority, tags, click } = ntfyPayload(event, opts)
 
   try {
     void fetch(url, {
       method: 'POST',
       // Headers must be ASCII/single-line; the id matches NAME_RE so this is safe.
-      headers: { Title: title, Priority: priority, Tags: tags },
+      // Click (if present) is a plain URL — also single-line ASCII.
+      headers: { Title: title, Priority: priority, Tags: tags, ...(click ? { Click: click } : {}) },
       body,
     }).catch((e) => logBridge({ event: 'ntfy', ok: false, topic, error: String(e) }))
   } catch (e) {
@@ -132,11 +198,19 @@ function notifyNtfy(event: CompletionEvent, opts?: { escalation?: boolean; needs
  * Emit a completion event. Never throws and never blocks the caller: log-write
  * failures go to stderr and the webhook POST is fire-and-forget.
  */
-export function emitCompletion(ev: Omit<CompletionEvent, 'status' | 'ts'> & { silent?: boolean }): void {
+export function emitCompletion(
+  ev: Omit<CompletionEvent, 'status' | 'ts' | 'handoff'> & { silent?: boolean; cwd?: string },
+): void {
   // `silent` suppresses ONLY the phone push (sink 3) — events.log + webhook still
   // fire — so routine per-task completions stay durable without buzzing the phone.
-  const { silent, ...rest } = ev
-  const event = { ts: new Date().toISOString(), status: 'done' as const, ...rest }
+  // `cwd` is used only to compute the git facts in the handoff; it is NOT stored
+  // in the event (so no local path leaks into events.log / the webhook).
+  const { silent, cwd, ...rest } = ev
+  const base = { ts: new Date().toISOString(), status: 'done' as const, ...rest }
+  // Chat-ready handoff block, computed once and carried on the event so all three
+  // sinks (log line, webhook JSON, ntfy body) share the same text.
+  const handoff = buildHandoff(base, gitInfo(cwd))
+  const event = { ...base, handoff }
   const line = JSON.stringify(event) + '\n'
 
   // 1) Durable local log.

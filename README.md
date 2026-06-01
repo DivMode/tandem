@@ -113,8 +113,11 @@ tandem **emits** a completion event the moment a turn or relay finishes — you 
 **What is emitted** — a JSON object:
 
 ```json
-{ "ts": "…", "type": "session", "status": "done", "id": "<session|loopId>", "cursor": 12345, "summary": "…", "reason": "…" }
+{ "ts": "…", "type": "session", "status": "done", "id": "<session|loopId>", "cursor": 12345, "summary": "…", "reason": "…", "handoff": "CC check — session \"…\" finished (done).\nSummary: …\nCommit: …\nFiles changed: …\nNext: …" }
 ```
+
+The `handoff` field is a chat-ready, copy-pasteable plain-text block (also used as
+the phone notification body — see *Phone notifications* below).
 
 **Where it goes (the EMIT side, which this repo implements):**
 
@@ -133,15 +136,33 @@ off until you set a topic. Three steps:
 3. **Set `TANDEM_NTFY_TOPIC`** in your `.env` to that exact topic (and optionally
    `TANDEM_NTFY_SERVER` if you self-host ntfy; default `https://ntfy.sh`).
 
-Now each completion sends a notification titled `tandem: <session id> done` with a
-one-line summary (id, status, cursor, summary text). The POST is fire-and-forget;
-if ntfy is unreachable the failure is logged to `~/.tandem/bridge.log` and the
-bridge keeps running.
+Now each completion sends a notification titled `tandem: <session id> done` whose
+**body is a chat-ready handoff block** — the same plain-text block written to
+`events.log` and POSTed to the webhook. On the phone it looks like:
+
+```
+🔔 tandem: my-session done
+CC check — session "my-session" finished (done).
+Summary: added the handoff block to completion events
+Commit: 880f6e0
+Files changed: 3
+Next: Review the session output and decide the next step.
+```
+
+The notification carries a **Click action pointing at https://claude.ai**, so
+tapping it opens claude.ai on your phone. There you paste `check` (or paste the
+handoff block itself) and the chat Claude immediately picks up — it knows what
+finished, the commit, how many files changed, and what to do next, without you
+re-typing any context. The POST is fire-and-forget; if ntfy is unreachable the
+failure is logged to `~/.tandem/bridge.log` and the bridge keeps running. (Commit
+hash and file count are read with a bounded, 3s-timeout `git` call in the
+session's cwd; if it isn't a git repo they fall back to `none` / `unknown`.)
 
 **Honest note:** this pings a **device** (your phone / the ntfy app) — it does
 **not** and **cannot** wake the claude.ai chat or post a reply there. It tells
-*you* the work is done so you can go back to the chat; the chat client still
-can't be woken by a server-initiated signal (see below).
+*you* the work is done and hands you a paste-ready block, so going back to the
+chat is one tap + one paste; the chat client still can't be woken by a
+server-initiated signal on its own (see below).
 
 ### Persistent manager: disk-backed memory + escalation
 

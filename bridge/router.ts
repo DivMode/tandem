@@ -286,7 +286,7 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
     const result = await session.send(text)
     if (result.status === 'done') {
       // Turn finished — EMIT a completion event (push), not just return it.
-      emitCompletion({ type: 'session', id: name, cursor: result.cursor, summary: summarize(result.report) })
+      emitCompletion({ type: 'session', id: name, cursor: result.cursor, summary: summarize(result.report), cwd: session.cwd })
     }
     return ok({
       status: result.status,
@@ -312,7 +312,7 @@ async function readSession(name: string, cursor: number): Promise<RpcResult> {
   try {
     const page = await session.readSince(cursor)
     if (page.idle && page.text.trim().length > 0) {
-      emitCompletion({ type: 'session', id: name, cursor: page.cursor, summary: summarize(page.text) })
+      emitCompletion({ type: 'session', id: name, cursor: page.cursor, summary: summarize(page.text), cwd: session.cwd })
     }
     return ok({ ...page, live: true, attachHint: session.attachHint() })
   } catch (e) {
