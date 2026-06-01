@@ -30,6 +30,7 @@ function fakeLoop(dir: string, overrides: Record<string, unknown> = {}): any {
     running: true,
     parked: false,
     idleTimeoutMs: 5000,
+    answerIdleTimeoutMs: 5000,
     maxTurns: 5,
     perTaskWallClockMs: 1000,
     deadline: Date.now() + 1000,
@@ -99,5 +100,30 @@ describe("awaitNextTask — the park-and-wait wake protocol", () => {
     enqueueTask(dir, "should-not-run");
     const loop = fakeLoop(dir, { running: false });
     expect(await awaitNextTask(loop)).toBeNull();
+  });
+
+  it("uses the LONGER answer-idle cap when awaiting an answer (pendingQuestion set)", async () => {
+    // Routine idle is tiny; the answer cap is what should govern the wait.
+    const loop = fakeLoop(dir, { idleTimeoutMs: 20, answerIdleTimeoutMs: 80, pendingQuestion: "which DB?" });
+    const t0 = Date.now();
+    expect(await awaitNextTask(loop)).toBeNull();
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(70); // waited the answer cap, not the 20ms routine cap
+  });
+
+  it("uses the routine idle cap when NOT awaiting an answer", async () => {
+    const loop = fakeLoop(dir, { idleTimeoutMs: 30, answerIdleTimeoutMs: 5000, pendingQuestion: undefined });
+    const t0 = Date.now();
+    expect(await awaitNextTask(loop)).toBeNull();
+    const waited = Date.now() - t0;
+    expect(waited).toBeGreaterThanOrEqual(25);
+    expect(waited).toBeLessThan(2000); // did NOT use the 5s answer cap
+  });
+
+  it("drains an answer that races in as the answer-idle timer fires (no dropped answer)", async () => {
+    const loop = fakeLoop(dir, { idleTimeoutMs: 5000, answerIdleTimeoutMs: 30, pendingQuestion: "which DB?" });
+    const p = awaitNextTask(loop);
+    await waitUntil(() => loop.parked === true);
+    enqueueTask(dir, "use postgres"); // the answer, persisted but wake NOT called
+    expect(await p).toBe("use postgres");
   });
 });

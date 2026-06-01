@@ -28,12 +28,14 @@ const MANAGER_ROOT = join(homedir(), '.tandem', 'manager')
 /** The manager's working set, persisted to STATE.json. */
 export interface ManagerState {
   /**
-   * running  — actively driving the worker on the current task.
-   * parked   — idle, alive, waiting for the next task (Phase 6b).
-   * blocked  — stuck; escalated to the human, loop halted.
-   * done     — fully finished and torn down.
+   * running        — actively driving the worker on the current task.
+   * parked         — idle, alive, waiting for the next task (Phase 6b).
+   * awaiting_input — mid-task; asked the human a question; parked ALIVE awaiting
+   *                  their answer (delivered via enqueue), then resumes (Phase 6c).
+   * blocked        — stuck; escalated to the human, loop halted (terminal).
+   * done           — fully finished and torn down.
    */
-  status: 'running' | 'parked' | 'blocked' | 'done'
+  status: 'running' | 'parked' | 'awaiting_input' | 'blocked' | 'done'
   /** last completed lead turn. */
   turn: number
   /** short description of the current task/focus. */
@@ -64,6 +66,28 @@ export function parseBlocked(text: string): string | null {
     const m = /^blocked\b[*_`"'\s]*[:\-—]?\s*(.*)$/i.exec(line)
     if (m) {
       // Strip any trailing emphasis/punctuation noise from the captured reason.
+      return m[1].replace(/[*_`"')\]\s]+$/, '').trim()
+    }
+  }
+  return null
+}
+
+/**
+ * Detect the NON-TERMINAL "ask the human a question" sentinel (Phase 6c). The
+ * lead emits `NEEDS_INPUT: <question>` (or `QUESTION:` / `NEEDS INPUT:`) on its
+ * own line when it needs an answer to continue — UNLIKE BLOCKED, this pauses the
+ * manager ALIVE rather than tearing it down. Mirrors parseBlocked's tolerant,
+ * own-line matching. Returns the question ('' for a bare sentinel), or null.
+ * Disjoint from parseBlocked (neither sentinel matches the other).
+ */
+export function parseNeedsInput(text: string): string | null {
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine
+      .replace(/^\s*(?:[>*\-+#]\s*)*/, '') // leading markdown bullets/quotes/headings
+      .replace(/^[*_`"'(\[\s]+/, '') // leading emphasis/quote/bracket
+      .trim()
+    const m = /^(?:needs[_\s]?input|question)\b[*_`"'\s]*[:\-—]?\s*(.*)$/i.exec(line)
+    if (m) {
       return m[1].replace(/[*_`"')\]\s]+$/, '').trim()
     }
   }
@@ -230,9 +254,11 @@ export function regroundPreamble(dir: string, maxLogLines = 20): string {
     'Recent decisions (append-only log):',
     recent.trim() || '(none yet)',
     '',
-    'If you cannot proceed without the human (repeated worker failure, a call that',
-    'needs their authority/taste, or an irreversible action), reply with',
-    '"BLOCKED: <reason>" on its own line and STOP — that pings them directly.',
+    'If you need the human, you have TWO options, each on its OWN line:',
+    '  • "NEEDS_INPUT: <question>" — ask a question and PAUSE. You will NOT be torn',
+    '    down: you stay alive, the human is pinged, and you RESUME with their answer.',
+    '  • "BLOCKED: <reason>" — a hard stop you believe is unrecoverable (ends the run).',
+    'Prefer NEEDS_INPUT whenever an answer would let you keep going.',
     '=== END STANDING MEMORY ===',
     '',
   ].join('\n')

@@ -110,7 +110,7 @@ function buildMcpServer(): McpServer {
 
   server.tool(
     "relay",
-    `${BLAST_RADIUS}\n\nControl the autonomous, NO-HUMAN-IN-THE-LOOP lead/worker relay (two interactive Claude Code sessions that message each other until the lead says RELAY_DONE, a max-turn cap is hit, or it is stopped). The lead is a PERSISTENT manager: when a task finishes it PARKS (stays alive, idle) and waits for the next task instead of dying; it tears down on stop, an idle-timeout, or when it escalates "BLOCKED". action:\n- "start": begin a relay — needs { goal, cwd?, maxTurns? } → { status:"running", loopId, leadName, workerName }\n- "read": fetch the lead<->worker transcript — needs { loopId, cursor? } → { text, cursor, running } (running:false = finished)\n- "enqueue": hand the parked/running manager the NEXT task — needs { loopId, task } → { ok, queued }\n- "inject": steer the lead mid-task — needs { loopId, message }\n- "stop": halt promptly — needs { loopId }\nEach finished task and the final teardown emit a completion event; an unresolvable block emits an urgent escalation (see README "Completion events").`,
+    `${BLAST_RADIUS}\n\nControl the autonomous, NO-HUMAN-IN-THE-LOOP lead/worker relay (two interactive Claude Code sessions that message each other). The lead is a PERSISTENT manager: when a task finishes it PARKS (stays alive, idle) and waits for the next task instead of dying; it tears down on stop, an idle-timeout, when it asks an unanswered question too long, or when it escalates terminal "BLOCKED". action:\n- "start": begin a relay — needs { goal, cwd?, maxTurns? } → { status:"running", loopId, leadName, workerName }\n- "read": fetch the lead<->worker transcript — needs { loopId, cursor? } → { text, cursor, running } (running:false = finished)\n- "enqueue": give the parked/running manager the NEXT task — needs { loopId, task } → { ok, queued }. ALSO the channel to ANSWER a question: if the manager asked NEEDS_INPUT and is awaiting an answer, the first enqueue is treated as that answer and RESUMES the same task.\n- "inject": steer the lead mid-task (only while a task is actively RUNNING; rejected while parked/awaiting-answer — use enqueue to answer) — needs { loopId, message }\n- "stop": halt promptly — needs { loopId }\nNotifications: routine task completions are SILENT (logged, no phone push); the manager buzzes the phone only when it NEEDS YOUR ANSWER (urgent, stays alive) or is FULLY FINISHED; a terminal BLOCKED emits an urgent escalation (see README "Completion events").`,
     {
       action: z.enum(["start", "read", "inject", "stop", "enqueue"]),
       goal: z.string().optional().describe('action=start: the relay objective.'),
@@ -118,8 +118,8 @@ function buildMcpServer(): McpServer {
       maxTurns: z.number().int().positive().optional().describe('action=start: per-task hard cap on turns.'),
       loopId: z.string().optional().describe('action=read|inject|stop|enqueue: the loop id from start.'),
       cursor: z.number().int().nonnegative().optional().describe('action=read: byte cursor to page from.'),
-      message: z.string().optional().describe('action=inject: message to deliver to the lead.'),
-      task: z.string().optional().describe('action=enqueue: the next task for the parked manager.'),
+      message: z.string().optional().describe('action=inject: steer a RUNNING task (rejected while parked).'),
+      task: z.string().optional().describe('action=enqueue: the next task, OR the answer to a NEEDS_INPUT question.'),
     },
     async ({ action, goal, cwd, maxTurns, loopId, cursor, message, task }) => {
       const id = encodeURIComponent(loopId ?? "");

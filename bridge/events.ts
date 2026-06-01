@@ -70,8 +70,19 @@ export interface NtfyPayload {
  */
 export function ntfyPayload(
   event: CompletionEvent,
-  opts?: { escalation?: boolean; reason?: string },
+  opts?: { escalation?: boolean; needsInput?: boolean; reason?: string },
 ): NtfyPayload {
+  if (opts?.needsInput) {
+    // Non-terminal question: the manager is alive and waiting for an answer.
+    // Distinct title from both 'done' and the terminal BLOCKED 'NEEDS YOU'.
+    const reason = (opts.reason ?? event.reason ?? event.summary ?? '').trim()
+    return {
+      title: `tandem: ${event.id} NEEDS YOUR ANSWER`,
+      body: summarize(`${event.type} ${event.id} asked: ${reason || 'needs your answer'}`),
+      priority: 'urgent',
+      tags: 'question,speech_balloon',
+    }
+  }
   if (opts?.escalation) {
     const reason = (opts.reason ?? event.reason ?? event.summary ?? '').trim()
     return {
@@ -97,7 +108,7 @@ export function ntfyPayload(
  *
  * NOTE: this reaches a DEVICE (your phone/the ntfy app), not the chat client.
  */
-function notifyNtfy(event: CompletionEvent, opts?: { escalation?: boolean; reason?: string }): void {
+function notifyNtfy(event: CompletionEvent, opts?: { escalation?: boolean; needsInput?: boolean; reason?: string }): void {
   const topic = process.env.TANDEM_NTFY_TOPIC
   if (!topic) return // ntfy off unless a topic is configured
 
@@ -121,8 +132,11 @@ function notifyNtfy(event: CompletionEvent, opts?: { escalation?: boolean; reaso
  * Emit a completion event. Never throws and never blocks the caller: log-write
  * failures go to stderr and the webhook POST is fire-and-forget.
  */
-export function emitCompletion(ev: Omit<CompletionEvent, 'status' | 'ts'>): void {
-  const event = { ts: new Date().toISOString(), status: 'done' as const, ...ev }
+export function emitCompletion(ev: Omit<CompletionEvent, 'status' | 'ts'> & { silent?: boolean }): void {
+  // `silent` suppresses ONLY the phone push (sink 3) — events.log + webhook still
+  // fire — so routine per-task completions stay durable without buzzing the phone.
+  const { silent, ...rest } = ev
+  const event = { ts: new Date().toISOString(), status: 'done' as const, ...rest }
   const line = JSON.stringify(event) + '\n'
 
   // 1) Durable local log.
@@ -147,8 +161,42 @@ export function emitCompletion(ev: Omit<CompletionEvent, 'status' | 'ts'>): void
     }
   }
 
-  // 3) Optional phone push via ntfy (env-gated, fire-and-forget).
-  notifyNtfy(event)
+  // 3) Optional phone push via ntfy (env-gated, fire-and-forget) — unless silent.
+  if (!silent) notifyNtfy(event)
+}
+
+/**
+ * Emit a NEEDS-INPUT event (Phase 6c): the manager asked the human a question and
+ * is parked ALIVE awaiting the answer (NOT torn down). Same sinks as
+ * emitCompletion, but the log line is tagged `event:"needs_input"` and the ntfy
+ * push is URGENT with a distinct "NEEDS YOUR ANSWER" title carrying the question.
+ * Never throws/blocks.
+ */
+export function emitNeedsInput(ev: Omit<CompletionEvent, 'status'> & { reason: string }): void {
+  const event = { ts: new Date().toISOString(), status: 'done' as const, ...ev }
+  const line = JSON.stringify({ event: 'needs_input', ...event }) + '\n'
+
+  try {
+    mkdirSync(EVENTS_DIR, { recursive: true })
+    appendFileSync(EVENTS_LOG, line)
+  } catch (e) {
+    process.stderr.write(`[events] needs_input log write failed: ${e instanceof Error ? e.message : String(e)}\n`)
+  }
+
+  const url = process.env.TANDEM_DONE_WEBHOOK
+  if (url) {
+    try {
+      void fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: line,
+      }).catch((e) => process.stderr.write(`[events] webhook POST failed: ${e}\n`))
+    } catch (e) {
+      process.stderr.write(`[events] webhook error: ${e instanceof Error ? e.message : String(e)}\n`)
+    }
+  }
+
+  notifyNtfy(event, { needsInput: true, reason: ev.reason })
 }
 
 /**

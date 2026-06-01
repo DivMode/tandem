@@ -39,3 +39,19 @@ describe("ntfyPayload — escalation (manager is stuck, needs the human)", () =>
     expect(p.body).toContain("need an API key");
   });
 });
+
+describe("ntfyPayload — needs-input (manager asked a question, staying alive)", () => {
+  it("uses a distinct 'NEEDS YOUR ANSWER' title, urgent, with a question tag", () => {
+    const p = ntfyPayload(baseEvent, { needsInput: true, reason: "which region?" });
+    expect(p.title).toBe("tandem: loop42 NEEDS YOUR ANSWER");
+    expect(p.priority).toBe("urgent");
+    expect(p.tags).toContain("question");
+    // distinct from both completion ('done') and terminal escalation ('NEEDS YOU')
+    expect(p.title).not.toBe("tandem: loop42 done");
+    expect(p.title).not.toBe("tandem: loop42 NEEDS YOU");
+  });
+  it("body carries the question text", () => {
+    const p = ntfyPayload(baseEvent, { needsInput: true, reason: "which region?" });
+    expect(p.body).toContain("which region?");
+  });
+});

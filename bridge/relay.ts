@@ -32,7 +32,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { TerminalSession } from './terminal-session.ts'
-import { emitCompletion, emitEscalation } from './events.ts'
+import { emitCompletion, emitEscalation, emitNeedsInput } from './events.ts'
 import {
   managerDir,
   initManagerMemory,
@@ -40,6 +40,7 @@ import {
   updateState,
   regroundPreamble,
   parseBlocked,
+  parseNeedsInput,
   enqueueTask,
   dequeueTask,
   readQueue,
@@ -59,6 +60,14 @@ const DEFAULT_WALL_CLOCK_MS = 30 * 60_000 // 30 minutes — now PER TASK (Phase 
  */
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000 // 15 minutes
 const IDLE_TIMEOUT_CEILING_MS = 60 * 60_000 // 1 hour
+/**
+ * Phase 6c: when the manager is parked AWAITING A HUMAN ANSWER (it asked a
+ * question), it waits longer than the routine idle cap — a human needs time to
+ * see the buzz and reply — but still bounded so an unanswered manager tears down
+ * rather than holding two tmux sessions forever.
+ */
+const DEFAULT_ANSWER_IDLE_TIMEOUT_MS = 60 * 60_000 // 1 hour
+const ANSWER_IDLE_CEILING_MS = 6 * 60 * 60_000 // 6 hours
 /** Hard cap on pending queued tasks, so enqueue can't grow the backlog unbounded. */
 const MAX_QUEUE_DEPTH = 64
 
@@ -138,6 +147,10 @@ interface RelayLoop {
   perTaskWallClockMs: number
   /** How long to stay parked before tearing down. */
   idleTimeoutMs: number
+  /** Longer cap used while parked awaiting a human answer (pendingQuestion set). */
+  answerIdleTimeoutMs: number
+  /** Set while the manager has asked a question and is awaiting the human's answer. */
+  pendingQuestion?: string
   /** True while the manager is parked (idle, awaiting the next task). */
   parked: boolean
   /** Resolver armed only while parked; enqueue()/stop() call it to wake the loop. */
@@ -176,6 +189,8 @@ export interface StartRelayOptions {
   wallClockMs?: number
   /** Optional idle-park timeout (ms); clamped to <= IDLE_TIMEOUT_CEILING_MS. */
   idleTimeoutMs?: number
+  /** Optional answer-park timeout (ms); clamped to <= ANSWER_IDLE_CEILING_MS. */
+  answerIdleTimeoutMs?: number
   /** Spec/context text seeded into the lead. */
   context?: string
   /** cwd allowlist passed straight through to TerminalSession.spawn. */
@@ -239,6 +254,10 @@ export async function startRelay(opts: StartRelayOptions): Promise<StartRelayRes
     opts.idleTimeoutMs && opts.idleTimeoutMs > 0 ? opts.idleTimeoutMs : DEFAULT_IDLE_TIMEOUT_MS,
     IDLE_TIMEOUT_CEILING_MS,
   )
+  const answerIdleTimeoutMs = Math.min(
+    opts.answerIdleTimeoutMs && opts.answerIdleTimeoutMs > 0 ? opts.answerIdleTimeoutMs : DEFAULT_ANSWER_IDLE_TIMEOUT_MS,
+    ANSWER_IDLE_CEILING_MS,
+  )
 
   const loop: RelayLoop = {
     loopId,
@@ -254,6 +273,7 @@ export async function startRelay(opts: StartRelayOptions): Promise<StartRelayRes
     maxTurns,
     perTaskWallClockMs: wallClockMs,
     idleTimeoutMs,
+    answerIdleTimeoutMs,
     parked: false,
   }
   loops.set(loopId, loop)
@@ -314,9 +334,26 @@ async function sendRaced(
 type TaskOutcome =
   | { kind: 'done' }
   | { kind: 'blocked'; reason: string }
+  | { kind: 'needsinput'; question: string } // asked the human — park ALIVE, resume on answer
   | { kind: 'stopped' }
   | { kind: 'deadline' } // this task hit its wall-clock cap (not fatal — park after)
   | { kind: 'maxturns' } // this task hit its per-task turn cap (not fatal — park after)
+
+/**
+ * How a resumed task is framed after the human answers a NEEDS_INPUT question.
+ * Restates the question + answer and tells the lead to RESUME (its in-flight
+ * state is reconstructed from the standing memory re-fed each turn).
+ */
+function answerSeed(answer: string, question: string): string {
+  return [
+    'The human has ANSWERED the question you were waiting on.',
+    `\nYour question was: ${question}`,
+    `Their answer: ${answer}`,
+    '\nYour mission and decision log are in the standing memory above. RESUME the',
+    'work using this answer — reply with your next instruction for the worker, or',
+    'DONE on its own line if the task is now complete.',
+  ].join('\n')
+}
 
 /** How a follow-up task (after the first) is framed for the already-seeded lead. */
 function taskSeed(task: string): string {
@@ -364,8 +401,19 @@ async function runTask(loop: RelayLoop, firstLeadMessage: string, maxTurns: numb
     const leadInstruction = leadRes.report
     transcript(loop, 'LEAD', leadInstruction)
 
-    // Stuck and wants the human — escalate. Checked BEFORE DONE so "BLOCKED" is
-    // never misread as completion.
+    // Asked the human a question (non-terminal). Checked BEFORE BLOCKED/DONE so a
+    // question is never misread as a hard stop or completion. The manager will
+    // park ALIVE and resume on the answer (handled in runManager).
+    const q = parseNeedsInput(leadInstruction)
+    if (q !== null) {
+      const question = q || 'manager asked a question'
+      appendDecision(loop.memDir, `turn ${turn}: NEEDS_INPUT — ${question}`)
+      updateState(loop.memDir, { status: 'awaiting_input', blockedReason: question })
+      return { kind: 'needsinput', question }
+    }
+
+    // Stuck and wants the human — escalate (terminal). Checked BEFORE DONE so
+    // "BLOCKED" is never misread as completion.
     const blk = parseBlocked(leadInstruction)
     if (blk !== null) {
       const reason = blk || 'manager requested human input'
@@ -423,9 +471,17 @@ export async function awaitNextTask(loop: RelayLoop): Promise<string | null> {
       if (readQueue(loop.memDir).length > 0) return resolve('task')
       if (!loop.running) return resolve('stop')
       loop.parked = true
-      updateState(loop.memDir, { status: 'parked', task: '(idle — awaiting next task)' })
-      transcript(loop, 'SYS', `parked · awaiting next task (idle timeout ${Math.round(loop.idleTimeoutMs / 60_000)}min)`)
-      loop.idleTimer = setTimeout(() => resolve('idle'), loop.idleTimeoutMs)
+      // Awaiting a human ANSWER (pendingQuestion set) gets the longer cap; a
+      // routine between-tasks park gets the short one.
+      const idleMs = loop.pendingQuestion ? loop.answerIdleTimeoutMs : loop.idleTimeoutMs
+      if (loop.pendingQuestion) {
+        updateState(loop.memDir, { status: 'awaiting_input' })
+        transcript(loop, 'SYS', `parked ALIVE · awaiting human answer (timeout ${Math.round(idleMs / 60_000)}min)`)
+      } else {
+        updateState(loop.memDir, { status: 'parked', task: '(idle — awaiting next task)' })
+        transcript(loop, 'SYS', `parked · awaiting next task (idle timeout ${Math.round(idleMs / 60_000)}min)`)
+      }
+      loop.idleTimer = setTimeout(() => resolve('idle'), idleMs)
     })
 
     // Disarm before acting on the result (resolve is idempotent; first wins).
@@ -471,15 +527,29 @@ async function runManager(loop: RelayLoop, goal: string, context: string | undef
       } else {
         const next = await awaitNextTask(loop)
         if (next === null) {
-          endReason = loop.running ? 'idle timeout — no new tasks' : 'stopped'
+          endReason = !loop.running
+            ? 'stopped'
+            : loop.pendingQuestion !== undefined
+              ? 'idle timeout — unanswered question'
+              : 'idle timeout — no new tasks'
           break
         }
         // A fresh task must not inherit a leftover steer from the previous one.
         loop.pendingInjection = undefined
-        taskNum++
-        leadMessage = taskSeed(next)
-        appendDecision(loop.memDir, `task ${taskNum} received: ${next.slice(0, 160)}`)
-        transcript(loop, 'SYS', `--- task ${taskNum}: ${next.slice(0, 160)} ---`)
+        if (loop.pendingQuestion !== undefined) {
+          // This is the ANSWER to an outstanding question — RESUME the same task
+          // (don't bump taskNum), and consume the question so a later enqueue is a
+          // fresh task, not a re-answer.
+          leadMessage = answerSeed(next, loop.pendingQuestion)
+          appendDecision(loop.memDir, `task ${taskNum} resumed with human answer: ${next.slice(0, 160)}`)
+          transcript(loop, 'SYS', `--- task ${taskNum} resumed (answer received) ---`)
+          loop.pendingQuestion = undefined
+        } else {
+          taskNum++
+          leadMessage = taskSeed(next)
+          appendDecision(loop.memDir, `task ${taskNum} received: ${next.slice(0, 160)}`)
+          transcript(loop, 'SYS', `--- task ${taskNum}: ${next.slice(0, 160)} ---`)
+        }
       }
 
       // Fresh per-task budget (turn loop restarts at 1; wall-clock resets).
@@ -496,8 +566,27 @@ async function runManager(loop: RelayLoop, goal: string, context: string | undef
         break
       }
 
-      // done | deadline | maxturns => this task finished (possibly capped). Emit a
-      // per-task completion (so the phone/chat learns it), then PARK for the next.
+      if (outcome.kind === 'needsinput') {
+        // The manager asked a question. Buzz the human (urgent), stay ALIVE, and
+        // PARK for the answer — do NOT break/teardown. pendingQuestion is set
+        // SYNCHRONOUSLY here (before the next awaitNextTask) so the answer that
+        // arrives via enqueue is framed as a resume, not a fresh task.
+        let cursor = 0
+        try {
+          cursor = statSync(loop.logPath).size
+        } catch {
+          /* log may not exist yet */
+        }
+        emitNeedsInput({ type: 'relay', id: loop.loopId, cursor, summary: `needs your answer: ${outcome.question}`, reason: outcome.question })
+        loop.pendingQuestion = outcome.question
+        appendDecision(loop.memDir, `task ${taskNum} awaiting human answer · parking`)
+        transcript(loop, 'SYS', `task ${taskNum} NEEDS_INPUT · parking ALIVE for the human's answer`)
+        continue // fall into awaitNextTask at the top of the loop
+      }
+
+      // done | deadline | maxturns => this task finished (possibly capped). Record
+      // it SILENTLY (events.log only — no phone buzz on routine completion), then
+      // PARK for the next task.
       const taskReason =
         outcome.kind === 'done' ? 'task done' : outcome.kind === 'deadline' ? 'task wall-clock cap' : 'task max turns'
       let cursor = 0
@@ -506,7 +595,7 @@ async function runManager(loop: RelayLoop, goal: string, context: string | undef
       } catch {
         /* log may not exist yet */
       }
-      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay task ${taskNum} ${taskReason}`, reason: taskReason })
+      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay task ${taskNum} ${taskReason}`, reason: taskReason, silent: true })
       appendDecision(loop.memDir, `task ${taskNum} ${taskReason} · parking`)
       transcript(loop, 'SYS', `task ${taskNum} ${taskReason} · parking for next task`)
     }
@@ -519,6 +608,7 @@ async function runManager(loop: RelayLoop, goal: string, context: string | undef
       loop.idleTimer = undefined
     }
     loop.parked = false
+    loop.pendingQuestion = undefined // never let a stale question leak past teardown
     transcript(loop, 'SYS', `manager finished · reason: ${endReason}`)
     let cursor = 0
     try {
@@ -606,16 +696,19 @@ export function enqueue(loopId: string, task: string): { ok: boolean; queued: nu
 }
 
 /**
- * Inject an operator message into the loop. It is prepended to the next message
- * the lead receives (taking effect on the next round, promptly — the loop checks
- * pendingInjection at the top of every turn). Returns whether it was accepted.
+ * Inject an operator message to steer the lead mid-task. It is prepended to the
+ * next message the lead receives (consumed at the top of the next turn). Returns
+ * whether it was accepted. NOTE: to ANSWER a manager that asked a NEEDS_INPUT
+ * question (parked-for-answer), or to add the next task, use `enqueue` — inject
+ * is rejected while parked (it only steers a task that is actively running).
  */
 export function inject(loopId: string, message: string): { ok: boolean } {
   const loop = loops.get(loopId)
   if (!loop || !loop.running) return { ok: false }
-  // While PARKED there is no in-flight task to steer. Reject rather than stash a
-  // pending injection that would (a) silently leak into the NEXT, unrelated task,
-  // or (b) be dropped at idle teardown. To add the next task, use enqueue.
+  // While PARKED (between tasks OR awaiting an answer) there is no in-flight turn
+  // to steer. Reject rather than stash a pending injection that would (a) silently
+  // leak into the NEXT task, or (b) be dropped at idle teardown. Use enqueue to
+  // add the next task or to answer an outstanding question.
   if (loop.parked) return { ok: false }
   loop.pendingInjection = message
   transcript(loop, 'SYS', `operator injected: ${message}`)
@@ -625,7 +718,7 @@ export function inject(loopId: string, message: string): { ok: boolean } {
 /** Loop metadata (for status / list surfaces). undefined if unknown. */
 export function info(
   loopId: string,
-): { loopId: string; leadName: string; workerName: string; running: boolean; parked: boolean; queued: number } | undefined {
+): { loopId: string; leadName: string; workerName: string; running: boolean; parked: boolean; awaitingAnswer: boolean; queued: number } | undefined {
   const loop = loops.get(loopId)
   if (!loop) return undefined
   return {
@@ -634,6 +727,7 @@ export function info(
     workerName: loop.workerName,
     running: loop.running,
     parked: loop.parked,
+    awaitingAnswer: loop.pendingQuestion !== undefined,
     queued: readQueue(loop.memDir).length,
   }
 }

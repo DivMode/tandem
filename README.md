@@ -179,14 +179,35 @@ you spinning up a throwaway pair each time.
 > be reaped by hand (`tmux kill-session`). Auto-resume + an orphan reaper are
 > Phase 6c.
 
-**Escalation.** When the manager genuinely can't proceed without you — repeated
-worker failure, a call that needs your authority, or an irreversible action — it
-emits `BLOCKED: <reason>` on its own line. tandem then fires an **urgent** ntfy
-push titled `tandem: <id> NEEDS YOU` (priority `urgent`, the blocking reason in
-the body) and writes an `event:"escalation"` line to `events.log` — instead of
-silently burning turns until a cap. This is the one place a device-push is the
-right primitive: **you** are the only node at the top that can actually be woken.
-Normal completions are unchanged (quiet `done` push); escalation is the loud one.
+**When does it buzz your phone?** Deliberately only when it's worth your
+attention — not on every step:
+
+| Event | Phone push? | ntfy title |
+|---|---|---|
+| Routine task finished (manager parks for the next) | **No** (logged only) | — |
+| Manager **asks you a question** (`NEEDS_INPUT`) | **Yes, urgent** | `tandem: <id> NEEDS YOUR ANSWER` |
+| Manager **fully finished** (stop / idle-timeout / all done) | **Yes** | `tandem: <id> done` |
+| Manager hit a terminal dead-end (`BLOCKED`) | **Yes, urgent** | `tandem: <id> NEEDS YOU` |
+
+Every event is still written to `events.log` regardless; only the **phone push**
+is gated, so routine progress stays durable without buzzing you.
+
+**Needs input — ask, stay alive, resume.** When the manager needs an answer to
+continue (not a dead-end, just a question), it emits `NEEDS_INPUT: <question>` on
+its own line. It then **parks alive** (it does *not* tear down), buzzes you
+urgently with the question, and waits — for a longer window than the routine idle
+park (default 1 h, max 6 h). You answer the same way you add work: through the
+chat, `relay { action: "enqueue", loopId, task: "<your answer>" }`. The first
+enqueue after a question is treated as the **answer** and **resumes the same
+task** (the lead re-grounds from its mission + decision log). So the full loop is:
+**manager asks → phone buzzes → you tell the chat → chat enqueues the answer →
+manager resumes.** If you never answer, it tears down at the answer-timeout (one
+final `done` buzz). `BLOCKED` remains the separate **terminal** escape hatch for a
+genuinely unrecoverable dead-end.
+
+This is the one place a device-push is the right primitive: **you** are the only
+node at the top that can actually be woken — and the chat is where *you* go to
+push the answer back down.
 
 **The missing piece (client side, out of scope / not under our control):** turning a completion event into an *unprompted* chat reply requires the chat client to be woken by it. Today **claude.ai chat cannot be woken this way** — a remote MCP connector is request/response, and the stateless Streamable-HTTP transport here holds no standing server→client channel to deliver a server-initiated notification to the chat UI. So tandem gives you the reliable signal (`events.log` + webhook); bridging that into an automatic message would need a client that polls `events.log`/the webhook and re-prompts the model — which only works in a harness you control, not in claude.ai chat as it exists now.
 

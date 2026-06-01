@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseBlocked,
+  parseNeedsInput,
   initManagerMemory,
   readMemory,
   appendDecision,
@@ -39,6 +40,37 @@ describe("parseBlocked (the escalation sentinel)", () => {
   });
   it("returns null when there is no sentinel (e.g. a normal DONE)", () => {
     expect(parseBlocked("all good now\nDONE")).toBeNull();
+  });
+});
+
+describe("parseNeedsInput (the non-terminal 'ask the human a question' sentinel)", () => {
+  it("returns the question when a line starts with NEEDS_INPUT:", () => {
+    expect(parseNeedsInput("NEEDS_INPUT: which database should I use?")).toBe(
+      "which database should I use?",
+    );
+  });
+  it("accepts the QUESTION: alias and a space variant 'NEEDS INPUT:'", () => {
+    expect(parseNeedsInput("QUESTION: which region?")).toBe("which region?");
+    expect(parseNeedsInput("NEEDS INPUT: which key?")).toBe("which key?");
+  });
+  it("tolerates markdown emphasis and a dash separator", () => {
+    expect(parseNeedsInput("**NEEDS_INPUT** — pick a region")).toBe("pick a region");
+  });
+  it("matches case-insensitively on its own line", () => {
+    expect(parseNeedsInput("step one done\n> needs_input: which key?\nmore")).toBe("which key?");
+  });
+  it("returns empty string for a bare NEEDS_INPUT (still a question, no text)", () => {
+    expect(parseNeedsInput("NEEDS_INPUT")).toBe("");
+  });
+  it("does NOT trip on the words inside a sentence", () => {
+    expect(parseNeedsInput("this step needs input from the API team")).toBeNull();
+  });
+  it("returns null for a normal DONE", () => {
+    expect(parseNeedsInput("all set\nDONE")).toBeNull();
+  });
+  it("is DISJOINT from parseBlocked (neither sentinel matches the other)", () => {
+    expect(parseNeedsInput("BLOCKED: cannot proceed")).toBeNull();
+    expect(parseBlocked("NEEDS_INPUT: which db?")).toBeNull();
   });
 });
 
@@ -168,5 +200,14 @@ describe("parked status round-trips (the persistent-manager idle state)", () => 
     initManagerMemory(dir, { goal: "g" });
     updateState(dir, { status: "parked", task: "(idle)" });
     expect(readMemory(dir).state?.status).toBe("parked");
+  });
+
+  it("persists status 'awaiting_input' with the outstanding question", () => {
+    initManagerMemory(dir, { goal: "g" });
+    updateState(dir, { status: "awaiting_input", blockedReason: "which DB?" });
+    const s = readMemory(dir).state;
+    expect(s?.status).toBe("awaiting_input");
+    expect(s?.blockedReason).toBe("which DB?");
+    expect(typeof s?.task).toBe("string"); // unspecified fields survive the merge
   });
 });
