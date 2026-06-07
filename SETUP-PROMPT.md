@@ -73,7 +73,9 @@ To connect it in Claude.ai:
 
 Then install the "Claude for Chrome" extension and sign in, and in any chat say: start tandem
 
-Your Claude Code already has the tandem skills. To give your chat AI the director skill: in Claude.ai open Settings > Customize > Skills, click + / Create skill, upload the file tandem-orchestration.zip from your tandem folder, and toggle it on.
+Now physically reveal the skill bundle so I can drag it: on macOS run `open -R <repo path>/tandem-orchestration.zip` (opens Finder with the file already selected/highlighted, ready to drag); on Linux run `xdg-open <repo path>` (opens the folder). Then print:
+
+A Finder window just opened with tandem-orchestration.zip selected. In Claude.ai, go to Settings > Customize > Skills, click + / Create skill, then drag that file in (or click to browse to it), and toggle it on. Your Claude Code already has all 3 skills.
 
 (If Claude.ai ever asks you to "sign in" to the connector instead of just adding it, the URL is wrong - re-paste the full one above, including the part after the last slash.)
 ```
