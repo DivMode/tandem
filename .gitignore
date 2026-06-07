@@ -44,3 +44,6 @@ build/
 
 # Coverage
 coverage/
+
+# personal project notes — not part of the public bridge
+CLAUDE.md
