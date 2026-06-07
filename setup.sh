@@ -134,6 +134,33 @@ esac
 say "Installing dependencies (npm install)…"
 npm install --silent
 
+# ── 2b. Install the tandem skills + build the Claude.ai skill bundle ─────────
+# Idempotent: copies this repo's skills/tandem-* folders into Claude Code's
+# skills dir, and rebuilds tandem-orchestration.zip (the bundle you upload to
+# Claude.ai as a chat-side skill). Safe to re-run — copies overwrite, the zip
+# is regenerated from scratch.
+SKILLS_SRC="${ROOT}/skills"
+SKILLS_DEST="${HOME}/.claude/skills"
+SKILL_COUNT=0
+if [ -d "$SKILLS_SRC" ]; then
+  mkdir -p "$SKILLS_DEST"
+  for d in "$SKILLS_SRC"/tandem-*/; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    rm -rf "${SKILLS_DEST:?}/${name}"
+    cp -R "$d" "${SKILLS_DEST}/${name}"
+    SKILL_COUNT=$((SKILL_COUNT + 1))
+  done
+
+  # Build tandem-orchestration.zip in the repo root (contents zipped so the
+  # archive holds the tandem-orchestration/ folder at its top level).
+  if [ -d "${SKILLS_SRC}/tandem-orchestration" ] && command -v zip >/dev/null 2>&1; then
+    rm -f "${ROOT}/tandem-orchestration.zip"
+    ( cd "$SKILLS_SRC" && zip -qr "${ROOT}/tandem-orchestration.zip" tandem-orchestration )
+  fi
+  say "Installed ${SKILL_COUNT} tandem skills into Claude Code; built tandem-orchestration.zip for Claude.ai."
+fi
+
 # ── 3. .env (token is TUNNEL-ONLY: the stdio path is local and needs none) ──
 [ -f .env ] || cp .env.example .env
 
