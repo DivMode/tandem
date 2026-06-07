@@ -1,10 +1,32 @@
 # tandem
 
-An MCP bridge that lets a chat AI (Claude.ai) spawn and drive interactive Claude Code sessions on your own Mac — over your own free Cloudflare quick tunnel.
+An MCP bridge that lets a chat AI (Claude.ai, ChatGPT) spawn and drive real Claude Code sessions on your own machine.
 
 ## What it is
 
-tandem runs a small MCP server on your machine and exposes it through a Cloudflare **quick tunnel** (a free, anonymous `https://<random>.trycloudflare.com` URL — no Cloudflare account, no deploy). A chat AI connects to that URL and can open a real, interactive `claude` session, talk to it, and watch it work, while you sit at the same terminal.
+tandem is a bridge between a chatbot and your computer: the chat AI connects over a URL you control and drives real, interactive Claude Code sessions running locally — opening them, sending work, and reading back results — while you watch or type alongside in your own terminal. It can also run **two sessions autonomously**: a manager that plans and reviews hands work to a worker that builds, relaying back and forth with no human in the loop. Everything runs on your machine; the only thing that leaves it is the tunnel you started yourself.
+
+## Quick start
+
+```bash
+git clone https://github.com/Maxmedawar/tandem.git
+cd tandem
+./setup.sh
+```
+
+When it asks which mode, pick **Tailscale** (the default — just press Enter) to get a **permanent URL** you paste into your chat app once and never touch again.
+
+The full 10-minute step-by-step walkthrough — Tailscale login, connecting to Claude.ai / ChatGPT, the Chrome extension — lives in **[SETUP.md](SETUP.md)**.
+
+## How it works
+
+tandem runs a small MCP server on your machine and exposes it one of three ways:
+
+- **Tailscale Funnel (recommended):** a **persistent** public URL — `https://<machine>.<your-tailnet>.ts.net` — that **never changes across restarts**. Free on every Tailscale plan, real HTTPS, no interstitial page. One-time login, then set-and-forget.
+- **Cloudflare quick tunnel:** a free, anonymous `https://<random>.trycloudflare.com` URL — no account at all, but the URL changes every run.
+- **Local stdio (desktop):** no network, no tunnel — for Claude Desktop / ChatGPT desktop.
+
+A chat AI connects to that URL and can open a real, interactive `claude` session, talk to it, and watch it work, while you sit at the same terminal.
 
 Sessions are real interactive Claude Code TUIs running inside **tmux** (`ccm-<name>`), driven by keystroke injection and screen scraping — *not* `claude -p` / headless — so usage stays on your normal Claude Code subscription. You can `tmux attach -t ccm-<name>` to watch or type alongside the AI. Everything runs locally; the only thing that leaves your machine is the tunnel you started yourself.
 
@@ -28,46 +50,6 @@ Sessions are real interactive Claude Code TUIs running inside **tmux** (`ccm-<na
   done so you can return to the chat — it does not resume the conversation.
 - **It is not a hosted/multi-tenant service.** Each user runs their own local
   bridge and their own tunnel; there is no shared server.
-
-## Prerequisites
-
-- **Node ≥ 22.6** (the bridge runs TypeScript directly via native type-stripping)
-- **tmux** (the session engine)
-- **cloudflared** (the free quick tunnel)
-- **claude** (Claude Code CLI) on your PATH
-
-## Quick Start
-
-```bash
-git clone https://github.com/Maxmedawar/tandem.git
-cd tandem
-./setup.sh
-```
-
-`setup.sh` will:
-
-1. check the prerequisites above (and tell you how to install any that are missing),
-2. `npm install`,
-3. generate a **fresh random `TANDEM_TOKEN`** into your `.env`,
-4. start the bridge and **your own** cloudflared quick tunnel,
-5. print your tunnel URL, token, and the exact connector JSON to paste into
-   **Claude.ai → Settings → Connectors → Add custom connector**.
-
-It never reuses anyone else's URL or token — the tunnel is yours and disappears when you stop it.
-
-### Configuration
-
-All config lives in `.env` (copied from `.env.example`, git-ignored):
-
-| Variable | Required | Meaning |
-|---|---|---|
-| `TANDEM_TOKEN` | ✅ | Shared secret; every request must present it. |
-| `TANDEM_CWD_ALLOWLIST` | recommended | Colon-separated absolute paths the bridge may operate in. If empty, defaults to `$HOME` and its immediate child dirs — narrow this. |
-| `TANDEM_DEFAULT_CWD` | — | Default working dir when a call omits `cwd` (default `$HOME`). |
-| `TANDEM_SKIP_PERMISSIONS` | — | Spawn `claude` in skip-permissions (autonomous) mode so turns don't stall on allow-prompts. **Default on**; set `0`/`false`/`no`/`off` to require normal prompts. Only suppresses in-session tool prompts — the cwd allowlist is still enforced **before** every spawn, so it never widens reachable dirs. |
-| `TANDEM_HOST` / `TANDEM_PORT` | — | Local bind address (the tunnel points here). Default `127.0.0.1:8787`. |
-
-Runtime artifacts (session transcripts, audit log) are written to `~/.tandem/`.
 
 ## Tools
 
@@ -232,6 +214,127 @@ push the answer back down.
 
 **The missing piece (client side, out of scope / not under our control):** turning a completion event into an *unprompted* chat reply requires the chat client to be woken by it. Today **claude.ai chat cannot be woken this way** — a remote MCP connector is request/response, and the stateless Streamable-HTTP transport here holds no standing server→client channel to deliver a server-initiated notification to the chat UI. So tandem gives you the reliable signal (`events.log` + webhook); bridging that into an automatic message would need a client that polls `events.log`/the webhook and re-prompts the model — which only works in a harness you control, not in claude.ai chat as it exists now.
 
+## Setup modes (full details)
+
+New here? Follow **[SETUP.md](SETUP.md)** for the guided 10-minute walkthrough — this section is the full reference for all three modes.
+
+### Prerequisites
+
+- **Node ≥ 22.6** (the bridge runs TypeScript directly via native type-stripping)
+- **tmux** (the session engine)
+- **tailscale** (**tailscale mode only** — the recommended persistent tunnel; see the macOS note below)
+- **cloudflared** (**quick mode only** — the free anonymous tunnel; desktop/stdio doesn't need it)
+- **claude** (Claude Code CLI) on your PATH
+
+`setup.sh` first asks one question — **tailscale, quick, or desktop?** — and
+defaults to **tailscale** (the persistent URL). Skip the prompt with
+`TANDEM_SETUP_MODE=tailscale|quick|desktop ./setup.sh` for scripted installs
+(`web` is accepted as a legacy alias for `quick`).
+
+### Persistent setup (recommended): Tailscale Funnel
+
+One login, one stable URL — `https://<machine>.<your-tailnet>.ts.net/<token>/mcp` —
+that **never changes across restarts**. Funnel is free on all Tailscale plans,
+needs no domain, terminates real HTTPS on your machine, and shows no
+interstitial/warning page.
+
+1. **Install Tailscale.**
+   - macOS: `brew install --cask tailscale-app` — the **standalone** app.
+     > ⚠️ The sandboxed **Mac App Store** version of Tailscale **cannot run
+     > Funnel**. If you installed from the App Store, replace it with the
+     > standalone app (or the open-source CLI: `brew install tailscale`).
+   - Linux: `curl -fsSL https://tailscale.com/install.sh | sh`
+2. **Log in once:** `tailscale up` (or open the Tailscale app and log in).
+3. **Run setup:** `./setup.sh` and press enter — tailscale is the default. It
+   checks prerequisites, `npm install`s, generates (or reuses) your
+   `TANDEM_TOKEN`, starts the bridge on `localhost:8787`, runs
+   `tailscale funnel --bg 8787` (public **443** → local 8787), verifies
+   `https://<host>/health` answers, and prints your MCP URL + connector JSON
+   (also saved to `.tandem/connector.json`).
+4. **Paste the MCP URL into Claude.ai** → Settings → Connectors →
+   **Add custom connector**. For Claude Code instead:
+   `claude mcp add --transport http tandem <your MCP URL>`.
+
+**The URL is permanent.** The hostname is your machine's stable MagicDNS name
+and the token is reused from `.env`, so the URL survives reboots and re-runs.
+The funnel itself is owned by the Tailscale daemon (`--bg` persists it across
+reboots); only the bridge process needs restarting — **re-running `./setup.sh`
+just re-attaches** and prints the same URL. It only changes if you rename the
+machine, switch tailnets, or replace `TANDEM_TOKEN`. Stop sharing any time with
+`tailscale funnel reset`.
+
+Two one-time tailnet toggles you may hit (the script detects both and prints
+the fix):
+
+- **Funnel not permitted:** your tailnet policy needs the `funnel` node
+  attribute — Tailscale prints a one-click enable link, or see
+  [tailscale.com/kb/1223/funnel](https://tailscale.com/kb/1223/funnel).
+- **HTTPS certs disabled:** enable them at
+  [login.tailscale.com/admin/dns](https://login.tailscale.com/admin/dns) →
+  "Enable HTTPS".
+
+### Instant fallback: Cloudflare quick tunnel
+
+No account of any kind — `TANDEM_SETUP_MODE=quick ./setup.sh` starts the bridge
+behind your own free, anonymous `https://<random>.trycloudflare.com` quick
+tunnel, gated by the same `TANDEM_TOKEN`, and prints the connector JSON to
+paste into **Claude.ai → Settings → Connectors → Add custom connector**. It
+never reuses anyone else's URL or token — the tunnel is yours and disappears
+when you stop it. The trade-off: **the URL changes every run**, so you re-paste
+the connector after each restart (that's why Tailscale is the recommended
+default).
+
+### Local desktop (stdio): no tunnel at all
+
+For desktop apps — `TANDEM_SETUP_MODE=desktop ./setup.sh`. The app spawns the
+bridge directly as a child process over **stdio**. No HTTP server, no tunnel,
+and **no token** — a stdio server can only be driven by the local app that
+spawned it, the same trust as your own terminal. The cwd allowlist is still
+enforced on every spawn. `setup.sh` prints (and saves to
+`.tandem/desktop-connector.json`) the connector config:
+
+```json
+{
+  "mcpServers": {
+    "tandem": {
+      "command": "node",
+      "args": ["--experimental-strip-types", "/path/to/tandem/src/stdio-server.ts"]
+    }
+  }
+}
+```
+
+For Claude Desktop, merge the `tandem` entry under `mcpServers` in
+`~/Library/Application Support/Claude/claude_desktop_config.json` and restart
+the app. For ChatGPT desktop, add a local MCP server with the same
+`command` + `args`. Nothing keeps running between chats — the app spawns the
+server on demand (`npm run start:stdio` runs it manually). The server reads
+`.env` (allowlist etc.) on its own, from the file next to `package.json`.
+Neither `tailscale` nor `cloudflared` is required for desktop mode.
+
+**Connector icon.** The server ships an icon (the Claude Code crab) so the
+connector and its tools show it instead of a blank glyph. It's exposed two ways,
+both unauthenticated and non-sensitive: as the MCP `icons` metadata (a
+self-contained `data:` URI in the server info) and at `GET /favicon.ico` /
+`GET /icon.png` — so a client that reads the spec field *or* one that just fetches
+the origin's favicon (like claude.ai) both pick it up. To change it, replace
+`assets/claudecode-icon.png` and regenerate the embedded copy in `src/icon.ts`
+(`base64 -i assets/claudecode-icon.png`).
+
+### Configuration
+
+All config lives in `.env` (copied from `.env.example`, git-ignored):
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `TANDEM_TOKEN` | ✅ (HTTP/tunnel only — not used by stdio) | Shared secret; every HTTP request must present it. The local stdio path needs none. |
+| `TANDEM_CWD_ALLOWLIST` | recommended | Colon-separated absolute paths the bridge may operate in. If empty, defaults to `$HOME` and its immediate child dirs — narrow this. |
+| `TANDEM_DEFAULT_CWD` | — | Default working dir when a call omits `cwd` (default `$HOME`). |
+| `TANDEM_SKIP_PERMISSIONS` | — | Spawn `claude` in skip-permissions (autonomous) mode so turns don't stall on allow-prompts. **Default on**; set `0`/`false`/`no`/`off` to require normal prompts. Only suppresses in-session tool prompts — the cwd allowlist is still enforced **before** every spawn, so it never widens reachable dirs. |
+| `TANDEM_HOST` / `TANDEM_PORT` | — | Local bind address (the Tailscale funnel or quick tunnel points here). Default `127.0.0.1:8787`. |
+
+Runtime artifacts (session transcripts, audit log) are written to `~/.tandem/`.
+
 ## Security
 
 Read this before exposing the bridge. For the full trust model and how to report
@@ -241,7 +344,8 @@ a vulnerability, see [SECURITY.md](SECURITY.md).
 - **A token is mandatory.** The server refuses to start without `TANDEM_TOKEN`, and rejects (HTTP 401) every request whose token doesn't match — via `Authorization: Bearer`, `?token=`, or the `/<token>/mcp` path.
 - **Directory allowlist.** Sessions and relays can only be opened inside the allowlist. Paths are realpath-canonicalized and boundary-checked, so `../` traversal, symlink escapes, and prefix look-alikes (`/code-evil` vs `/code`) are rejected. Keep the list as narrow as possible. **Skip-permissions does not relax this** — the allowlist check runs before spawn whether or not prompts are skipped, and a cwd outside it still returns `403`.
 - **Only `ccm-*` tmux sessions are drivable**, and relay-owned sessions are isolated from the generic session tools. Every spawn/send/interrupt/close/relay action is appended to `~/.tandem/bridge.log`.
-- **You run your own tunnel.** The quick tunnel is started locally by you and is anonymous; nothing routes through the author's machine or cloud. Stop the tunnel to take the bridge offline instantly.
+- **The Funnel endpoint is public internet — the token gate is identical and mandatory.** A Tailscale Funnel URL is reachable by anyone, exactly like a quick-tunnel URL; the difference is persistence, not exposure. Tandem treats both the same: every request must present `TANDEM_TOKEN`. Funnel additionally terminates TLS **on your own machine** with a real per-host cert and shows no interstitial page.
+- **You run your own tunnel.** Both tunnels are started locally by you — the quick tunnel is anonymous, the funnel runs under your own Tailscale account; nothing routes through the author's machine or cloud. Stop sharing instantly: kill the cloudflared process (quick) or run `tailscale funnel reset` (tailscale).
 - **No secrets in the repo.** Tokens and URLs come only from `.env` / generated runtime files, all git-ignored.
 
 ## License
