@@ -15,7 +15,7 @@ Follow the **Tailscale path** below — it's the recommended setup: free, perman
 - **Google Chrome + the Claude browser extension** — this is what lets the system report back to your chat on its own. Install "Claude for Chrome" from the Chrome Web Store and sign in.
 - **A free Tailscale account** — https://tailscale.com (sign up with Google/GitHub, takes a minute)
 
-> macOS note: install Tailscale with `brew install tailscale` (the standalone version), **not** the Mac App Store version — the App Store one can't do the public URL.
+> macOS note: install Tailscale with `brew install --cask tailscale-app` (the standalone GUI app — supports Funnel and is the easiest to log into), **not** the Mac App Store version — the sandboxed App Store one can't do the public URL. Then open the app and sign in. (Advanced/headless alternative: `brew install tailscale` + `sudo brew services start tailscale` — CLI only, no GUI.)
 
 ---
 
@@ -120,7 +120,7 @@ After that it runs on its own — the manager works, then reports back into your
 | "Funnel not permitted" | Flip the Funnel toggle in Tailscale Access Controls (the script prints the link). |
 | "HTTPS certs disabled" | Enable HTTPS in the Tailscale admin DNS page (link in the script). |
 | URL changed after restart | You're on **quick** mode, not Tailscale. Re-run `./setup.sh` and pick Tailscale for a permanent URL. |
-| macOS: funnel won't start | You have the Mac App Store Tailscale. Install the standalone one: `brew install tailscale`. |
+| macOS: funnel won't start | You have the Mac App Store Tailscale. Install the standalone app: `brew install --cask tailscale-app`. |
 | Manager can't type back into chat | Chrome + the Claude extension must be installed and signed in, and you must have pasted the chat URL in Step 7. |
 | Tools don't appear in the connector | Re-check the URL (including the `/<token>/mcp` part) and that the machine + bridge are running. |
 

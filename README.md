@@ -8,15 +8,22 @@ tandem is a bridge between a chatbot and your computer: the chat AI connects ove
 
 ## Quick start
 
-```bash
-git clone https://github.com/Maxmedawar/tandem.git
-cd tandem
-./setup.sh
-```
+1. **Install the prereqs:**
+   - Node 22.6+
+   - tmux
+   - Claude Code CLI (`claude`)
+   - Tailscale:
+     - macOS: `brew install --cask tailscale-app` (the standalone GUI app; the Mac App Store version does **not** support Funnel)
+     - Linux: `curl -fsSL https://tailscale.com/install.sh | sh`
+2. **Get tandem:** `git clone https://github.com/Maxmedawar/tandem.git && cd tandem && ./setup.sh`
+3. **Pick Tailscale** when the script asks which mode (it's the default — just press Enter). You get a **permanent URL** you set up once and never touch again.
+4. **Sign into Tailscale** when prompted — open the Tailscale app and log in (one time, free account).
+5. **Copy the MCP URL** the script prints (`https://<machine>.<tailnet>.ts.net/<token>/mcp`).
+6. **Paste it into your chat app:** Claude.ai or ChatGPT → Settings → Connectors → Add custom connector.
+7. **Install the Claude Chrome extension** ("Claude for Chrome" from the Chrome Web Store) and sign in — this lets sessions report back to your chat.
+8. **Say "start tandem"** in your chat, and you're off.
 
-When it asks which mode, pick **Tailscale** (the default — just press Enter) to get a **permanent URL** you paste into your chat app once and never touch again.
-
-The full 10-minute step-by-step walkthrough — Tailscale login, connecting to Claude.ai / ChatGPT, the Chrome extension — lives in **[SETUP.md](SETUP.md)**.
+Full walkthrough + troubleshooting: see **[SETUP.md](SETUP.md)**.
 
 ## How it works
 
@@ -242,7 +249,8 @@ interstitial/warning page.
    - macOS: `brew install --cask tailscale-app` — the **standalone** app.
      > ⚠️ The sandboxed **Mac App Store** version of Tailscale **cannot run
      > Funnel**. If you installed from the App Store, replace it with the
-     > standalone app (or the open-source CLI: `brew install tailscale`).
+     > standalone app. (Advanced/headless alternative: `brew install tailscale`
+     > + `sudo brew services start tailscale` — CLI only, no GUI.)
    - Linux: `curl -fsSL https://tailscale.com/install.sh | sh`
 2. **Log in once:** `tailscale up` (or open the Tailscale app and log in).
 3. **Run setup:** `./setup.sh` and press enter — tailscale is the default. It
