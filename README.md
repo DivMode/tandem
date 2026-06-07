@@ -33,7 +33,7 @@ Sessions are real interactive Claude Code TUIs running inside **tmux** (`ccm-<na
 
 - **Node ≥ 22.6** (the bridge runs TypeScript directly via native type-stripping)
 - **tmux** (the session engine)
-- **cloudflared** (the free quick tunnel)
+- **cloudflared** (the free quick tunnel — **web mode only**; desktop/stdio doesn't need it)
 - **claude** (Claude Code CLI) on your PATH
 
 ## Quick Start
@@ -44,7 +44,41 @@ cd tandem
 ./setup.sh
 ```
 
-`setup.sh` will:
+`setup.sh` first asks one question — **desktop or web?** — and defaults to desktop:
+
+### Local desktop = no tunnel. Web = tunnel.
+
+- **Desktop (Claude Desktop, ChatGPT desktop — default).** The app spawns the
+  bridge directly as a child process over **stdio**. No HTTP server, no tunnel,
+  and **no token** — a stdio server can only be driven by the local app that
+  spawned it, the same trust as your own terminal. The cwd allowlist is still
+  enforced on every spawn. `setup.sh` prints (and saves to
+  `.tandem/desktop-connector.json`) the connector config:
+
+  ```json
+  {
+    "mcpServers": {
+      "tandem": {
+        "command": "node",
+        "args": ["--experimental-strip-types", "/path/to/tandem/src/stdio-server.ts"]
+      }
+    }
+  }
+  ```
+
+  For Claude Desktop, merge the `tandem` entry under `mcpServers` in
+  `~/Library/Application Support/Claude/claude_desktop_config.json` and restart
+  the app. For ChatGPT desktop, add a local MCP server with the same
+  `command` + `args`. Nothing keeps running between chats — the app spawns the
+  server on demand (`npm run start:stdio` runs it manually). The server reads
+  `.env` (allowlist etc.) on its own, from the file next to `package.json`.
+  `cloudflared` is **not** required for desktop mode.
+
+- **Web (claude.ai in a browser).** The browser can't spawn a local process, so
+  the bridge runs as an HTTP server behind your own Cloudflare quick tunnel,
+  gated by a fresh random `TANDEM_TOKEN` — the flow below, unchanged.
+
+In web mode, `setup.sh` will:
 
 1. check the prerequisites above (and tell you how to install any that are missing),
 2. `npm install`,
@@ -55,13 +89,22 @@ cd tandem
 
 It never reuses anyone else's URL or token — the tunnel is yours and disappears when you stop it.
 
+**Connector icon.** The server ships an icon (the Claude Code crab) so the
+connector and its tools show it instead of a blank glyph. It's exposed two ways,
+both unauthenticated and non-sensitive: as the MCP `icons` metadata (a
+self-contained `data:` URI in the server info) and at `GET /favicon.ico` /
+`GET /icon.png` — so a client that reads the spec field *or* one that just fetches
+the origin's favicon (like claude.ai) both pick it up. To change it, replace
+`assets/claudecode-icon.png` and regenerate the embedded copy in `src/icon.ts`
+(`base64 -i assets/claudecode-icon.png`).
+
 ### Configuration
 
 All config lives in `.env` (copied from `.env.example`, git-ignored):
 
 | Variable | Required | Meaning |
 |---|---|---|
-| `TANDEM_TOKEN` | ✅ | Shared secret; every request must present it. |
+| `TANDEM_TOKEN` | ✅ (HTTP/tunnel only — not used by stdio) | Shared secret; every HTTP request must present it. The local stdio path needs none. |
 | `TANDEM_CWD_ALLOWLIST` | recommended | Colon-separated absolute paths the bridge may operate in. If empty, defaults to `$HOME` and its immediate child dirs — narrow this. |
 | `TANDEM_DEFAULT_CWD` | — | Default working dir when a call omits `cwd` (default `$HOME`). |
 | `TANDEM_SKIP_PERMISSIONS` | — | Spawn `claude` in skip-permissions (autonomous) mode so turns don't stall on allow-prompts. **Default on**; set `0`/`false`/`no`/`off` to require normal prompts. Only suppresses in-session tool prompts — the cwd allowlist is still enforced **before** every spawn, so it never widens reachable dirs. |

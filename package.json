@@ -27,6 +27,7 @@
   },
   "scripts": {
     "start": "node --experimental-strip-types src/server.ts",
+    "start:stdio": "node --experimental-strip-types src/stdio-server.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
