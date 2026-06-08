@@ -80,6 +80,14 @@ The autonomous loop (manager reports back to the chat tab on its own) has hard r
 
 If any are missing, the system still runs in **manual mode** (the human relays between chat and sessions). The closed loop needs all five.
 
+### Troubleshooting: a session spawns but stays BLANK ("no banner", commands don't go through)
+
+This is the #1 confusing failure. The tmux session exists and the `claude` process is alive, but the pane is empty and anything you send seems ignored. It almost always means **the machine is overloaded** — the interactive TUI is CPU-starved and never finishes its first render. Tell-tale signs and the fix:
+
+- Check the load: `uptime` (load average). If it is well above your CPU count (e.g. 70+ on an 8-core Mac), that's the cause. Common culprits: macOS background indexing (`mediaanalysisd`, `spotlightknowledged`) churning, and **stale `ccm-*` sessions piling up** (each is a live `claude`). Confirm claude itself is fine with `claude -p "hi"` — it will answer in seconds even when the TUI can't render, which is what makes this misleading.
+- Fix it: **reap stale sessions** — `tmux ls | grep '^ccm-'` then `tmux kill-session -t ccm-<name>` for the dead ones (or kill them all if none are wanted) — and let the indexing finish. Then re-spawn.
+- The bridge now **self-diagnoses** this: `open_session` returns `ready: false` plus a `warning` naming the blank pane + current load + remedy, instead of silently handing back a dead session. If you see that warning, don't drive the session — clear the overload first.
+
 ---
 
 ## WHAT THE DIRECTOR DOES THE MOMENT TANDEM IS STARTED
