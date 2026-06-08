@@ -1,4 +1,18 @@
-# tandem
+<p align="center">
+  <img src="assets/tandem-logo.png" alt="tandem" width="440">
+</p>
+<h3 align="center">Run and manage Claude Code sessions from your Claude.ai chat, and it talks back on its own.</h3>
+<p align="center">
+  <a href="https://github.com/Maxmedawar/tandem/actions/workflows/ci.yml"><img src="https://github.com/Maxmedawar/tandem/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Maxmedawar/tandem/releases"><img src="https://img.shields.io/github/v/release/Maxmedawar/tandem?color=E8643C" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-E8643C.svg" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/node-%3E%3D22.6-339933" alt="Node >=22.6">
+  <a href="https://github.com/Maxmedawar/tandem/stargazers"><img src="https://img.shields.io/github/stars/Maxmedawar/tandem?color=E8643C" alt="Stars"></a>
+  <img src="https://img.shields.io/badge/PRs-welcome-E8643C.svg" alt="PRs welcome">
+</p>
+<p align="center">
+  <img src="assets/demo.gif" alt="tandem demo" width="820">
+</p>
 
 An MCP bridge that lets a chat AI (Claude.ai, ChatGPT) spawn and drive real Claude Code sessions on your own machine.
 
