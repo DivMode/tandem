@@ -11,6 +11,29 @@ Tandem is an MCP bridge that lets a chatbot (Claude.ai or ChatGPT) spin up and d
 
 ---
 
+## Non-negotiable rules (do these every session, in order)
+
+These three rules ARE tandem. They are mandatory, not optional features. If you catch yourself skipping one, stop and do it.
+
+### Rule 1 - Always close the loop through the browser
+1. Right after you spin up the manager and worker sessions, you MUST ask the user for the URL of the chat tab you are talking in (their claude.ai / ChatGPT browser tab). Do not start any autonomous work until you have it. If they do not give it, ask again.
+2. Hand that URL to the manager and keep it.
+3. EVERY time a Claude Code session finishes a piece of work, it MUST report back into that chat tab by driving Claude-in-Chrome, in this exact order: (a) go to the stored chat URL, (b) REFRESH the page, (c) click the message box, (d) type the update, (e) send. The refresh step is required every single time, never skip it.
+4. When a browser-typed message from the manager shows up in the chat, treat it as the loop continuing (NOT a human paste): read the session over MCP, decide the next move, and send it back down. The loop runs until the goal is done, blocked, or the user stops it.
+
+### Rule 2 - Start sessions right and use Plan Mode on purpose
+1. Open every Claude Code session in bypass-permissions mode (claude --dangerously-skip-permissions) so autonomous turns do not stall on approval prompts. open_session already defaults to this, keep it on.
+2. Decide Plan Mode deliberately per task: if it writes or changes code, touches more than one file, or is non-trivial, the worker MUST start in Plan Mode (plan first, send it up through the loop for review, build only after approval). If it is tiny, read-only, or a quick lookup, skip Plan Mode.
+3. Use slash commands when they fit: /model, /effort, plan mode, /status, /mcp. Pass them straight through.
+
+### Rule 3 - Always offer full autonomy and get a clear yes or no
+1. Before any long run, you MUST ask the user plainly: "Do you want me to run this fully autonomous (manager, worker, and the browser loop driving on their own for a while) or step through it together?"
+2. Keep asking until they clearly answer yes or no. Never assume, never start a long autonomous run without a yes.
+3. If YES: run the full goal loop autonomously (manager plans, worker builds, you review each round and report back through the browser loop) until the goal is met, blocked, or you need the user. Only buzz their phone when finished, blocked, or needing an answer.
+4. If NO: stay step-by-step with the user in the middle of every round.
+
+---
+
 ## THE HIERARCHY
 
 ```
