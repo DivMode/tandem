@@ -11,26 +11,27 @@ Tandem is an MCP bridge that lets a chatbot (Claude.ai or ChatGPT) spin up and d
 
 ---
 
-## Non-negotiable rules (do these every session, in order)
+## Non-negotiable rules (do these every session)
 
-These three rules ARE tandem. They are mandatory, not optional features. If you catch yourself skipping one, stop and do it.
+These three rules ARE tandem. They are MANDATORY, not optional features. They run EVERY session, no exceptions. If you catch yourself skipping one, STOP and do it.
 
-### Rule 1 - Always close the loop through the browser
-1. Right after you spin up the manager and worker sessions, you MUST ask the user for the URL of the chat tab you are talking in (their claude.ai / ChatGPT browser tab). Do not start any autonomous work until you have it. If they do not give it, ask again.
-2. Hand that URL to the manager and keep it.
-3. EVERY time a Claude Code session finishes a piece of work, it MUST report back into that chat tab by driving Claude-in-Chrome, in this exact order: (a) go to the stored chat URL, (b) REFRESH the page, (c) click the message box, (d) type the update, (e) send. The refresh step is required every single time, never skip it.
-4. When a browser-typed message from the manager shows up in the chat, treat it as the loop continuing (NOT a human paste): read the session over MCP, decide the next move, and send it back down. The loop runs until the goal is done, blocked, or the user stops it.
+### Rule 1 — Close the loop through the browser (MANDATORY)
+1. At session start, before ANY autonomous work, the director MUST ask the user for the URL of their claude.ai or ChatGPT chat tab (the tab you are talking in). The director MUST keep asking until the user gives it — no URL, no autonomous work.
+2. The director MUST hand that URL to the manager, and the manager MUST keep it for the whole session.
+3. EVERY time a Claude Code session finishes a piece of work, it MUST report back into that chat by driving Claude-in-Chrome in THIS EXACT ORDER: (a) go to the stored chat URL, (b) REFRESH the page, (c) click the input box, (d) type the update, (e) send. Refresh-before-send is REQUIRED every single time — never skip the refresh.
+4. The director MUST treat a manager browser-typed message as the loop continuing (NOT a human paste): read the session over MCP, decide the next move, and send it back down. The loop runs until the goal is done, blocked, or the user stops it.
 
-### Rule 2 - Start sessions right and use Plan Mode on purpose
-1. Open every Claude Code session in bypass-permissions mode (claude --dangerously-skip-permissions) so autonomous turns do not stall on approval prompts. open_session already defaults to this, keep it on.
-2. Decide Plan Mode deliberately per task: if it writes or changes code, touches more than one file, or is non-trivial, the worker MUST start in Plan Mode (plan first, send it up through the loop for review, build only after approval). If it is tiny, read-only, or a quick lookup, skip Plan Mode.
-3. Use slash commands when they fit: /model, /effort, plan mode, /status, /mcp. Pass them straight through.
+### Rule 2 — Start sessions right and use Plan Mode on purpose (MANDATORY)
+1. You MUST open every Claude Code session with `claude --dangerously-skip-permissions` so autonomous turns do not stall on approval prompts. open_session already defaults to this — keep it on.
+2. You MUST decide Plan Mode deliberately per task. Any task that writes or changes code, touches more than one file, or is otherwise non-trivial MUST start in Plan Mode and get its plan approved through the loop BEFORE building. Tiny or read-only tasks skip Plan Mode.
+3. Use the slash commands when they fit: `/model`, `/effort`, `/status`, `/mcp`, and plan mode when needed. Pass them straight through.
 
-### Rule 3 - Always offer full autonomy and get a clear yes or no
-1. Before any long run, you MUST ask the user plainly: "Do you want me to run this fully autonomous (manager, worker, and the browser loop driving on their own for a while) or step through it together?"
-2. Keep asking until they clearly answer yes or no. Never assume, never start a long autonomous run without a yes.
-3. If YES: run the full goal loop autonomously (manager plans, worker builds, you review each round and report back through the browser loop) until the goal is met, blocked, or you need the user. Only buzz their phone when finished, blocked, or needing an answer.
-4. If NO: stay step-by-step with the user in the middle of every round.
+### Rule 3 — Always offer full autonomy and get a clear yes or no (MANDATORY)
+1. Before any long run, the director MUST ask the user plainly whether they want it fully autonomous — manager, worker, and the browser loop driving on their own for a while — or to step through it together.
+2. The director MUST keep asking until the user clearly answers yes or no. Never assume.
+3. The director MUST NEVER start a long autonomous run without an explicit yes.
+4. If YES: run the full goal loop autonomously (manager plans, worker builds, you review each round and report back through the browser loop) until the goal is met, blocked, or you need the user. Only buzz their phone when finished, blocked, or needing an answer.
+5. If NO: stay step-by-step with the user in the middle of every round.
 
 ---
 
@@ -86,7 +87,7 @@ When the user says "start tandem" / "spawn a session" / anything that kicks off 
 
 1. **Read this skill** (you're doing it now).
 2. **Confirm the requirements above.** Name any that are missing.
-3. **Spawn the sessions** via the tandem MCP (manager + worker, in the project directory, on the best model, high effort).
+3. **Spawn the sessions** via the tandem MCP (manager + worker, in the project directory, on the best model; set the **worker to `ultracode`** effort with `/effort ultracode`, the manager to high).
 4. **Give the user the two tmux attach commands** so they can watch both sessions live in their terminal, e.g. `tmux attach -t ccm-manager` and `tmux attach -t ccm-worker` (use the actual attachHint the MCP returns for each session).
 5. **Ask the user for the URL of the chat tab they are talking to you in.** This is the single most important setup step — the manager needs it to report back. Ask explicitly: "Paste the full URL of this chat tab so the manager can report back to it on its own."
 6. **Hand that URL to the manager session** and tell the manager to store it in its disk memory (MISSION.md / STATE.json). The manager uses it as the return address.
@@ -129,7 +130,7 @@ Every CC session spawned by tandem MUST:
 
 1. **Bypass permissions by default.** The bridge handles this. The cwd allowlist is the real guardrail, enforced before spawn. Never widen the allowlist to work around a block.
 2. **Use the best available model.** Default to the strongest current model (set via the `model` param on `open_session`, or `claude --model opus` for direct launches). Throwaway/probe sessions can use a smaller model. Real work = best model. No exceptions.
-3. **High effort thinking.** Default to high. Only drop to medium/low for trivial checks.
+3. **Effort: the worker runs on ultracode.** The worker (builder) MUST be set to `ultracode` effort (`/effort ultracode` — xhigh thinking + dynamic workflow orchestration) on every real build session, no exceptions. The manager/director default to high. Only drop to medium/low for trivial probe sessions.
 4. **Fresh sessions per phase.** Never reuse a bloated session. Context compacts, transcripts get huge, reads fail. Start clean for each phase.
 
 ---
@@ -277,6 +278,7 @@ The manager's disk memory (`~/.tandem/manager/<id>/`) is always the per-goal scr
 |---|---|
 | Tries to skip the spec | 🏗️ Stop. Spec first. No cowboy coding. |
 | Worker launches without the best model | 🏗️ Relaunch with `claude --model opus` so all agents inherit it. |
+| Worker runs a real build on less than ultracode | 🏗️ Set it: `/effort ultracode`. The builder always runs on ultracode. |
 | Worker runs solo instead of spawning a team for a real feature | 🏗️ Use agent-organizer. No solo runs for real features. |
 | Manager rubber-stamps without verifying | 🏗️ Read the actual diff. Run the tests yourself. No vibes-based approvals. |
 | Reuses a bloated session instead of starting fresh | 🏗️ Fresh session. Old context is compacted/garbage. |
@@ -343,7 +345,7 @@ The director then reads the session over MCP and replies with the next instructi
 ```
 Human says "build X" (or "GOAL: X")
   -> Director: research, debate, write spec
-  -> Director: check requirements, spawn Manager + Worker (best model, high effort),
+  -> Director: check requirements, spawn Manager + Worker (best model; worker on ultracode, manager on high),
        give the human the tmux attach commands, ASK for the chat tab URL, hand it to the Manager
   -> Manager: read spec, plan phases, store URL in disk memory, direct Worker
   -> Worker: read spec, assemble agent team, perfection loop, report "CC check"
