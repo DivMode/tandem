@@ -23,8 +23,9 @@ These three rules ARE tandem. They are MANDATORY, not optional features. They ru
 
 ### Rule 2 — Start sessions right and use Plan Mode on purpose (MANDATORY)
 1. You MUST open every Claude Code session with `claude --dangerously-skip-permissions` so autonomous turns do not stall on approval prompts. open_session already defaults to this — keep it on.
-2. You MUST decide Plan Mode deliberately per task. Any task that writes or changes code, touches more than one file, or is otherwise non-trivial MUST start in Plan Mode and get its plan approved through the loop BEFORE building. Tiny or read-only tasks skip Plan Mode.
-3. Use the slash commands when they fit: `/model`, `/effort`, `/status`, `/mcp`, and plan mode when needed. Pass them straight through.
+2. The worker session MUST run on ultracode. Run `/effort ultracode` (xhigh thinking + dynamic workflow orchestration) in the worker before any real build — it is the builder that spawns agent teams and runs the perfection loop, so it always gets the highest effort. The manager and director stay on high. NEVER run a real worker build on less than ultracode.
+3. You MUST decide Plan Mode deliberately per task. Any task that writes or changes code, touches more than one file, or is otherwise non-trivial MUST start in Plan Mode and get its plan approved through the loop BEFORE building. Tiny or read-only tasks skip Plan Mode.
+4. Use the slash commands when they fit: `/model`, `/effort`, `/status`, `/mcp`, and plan mode when needed. Pass them straight through.
 
 ### Rule 3 — Always offer full autonomy and get a clear yes or no (MANDATORY)
 1. Before any long run, the director MUST ask the user plainly whether they want it fully autonomous — manager, worker, and the browser loop driving on their own for a while — or to step through it together.
