@@ -35,7 +35,7 @@
 import { execFile } from 'node:child_process'
 import { existsSync, realpathSync, statSync } from 'node:fs'
 import { open, mkdir } from 'node:fs/promises'
-import { homedir } from 'node:os'
+import { cpus, homedir, loadavg } from 'node:os'
 import { join, sep } from 'node:path'
 
 const HOME = homedir()
@@ -190,10 +190,52 @@ function isCwdAllowedLocal(cwd: string, allowlist: string[]): boolean {
   return allowlist.some((root) => isUnder(real, root))
 }
 
+/**
+ * Diagnose why a freshly-spawned pane is not usable yet — turns the #1 silent
+ * failure ("session won't boot / no banner / commands don't go through") into a
+ * clear, actionable message.
+ *
+ * Returns null when the pane shows the prompt (ready), otherwise a human-readable
+ * reason. The classic failure observed in the field: a BLANK pane under HIGH
+ * system load — the interactive `claude` TUI is CPU-starved (e.g. macOS Spotlight
+ * / mediaanalysisd indexing, or too many live sessions) and never finishes its
+ * first render, so warmup never sees the prompt and any later send() injects into
+ * a dead TUI. `claude -p` still works in that state because it's a short burst,
+ * which is exactly why "the bridge looks broken but claude is fine" is confusing.
+ *
+ * Pure (load/cpu are injected) so it is unit-testable without a real machine.
+ */
+export function describeReadiness(
+  pane: string,
+  load1: number,
+  cpuCount: number,
+  name: string,
+): string | null {
+  if (pane.includes('❯')) return null
+  const where = pane.trim().length === 0 ? 'the pane is still blank' : 'the prompt never appeared'
+  const overloaded = cpuCount > 0 && load1 > cpuCount * 1.5
+  if (overloaded) {
+    return (
+      `session "${name}" did not reach the prompt: ${where} and the machine is overloaded ` +
+      `(load ${load1.toFixed(1)} on ${cpuCount} CPUs). The interactive TUI is CPU-starved and ` +
+      `can't finish its first render. Wait for the load to drop (e.g. macOS Spotlight/photo ` +
+      `indexing to finish) and/or close stale sessions, then retry.`
+    )
+  }
+  return (
+    `session "${name}" did not reach the prompt: ${where} after warmup. The TUI may not have ` +
+    `initialized — attach a real terminal once to kick it: tmux attach -t ${SESSION_PREFIX}${name}`
+  )
+}
+
 export class TerminalSession {
   private readonly _name: string
   private readonly _cwd: string
   private readonly logPath: string
+  /** Set by warmup(): did the TUI reach its prompt? */
+  private _ready = false
+  /** Set by warmup() when NOT ready: an actionable reason (load/blank/attach). */
+  private _readinessWarning: string | undefined
 
   // Explicit field assignment (NOT TS "parameter properties") — the bridge runs
   // under `node --experimental-strip-types`, whose strip-only mode rejects the
@@ -210,6 +252,16 @@ export class TerminalSession {
 
   get cwd(): string {
     return this._cwd
+  }
+
+  /** True once the TUI has shown its prompt (warmup saw `❯`). */
+  get ready(): boolean {
+    return this._ready
+  }
+
+  /** When not ready, a human-actionable reason warmup recorded (else undefined). */
+  get readinessWarning(): string | undefined {
+    return this._readinessWarning
   }
 
   get tmuxTarget(): string {
@@ -379,11 +431,26 @@ export class TerminalSession {
         continue
       }
       // Ready = the prompt box marker present and not working.
-      if (pane.includes('❯') && !this.isWorking(pane)) return
+      if (pane.includes('❯') && !this.isWorking(pane)) {
+        this._ready = true
+        return
+      }
       await sleep(POLL_MS)
     }
-    // Don't hard-fail: the session may still be usable; the first send() will
-    // simply observe idle via its own polling.
+    // Don't hard-fail: the session may still be usable (e.g. a human attaches and
+    // kicks the TUI), so we keep it. But DO record WHY it isn't ready so the caller
+    // can surface an actionable message instead of silently driving a blank pane —
+    // the #1 "sessions not working" symptom (a CPU-starved TUI under heavy load).
+    const finalPane = await this.capture()
+    const warning = describeReadiness(finalPane, loadavg()[0], cpus().length, this._name)
+    if (warning === null) {
+      // Became ready right at the deadline.
+      this._ready = true
+      return
+    }
+    this._ready = false
+    this._readinessWarning = warning
+    process.stderr.write(`[bridge] ${warning}\n`)
   }
 
   /**

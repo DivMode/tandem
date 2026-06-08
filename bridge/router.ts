@@ -242,8 +242,17 @@ async function handleOpen(req: RpcRequest): Promise<RpcResult> {
   try {
     const session = await TerminalSession.spawn({ name, cwd, allowlist: ALLOWLIST, model, effort })
     registerLive(session)
-    audit({ route: 'POST /sessions/open', name: session.name, cwd, model, effort })
-    return ok({ name: session.name, cwd: session.cwd, attachHint: session.attachHint() })
+    audit({ route: 'POST /sessions/open', name: session.name, cwd, model, effort, ready: session.ready })
+    // Surface readiness: when the TUI did NOT reach its prompt (the classic
+    // CPU-starved / blank-pane boot failure), include an actionable warning so the
+    // caller doesn't silently drive a dead session believing it opened cleanly.
+    return ok({
+      name: session.name,
+      cwd: session.cwd,
+      attachHint: session.attachHint(),
+      ready: session.ready,
+      ...(session.readinessWarning ? { warning: session.readinessWarning } : {}),
+    })
   } catch (e) {
     return err(500, `failed to open session: ${e instanceof Error ? e.message : String(e)}`)
   }
