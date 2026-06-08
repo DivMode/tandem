@@ -47,3 +47,8 @@ coverage/
 
 # personal project notes — not part of the public bridge
 CLAUDE.md
+AGENTS.md
+
+# internal launch/distribution planning (contains local paths + strategy) — never publish
+LAUNCH_LOG.md
+LAUNCH_QUEUE.md
