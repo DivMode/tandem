@@ -120,7 +120,7 @@ tandem runs a small MCP server on your machine and exposes it one of three ways:
 
 A chat AI connects to that URL and can open a real, interactive `claude` session, talk to it, and watch it work, while you sit at the same terminal.
 
-Sessions are real interactive Claude Code TUIs running inside **tmux** (`ccm-<name>`), driven by keystroke injection and screen scraping — *not* `claude -p` / headless — so usage stays on your normal Claude Code subscription. You can `tmux attach -t ccm-<name>` to watch or type alongside the AI. Everything runs locally; the only thing that leaves your machine is the tunnel you started yourself.
+Sessions are real interactive Claude Code TUIs running inside **tmux** (`ccm-<name>`), driven by keystroke injection and screen scraping against the genuine `claude` CLI. You can `tmux attach -t ccm-<name>` to watch or type alongside the AI. Everything runs locally; the only thing that leaves your machine is the tunnel you started yourself.
 
 ## Capabilities
 
@@ -142,6 +142,11 @@ Sessions are real interactive Claude Code TUIs running inside **tmux** (`ccm-<na
   done so you can return to the chat — it does not resume the conversation.
 - **It is not a hosted/multi-tenant service.** Each user runs their own local
   bridge and their own tunnel; there is no shared server.
+- **Automating Claude is on you.** tandem drives the official `claude` CLI through
+  automated and sometimes unattended means; depending on how you auth it, this may
+  fall under [Anthropic's Consumer Terms](https://www.anthropic.com/legal/consumer-terms)
+  restrictions on automated access. Run it on your own account at your own risk;
+  an Anthropic API key is the cleanly-permitted path for autonomous use.
 
 ## Tools
 
@@ -444,3 +449,13 @@ a vulnerability, see [SECURITY.md](SECURITY.md).
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=maxmedawar%2Ftandem&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=maxmedawar/tandem&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=maxmedawar/tandem&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=maxmedawar/tandem&type=date&legend=top-left" />
+ </picture>
+</a>
