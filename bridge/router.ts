@@ -1,37 +1,59 @@
 /**
  * router.ts — local RPC router (the TRUST BOUNDARY).
  *
- * Adapted from the original cloud-code-mcp bridge. The Worker/WebSocket tunnel
- * transport has been removed: in tandem the MCP HTTP server (src/http-mcp.ts)
- * calls `route()` DIRECTLY in-process. Everything below — the route table,
- * handlers, name validation, relay-owned isolation, cwd allowlist enforcement,
- * and the audit log — is unchanged from the proven original.
+ * Network transport stays outside this module. Tandem's MCP servers call
+ * `route()` directly in-process, keeping the route table, handlers, name
+ * validation, relay-owned isolation, cwd admission, and audit policy inside
+ * one explicit trust boundary.
  *
- * ENGINE = tmux. Every drivable "session" is a REAL interactive `claude` TUI in
- * a tmux session "ccm-<name>", spawned and driven by TerminalSession via
- * keystroke injection + pane scraping. We NEVER run `claude -p` / headless and
- * NEVER set ANTHROPIC_API_KEY, so usage stays on the user's interactive
- * subscription. The autonomous capability is the zero-API two-session relay.
+ * ENGINE-AWARE (Phase 2): a drivable "session" is either a REAL interactive
+ * claude/codex/shell TUI in a tmux session "ccm-<name>" (driven by the shared
+ * TerminalSession lifecycle via keystroke injection + pane scraping), or an
+ * attached Hermes writable-agent id (a loopback HTTP gateway, not tmux). We
+ * NEVER run `claude -p` / headless and NEVER set ANTHROPIC_API_KEY, so Claude
+ * usage stays on the user's interactive subscription. The autonomous capability
+ * is the zero-API two-session relay, which stays Claude-only and unaffected by
+ * engine selection.
+ *
+ * ENGINE RESOLUTION ORDER (binding — Phase 2 correction E): every open_session
+ * call resolves and validates the engine (unknown id → 400, disabled → 403,
+ * enabled-but-unavailable executable → 503) via engine-registry.ts BEFORE any
+ * cwd resolution, tmux lookup, spawn, or network side effect. An engine
+ * mismatch on session-NAME reuse (a name already open under a different
+ * engine) is rejected with 409 before any further work too.
  *
  * SECURITY RAILS:
  *   - cwd ALLOWLIST (buildAllowlist / isCwdAllowed / safeResolve from
  *     sessions.ts). Any cwd outside the allowlist is rejected with a clean 403.
  *     Paths are realpath-canonicalized before the check so `..` / symlink escapes
  *     can't slip through, and the prefix comparison uses a trailing separator so
- *     "/Users/max" does NOT match "/Users/maxfoo".
- *   - Only ccm-* tmux sessions are drivable.
+ *     "/srv/code" does NOT match "/srv/code-evil".
+ *   - Only ccm-* tmux sessions (claude/codex/shell) or an allowlisted Hermes
+ *     agent id are drivable.
  *   - tmux send-keys is injection-safe (-l literal + -- end-of-options).
- *   - Audit log: every spawn / send / interrupt / close / relay control appends a
- *     line to ~/.tandem/bridge.log. A failed audit write surfaces to stderr.
+ *   - Audit log: every spawn / send / interrupt / close / relay control appends
+ *     metadata only to a private ~/.tandem/bridge.log. Prompt, command, task,
+ *     goal, context, report, output, and request-body values are replaced with
+ *     byte counts. A failed audit write surfaces to stderr.
  *
  * Config (env): TANDEM_CWD_ALLOWLIST / TANDEM_DEFAULT_CWD are mapped to the
  * engine's CCM_* names by the entrypoint before this module loads.
+ * TANDEM_ENABLED_ENGINES opts non-default engines in (see engine-registry.ts).
  */
 
-import { appendFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
-import { TerminalSession, validateModel, validateEffort } from './terminal-session.ts'
+import { validateModel, validateEffort, TerminalSession } from './terminal-session.ts'
+import type { EngineId } from './drivable.ts'
+import {
+  resolveEngine,
+  UnknownEngineError,
+  EngineDisabledError,
+  EngineUnavailableError,
+} from './engine-registry.ts'
+import { ClaudeSession } from './engines/claude.ts'
+import { CodexSession } from './engines/codex.ts'
+import { ShellSession } from './engines/shell.ts'
+import { HermesSession, loadHermesConfig } from './engines/hermes.ts'
 import {
   buildAllowlist,
   isCwdAllowed,
@@ -43,15 +65,15 @@ import {
 } from './sessions.ts'
 import * as relay from './relay.ts'
 import { emitCompletion, summarize } from './events.ts'
+import { audit } from './audit.ts'
 
 // ---- config ---------------------------------------------------------------
 
 const HOME = homedir()
-const DEFAULT_CWD = process.env.CCM_DEFAULT_CWD ?? HOME
-const BRIDGE_LOG = join(HOME, '.tandem', 'bridge.log')
-
-/** The allowlist is built once from env (or the $HOME default) at startup. */
+/** The explicit allowlist is built once from env at startup. */
 const ALLOWLIST = buildAllowlist()
+/** If no default is configured, use the first explicitly allowlisted root. */
+const DEFAULT_CWD = process.env.CCM_DEFAULT_CWD ?? ALLOWLIST[0] ?? HOME
 
 export function getAllowlist(): string[] {
   return ALLOWLIST
@@ -76,19 +98,6 @@ const RELAY_NAME_RE = /^relay-/
 
 export function isRelayOwned(name: string): boolean {
   return RELAY_NAME_RE.test(name)
-}
-
-function audit(fields: Record<string, unknown>): void {
-  const line = JSON.stringify({ ts: new Date().toISOString(), ...fields }) + '\n'
-  try {
-    mkdirSync(join(HOME, '.tandem'), { recursive: true })
-    appendFileSync(BRIDGE_LOG, line)
-  } catch (e) {
-    // Do NOT silently swallow: surface to stderr so a broken audit trail is visible.
-    process.stderr.write(
-      `[bridge] AUDIT WRITE FAILED (${e instanceof Error ? e.message : String(e)}): ${line}`,
-    )
-  }
 }
 
 // ---- RPC routing ----------------------------------------------------------
@@ -204,50 +213,182 @@ async function handleOpen(req: RpcRequest): Promise<RpcResult> {
     audit({ route: 'POST /sessions/open', name, denied: 'relay-owned' })
     return err(409, `session name "${name}" is reserved for the relay; use the relay routes`)
   }
+
+  // Resolve + validate the engine FIRST — before any cwd/tmux/network side
+  // effect (binding — Phase 2 correction E). Defaults to "claude" (the only
+  // engine enabled by default); codex/shell/hermes require explicit opt-in via
+  // TANDEM_ENABLED_ENGINES.
+  const rawEngine = req.body['engine'] !== undefined ? String(req.body['engine']) : undefined
+  let engine: EngineId
+  try {
+    ;({ id: engine } = await resolveEngine(rawEngine))
+  } catch (e) {
+    if (e instanceof UnknownEngineError) return err(400, e.message)
+    if (e instanceof EngineDisabledError) return err(403, e.message)
+    if (e instanceof EngineUnavailableError) return err(503, e.message)
+    return err(500, e instanceof Error ? e.message : String(e))
+  }
+
+  // An engine mismatch on name reuse is rejected before any further work,
+  // regardless of which engine's open path would otherwise run.
+  const liveExisting = getLive(name)
+  if (liveExisting && liveExisting.engine !== engine) {
+    audit({ route: 'POST /sessions/open', name, engine, denied: 'engine-mismatch', existingEngine: liveExisting.engine })
+    return err(409, `session "${name}" already exists with engine "${liveExisting.engine}"`)
+  }
+
+  if (engine === 'hermes') {
+    return handleOpenHermes(name, req)
+  }
+  return handleOpenTmux(engine, name, req)
+}
+
+/** open_session for the `hermes` engine: attach to an existing, explicitly
+ *  allowlisted writable agent id. No spawn, no cwd, no model/effort — Hermes
+ *  rejects all three (binding — Phase 2 correction E). */
+async function handleOpenHermes(name: string, req: RpcRequest): Promise<RpcResult> {
+  if (req.body['cwd'] !== undefined) return err(400, 'cwd is not supported for engine "hermes"')
+  if (req.body['model'] !== undefined) return err(400, 'model is not supported for engine "hermes"')
+  if (req.body['effort'] !== undefined) return err(400, 'effort is not supported for engine "hermes"')
+
+  const existing = getLive(name)
+  if (existing) {
+    audit({ route: 'POST /sessions/open', name, engine: 'hermes', reused: true })
+    return ok({ name: existing.id, engine: 'hermes', attachHint: existing.attachHint(), reused: true })
+  }
+
+  // A tmux-hosted session may have survived a bridge restart without yet being
+  // re-adopted into the in-memory registry. Never let a Hermes attachment claim
+  // that live session's name and hide/misroute it. Any ccm-<name> collision is a
+  // conflict, including an untagged one.
+  if (await TerminalSession.exists(name)) {
+    const existingEngine = await TerminalSession.engineTagOf(name)
+    audit({
+      route: 'POST /sessions/open',
+      name,
+      engine: 'hermes',
+      denied: 'tmux-name-conflict',
+      ...(existingEngine ? { existingEngine } : {}),
+    })
+    return err(
+      409,
+      existingEngine
+        ? `session "${name}" already exists with engine "${existingEngine}"`
+        : `session "${name}" already exists as a tmux session`,
+    )
+  }
+
+  const config = loadHermesConfig()
+  if (!config) {
+    audit({ route: 'POST /sessions/open', name, engine: 'hermes', denied: 'not-configured' })
+    return err(503, 'Hermes is not configured (set TANDEM_HERMES_BASE_URL)')
+  }
+  // Allowlist enforced HERE (registry/router) AND again inside HermesSession.attach
+  // (binding — Phase 2 correction D: "enforce the writable-agent id allowlist in
+  // both the registry/router and the Hermes adapter").
+  if (!config.writableAgents.has(name)) {
+    audit({ route: 'POST /sessions/open', name, engine: 'hermes', denied: 'not-writable-allowlisted' })
+    return err(403, `Hermes agent "${name}" is not on the writable-agent allowlist`)
+  }
+  try {
+    const session = HermesSession.attach({ agentId: name, config })
+    registerLive(session)
+    audit({ route: 'POST /sessions/open', name: session.id, engine: 'hermes' })
+    return ok({ name: session.id, engine: 'hermes', attachHint: session.attachHint() })
+  } catch (e) {
+    return err(500, `failed to attach Hermes agent: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
+/** open_session for claude/codex/shell: the shared tmux lifecycle, generalized
+ *  from Phase 1's Claude-only path. model/effort remain Claude-only. */
+async function handleOpenTmux(engine: 'claude' | 'codex' | 'shell', name: string, req: RpcRequest): Promise<RpcResult> {
+  // Per-session model/effort (optional, Claude only — binding Phase 2 correction
+  // C: no silent option loss for codex/shell). Validated up front so a bad value
+  // fails as a clean 400 rather than a generic 500 from spawn.
+  let model: string | undefined
+  let effort: string | undefined
+  if (engine === 'claude') {
+    try {
+      if (req.body['model'] !== undefined) model = validateModel(String(req.body['model']))
+      if (req.body['effort'] !== undefined) effort = validateEffort(String(req.body['effort']))
+    } catch (e) {
+      return err(400, e instanceof Error ? e.message : String(e))
+    }
+  } else {
+    if (req.body['model'] !== undefined) return err(400, `model is not supported for engine "${engine}"`)
+    if (req.body['effort'] !== undefined) return err(400, `effort is not supported for engine "${engine}"`)
+  }
+
+  // Idempotent: reuse a session already live under this name (engine already
+  // confirmed to match by the caller, handleOpen).
+  const existing = getLive(name)
+  if (existing) {
+    audit({ route: 'POST /sessions/open', name, engine, cwd: existing.cwd, reused: true })
+    return ok({ name: existing.id, engine, cwd: existing.cwd, attachHint: existing.attachHint(), reused: true })
+  }
+
+  // A live, already-admitted session can be reused without re-applying a cwd
+  // admission check. Fresh spawn and restart adoption still require the
+  // explicit allowlist below. Keeping this after option validation also means
+  // unsupported controls never become silent no-ops on reuse.
   const cwdInput = req.body['cwd'] !== undefined ? String(req.body['cwd']) : DEFAULT_CWD
   if (!isCwdAllowed(cwdInput, ALLOWLIST)) {
     return err(403, `cwd not allowed: ${cwdInput}`)
   }
   const cwd = safeResolve(cwdInput)
 
-  // Per-session model/effort (optional). Validate up front so a bad value fails as
-  // a clean 400 rather than a generic 500 from spawn.
-  let model: string | undefined
-  let effort: string | undefined
-  try {
-    if (req.body['model'] !== undefined) model = validateModel(String(req.body['model']))
-    if (req.body['effort'] !== undefined) effort = validateEffort(String(req.body['effort']))
-  } catch (e) {
-    return err(400, e instanceof Error ? e.message : String(e))
+  // A same-named ccm-* tmux session tagged with a DIFFERENT engine is a 409
+  // conflict, distinct from a provenance/cwd adoption failure (403) — checked
+  // before attempting adoption so the caller gets the precise reason.
+  const existingTag = await TerminalSession.engineTagOf(name)
+  if (existingTag !== undefined && existingTag !== engine) {
+    audit({ route: 'POST /sessions/open', name, engine, denied: 'engine-mismatch', existingEngine: existingTag })
+    return err(409, `session "${name}" already exists with engine "${existingTag}"`)
   }
 
-  // Idempotent: reuse a session already live under this name.
-  const existing = getLive(name)
-  if (existing) {
-    audit({ route: 'POST /sessions/open', name, cwd, reused: true })
-    return ok({ name: existing.name, cwd: existing.cwd, attachHint: existing.attachHint(), reused: true })
-  }
-  // Re-adopt a ccm-* session that survived a bridge restart (re-validates cwd).
-  const adopted = await TerminalSession.attachExisting(name, ALLOWLIST)
+  // Re-adopt a ccm-* session that survived a bridge restart (re-validates
+  // provenance tags + cwd).
+  const adopted =
+    engine === 'claude'
+      ? await ClaudeSession.attachExisting(name, ALLOWLIST)
+      : engine === 'codex'
+        ? await CodexSession.attachExisting(name, ALLOWLIST)
+        : await ShellSession.attachExisting(name, ALLOWLIST)
   if (adopted) {
     registerLive(adopted)
-    audit({ route: 'POST /sessions/open', name, cwd: adopted.cwd, adopted: true })
-    return ok({ name: adopted.name, cwd: adopted.cwd, attachHint: adopted.attachHint(), reused: true })
+    audit({ route: 'POST /sessions/open', name, engine, cwd: adopted.cwd, adopted: true })
+    return ok({ name: adopted.id, engine, cwd: adopted.cwd, attachHint: adopted.attachHint(), reused: true })
   }
-  if (await TerminalSession.exists(name)) {
-    audit({ route: 'POST /sessions/open', name, denied: 'adopt-cwd-not-allowed' })
-    return err(403, `existing session "${name}" has a cwd outside the allowlist; refusing to adopt`)
+  const stillExists =
+    engine === 'claude'
+      ? await ClaudeSession.exists(name)
+      : engine === 'codex'
+        ? await CodexSession.exists(name)
+        : await ShellSession.exists(name)
+  if (stillExists) {
+    audit({ route: 'POST /sessions/open', name, engine, denied: 'adopt-provenance-or-cwd' })
+    return err(
+      403,
+      `existing session "${name}" has a cwd outside the allowlist or unrecognized provenance; refusing to adopt`,
+    )
   }
 
   try {
-    const session = await TerminalSession.spawn({ name, cwd, allowlist: ALLOWLIST, model, effort })
+    const session =
+      engine === 'claude'
+        ? await ClaudeSession.spawn({ name, cwd, allowlist: ALLOWLIST, model, effort })
+        : engine === 'codex'
+          ? await CodexSession.spawn({ name, cwd, allowlist: ALLOWLIST })
+          : await ShellSession.spawn({ name, cwd, allowlist: ALLOWLIST })
     registerLive(session)
-    audit({ route: 'POST /sessions/open', name: session.name, cwd, model, effort, ready: session.ready })
+    audit({ route: 'POST /sessions/open', name: session.id, engine, cwd, model, effort, ready: session.ready })
     // Surface readiness: when the TUI did NOT reach its prompt (the classic
     // CPU-starved / blank-pane boot failure), include an actionable warning so the
     // caller doesn't silently drive a dead session believing it opened cleanly.
     return ok({
-      name: session.name,
+      name: session.id,
+      engine,
       cwd: session.cwd,
       attachHint: session.attachHint(),
       ready: session.ready,
@@ -272,27 +413,32 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
     return readSession(name, cursor)
   }
 
-  // Optional per-send model/effort override. Validate up front → clean 400.
+  // Optional per-send model/effort override — Claude-only (binding — Phase 2
+  // correction C: no silent option loss for codex/shell/hermes). Validate up
+  // front → clean 400, never a generic error from deep inside the adapter.
   let model: string | undefined
   let effort: string | undefined
-  try {
-    if (req.body['model'] !== undefined) model = validateModel(String(req.body['model']))
-    if (req.body['effort'] !== undefined) effort = validateEffort(String(req.body['effort']))
-  } catch (e) {
-    return err(400, e instanceof Error ? e.message : String(e))
+  if (req.body['model'] !== undefined || req.body['effort'] !== undefined) {
+    if (session.engine !== 'claude') {
+      return err(400, `model/effort are Claude-only options; not supported for engine "${session.engine}"`)
+    }
+    try {
+      if (req.body['model'] !== undefined) model = validateModel(String(req.body['model']))
+      if (req.body['effort'] !== undefined) effort = validateEffort(String(req.body['effort']))
+    } catch (e) {
+      return err(400, e instanceof Error ? e.message : String(e))
+    }
   }
 
-  audit({ route: 'POST /sessions/:name/send', name, cwd: session.cwd, text, model, effort })
+  audit({ route: 'POST /sessions/:name/send', name, engine: session.engine, cwd: session.cwd, text, model, effort })
 
   try {
-    // Apply per-turn controls (if any) as an in-session slash preamble first.
-    if (model !== undefined || effort !== undefined) {
-      await session.applyControls({ model, effort })
-    }
     // session.send() is already BOUNDED by the engine's soft cap (TANDEM_WAIT_MS):
     // it returns status:'done' with the report once idle, or status:'running' at
-    // the cap so the caller can call again — never an infinite internal loop.
-    const result = await session.send(text)
+    // the cap so the caller can poll/read again without resending the prompt.
+    // Never an infinite internal loop.
+    // Per-turn model/effort overrides (if any) are applied by the adapter itself.
+    const result = await session.send(text, { model, effort })
     if (result.status === 'done') {
       // Turn finished — EMIT a completion event (push), not just return it.
       emitCompletion({ type: 'session', id: name, cursor: result.cursor, summary: summarize(result.report), cwd: session.cwd })
@@ -300,6 +446,7 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
     return ok({
       status: result.status,
       name,
+      engine: session.engine,
       report: result.report,
       cursor: result.cursor,
       attachHint: session.attachHint(),
@@ -319,11 +466,11 @@ async function readSession(name: string, cursor: number): Promise<RpcResult> {
     return ok({ text: '', cursor, idle: true, live: false })
   }
   try {
-    const page = await session.readSince(cursor)
+    const page = await session.read({ cursor })
     if (page.idle && page.text.trim().length > 0) {
       emitCompletion({ type: 'session', id: name, cursor: page.cursor, summary: summarize(page.text), cwd: session.cwd })
     }
-    return ok({ ...page, live: true, attachHint: session.attachHint() })
+    return ok({ ...page, live: true, engine: session.engine, attachHint: session.attachHint() })
   } catch (e) {
     return err(500, `read failed: ${e instanceof Error ? e.message : String(e)}`)
   }
@@ -337,9 +484,9 @@ async function handleRead(name: string, req: RpcRequest): Promise<RpcResult> {
 async function handleInterrupt(name: string): Promise<RpcResult> {
   const session = getLive(name)
   if (!session) return err(409, `session "${name}" is not live`)
-  audit({ route: 'POST /sessions/:name/interrupt', name, cwd: session.cwd })
+  audit({ route: 'POST /sessions/:name/interrupt', name, engine: session.engine, cwd: session.cwd })
   await session.interrupt()
-  return ok({ ok: true, name })
+  return ok({ ok: true, name, engine: session.engine })
 }
 
 async function handleClose(name: string): Promise<RpcResult> {
@@ -348,10 +495,10 @@ async function handleClose(name: string): Promise<RpcResult> {
     // Already gone is success (idempotent).
     return ok({ ok: true, name, alreadyClosed: true })
   }
-  audit({ route: 'POST /sessions/:name/close', name, cwd: session.cwd })
+  audit({ route: 'POST /sessions/:name/close', name, engine: session.engine, cwd: session.cwd })
   await session.close()
   unregisterLive(name)
-  return ok({ ok: true, name })
+  return ok({ ok: true, name, engine: session.engine })
 }
 
 // ---- relay handlers -------------------------------------------------------
@@ -376,6 +523,7 @@ async function handleRelayStart(req: RpcRequest): Promise<RpcResult> {
     })
     return ok({ status: 'running', loopId, leadName, workerName, cursor: 0 })
   } catch (e) {
+    if (e instanceof relay.RelayConfigError) return err(400, e.message)
     return err(500, `failed to start relay: ${e instanceof Error ? e.message : String(e)}`)
   }
 }

@@ -1,30 +1,20 @@
-# Tandem Skills
+# Tandem skills
 
-Three skills that work together to run the tandem orchestration system:
+These optional skills teach compatible agents how to use Tandem well. The MCP bridge works without them.
 
-- **tandem-orchestration** — the master skill. Defines the whole hierarchy (human → director chatbot → manager Claude Code session → worker Claude Code session → sub-agents), the browser return loop, and the GOAL protocol. Every layer reads this.
-- **tandem-engineering-workflow** — the standard discipline. The spec → plan mode → review → audit cycle the director and manager hold every build to.
-- **tandem-agentic-engineering** — the worker's guide. How a Claude Code worker assembles agent teams, runs concurrent review, and attacks its own work before reporting up.
+- `tandem-orchestration`: engine-neutral multi-agent and multi-device routing, session control, delegation, and verification. It also explains the separate Claude-only relay.
+- `tandem-engineering-workflow`: engine-neutral planning, implementation, testing, review, and reporting discipline.
+- `tandem-agentic-engineering`: a specialized guide for Claude Code workers that can spawn their own internal agent teams.
 
-## Install — on BOTH sides
+Install only the skills that the chosen MCP client or worker runtime understands. Do not assume every chat or coding agent has the same skill format.
 
-The skills must be available to both ends of the loop:
+The release includes `tandem-orchestration.zip` for clients that accept a skill archive. Setup does not modify Claude, Codex, or other agent configuration. Install a skill only when the chosen runtime supports it and the operator requests it.
 
-1. **The chatbot (Claude.ai or ChatGPT):** load all three as skills so the director follows the protocol.
-2. **Claude Code:** make them available to the sessions — drop them into the project (e.g. `.claude/skills/`) or reference them from the project's `CLAUDE.md`.
+The general path is:
 
-## Requirements for the autonomous browser loop
+1. Give the director the orchestration and engineering workflow skills.
+2. Give a worker only the engine-specific guidance it can actually follow.
+3. Call `list_devices`, select an advertised engine, and preserve returned global session names.
+4. Verify worker output independently before declaring the task complete.
 
-The closed loop (no human relaying messages) only works when all of these are true:
-
-- The machine is on and awake (sessions spawn locally in tmux).
-- The tandem MCP is connected to the chatbot.
-- You're using Chrome.
-- The Claude-in-Chrome browser extension is installed and signed in.
-- These skills are installed on both sides (chatbot and Claude Code).
-
-If any are missing, everything still works in **manual mode** — you relay between the chat and the sessions yourself.
-
-## Memory — bring your own
-
-Tandem ships no memory system. The codebase plus Markdown files (`MISSION.md`, `STATE.json`, `LOG.md`, `.claude/specs/`) work as RAG out of the box — sessions re-read them each round, which survives context compaction. Or plug in any RAG / memory MCP you prefer.
+Tandem ships no external memory service. Projects can keep durable state in ordinary repository files or use a separate memory/RAG system chosen by the operator.

@@ -2,7 +2,7 @@
  * bridge/relay.ts — the ZERO-API peer-to-peer relay (replaces the removed API brain).
  *
  * Connects TWO interactive tmux-hosted Claude Code sessions, both billed against
- * Max's real interactive subscription (NEVER the Messages API — there is no
+ * the owner's real interactive subscription (NEVER the Messages API — there is no
  * @anthropic-ai/sdk here, and we never set ANTHROPIC_API_KEY):
  *
  *   - the LEAD ("brain") session, seeded as the reviewer/strategist. Each round
@@ -31,7 +31,7 @@ import { appendFileSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { TerminalSession } from './terminal-session.ts'
+import { TerminalSession, bypassPermissionsEnabled } from './terminal-session.ts'
 import { emitCompletion, emitEscalation, emitNeedsInput } from './events.ts'
 import {
   managerDir,
@@ -182,7 +182,7 @@ function transcript(loop: RelayLoop, tag: 'LEAD' | 'WORKER' | 'SYS', text: strin
       `[relay] transcript write failed for ${loop.loopId}: ${e instanceof Error ? e.message : String(e)}\n`,
     )
   }
-  // Also render live to stdout so Max watching the bridge sees both sides talk.
+  // Also render live to stdout so an owner watching the bridge sees both sides talk.
   process.stdout.write(block)
 }
 
@@ -209,6 +209,14 @@ export interface StartRelayResult {
   workerName: string
 }
 
+/**
+ * Thrown by startRelay() when it refuses to start because of a configuration
+ * problem rather than a runtime failure — distinguished from other startRelay
+ * errors (e.g. a failed spawn) so the router can return a clean 400 instead of
+ * a 500.
+ */
+export class RelayConfigError extends Error {}
+
 /** Clamp a possibly-untrusted turn count to the safe hard ceiling. */
 function clampMaxTurns(requested: number | undefined): number {
   if (requested === undefined || !Number.isFinite(requested)) return DEFAULT_MAX_TURNS
@@ -223,6 +231,19 @@ function clampMaxTurns(requested: number | undefined): number {
  * never blocks the tunnel; progress is observed via readSince().
  */
 export async function startRelay(opts: StartRelayOptions): Promise<StartRelayResult> {
+  // FAIL FAST: the relay is unattended (no human present to click through an
+  // in-session permission prompt). Starting it without bypass explicitly
+  // enabled would let a session silently hang forever the first time Claude
+  // asks for tool permission. Refuse before spawning anything, with a clear
+  // configuration error, rather than starting two sessions that can wedge.
+  if (!bypassPermissionsEnabled()) {
+    throw new RelayConfigError(
+      'relay refused to start: Claude permission bypass is not enabled, and the relay runs ' +
+        'unattended — it would hang the first time Claude asks for tool permission. Set ' +
+        'TANDEM_ALLOW_BYPASS=1 to allow it, or drive individual sessions with open_session / ' +
+        'send_to_session instead, where you can approve prompts yourself.',
+    )
+  }
   ensureRelayDir()
   const loopId = randomUUID().slice(0, 8)
   const maxTurns = clampMaxTurns(opts.maxTurns)
@@ -240,11 +261,13 @@ export async function startRelay(opts: StartRelayOptions): Promise<StartRelayRes
   const allowlist = opts.allowlist ?? []
 
   // Spawn both interactive sessions. cwd is validated against the allowlist
-  // INSIDE TerminalSession.spawn (per the shared contract).
-  const lead = await TerminalSession.spawn({ name: leadName, cwd: opts.cwd, allowlist })
+  // INSIDE TerminalSession.spawn (per the shared contract). allowBypass is
+  // passed explicitly (true) since the guard above already confirmed it — the
+  // relay must never fall back to a silent per-spawn env re-read.
+  const lead = await TerminalSession.spawn({ name: leadName, cwd: opts.cwd, allowlist, allowBypass: true })
   let worker: TerminalSession
   try {
-    worker = await TerminalSession.spawn({ name: workerName, cwd: opts.cwd, allowlist })
+    worker = await TerminalSession.spawn({ name: workerName, cwd: opts.cwd, allowlist, allowBypass: true })
   } catch (e) {
     // Don't leak the lead session if the worker fails to come up.
     await lead.close().catch(() => {})

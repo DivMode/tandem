@@ -1,59 +1,123 @@
 /**
- * tandem — entrypoint
+ * Tandem network entrypoint.
  *
- * Starts the local MCP bridge that a chat AI (Claude.ai) reaches through YOUR
- * OWN cloudflared quick tunnel. Everything sensitive comes from the environment
- * (.env) — there are no secrets in this repo.
- *
- * Security model (do not weaken):
- *   - TANDEM_TOKEN is REQUIRED. Without it the server refuses to start.
- *   - Every request must present that token (Bearer header, ?token=, or path).
- *   - Sessions may only be opened inside the cwd allowlist (TANDEM_CWD_ALLOWLIST).
- *
- * The token check runs BEFORE any heavy/optional dependency is imported, so
- * `TANDEM_TOKEN= node --experimental-strip-types src/server.ts` fails fast with
- * instructions even before `npm install`.
+ * The public MCP listener is OAuth-protected by default. The private fleet
+ * listener is a separate loopback-only WebSocket service with its own bearer
+ * credential. An explicit legacy flag keeps static bearer-header migration
+ * available without re-enabling query or path credentials.
  */
+import { fileURLToPath } from "node:url";
+import { loadProtectedRuntimeConfigFromEnv, readProtectedSecretFile } from "./runtime-config.ts";
 
-const TOKEN = (process.env.TANDEM_TOKEN ?? "").trim();
-
-if (!TOKEN) {
-  console.error(
-    [
-      "",
-      "✗ tandem will not start: TANDEM_TOKEN is not set.",
-      "",
-      "  The bridge runs real commands on this machine, so it must never be",
-      "  exposed without a secret token.",
-      "",
-      "  Fix it one of these ways:",
-      "    • Run the setup script (recommended):   ./setup.sh",
-      "    • Or set it yourself:                    export TANDEM_TOKEN=$(openssl rand -hex 32)",
-      "    • Or put TANDEM_TOKEN=... in a .env file next to package.json",
-      "",
-    ].join("\n"),
-  );
+try {
+  const loadedProtectedConfig = await loadProtectedRuntimeConfigFromEnv();
+  if (!loadedProtectedConfig) {
+    try {
+      process.loadEnvFile(fileURLToPath(new URL("../.env", import.meta.url)));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  if (!process.env.TANDEM_OWNER_PASSWORD && process.env.TANDEM_OWNER_PASSWORD_FILE) {
+    process.env.TANDEM_OWNER_PASSWORD = await readProtectedSecretFile(process.env.TANDEM_OWNER_PASSWORD_FILE);
+  }
+} catch {
+  console.error("tandem will not start: protected runtime configuration is unavailable or unsafe");
   process.exit(1);
 }
 
-if (TOKEN.length < 16) {
-  console.error(
-    "✗ TANDEM_TOKEN is too short to be safe (need >= 16 chars). " +
-      "Generate one with: openssl rand -hex 32",
-  );
-  process.exit(1);
-}
-
-// Bridge the user-facing TANDEM_* config to the engine's CCM_* names. This MUST
-// happen before importing the engine, which reads them at module load.
 if (process.env.TANDEM_CWD_ALLOWLIST) process.env.CCM_CWD_ALLOWLIST = process.env.TANDEM_CWD_ALLOWLIST;
 if (process.env.TANDEM_DEFAULT_CWD) process.env.CCM_DEFAULT_CWD = process.env.TANDEM_DEFAULT_CWD;
 
-// Token is present and sane. Now load the rest (these import external deps).
-const { startServer } = await import("./http-mcp.ts");
+const legacyAuth = process.env.TANDEM_LEGACY_TOKEN_AUTH === "1";
+const publicHost = process.env.TANDEM_HOST ?? "127.0.0.1";
+const publicPort = Number(process.env.TANDEM_PORT ?? 8787);
+const fleetToken = (process.env.TANDEM_FLEET_TOKEN ?? "").trim();
+const fleetHost = process.env.TANDEM_FLEET_HOST ?? "127.0.0.1";
+const fleetPort = Number(process.env.TANDEM_FLEET_PORT ?? 8788);
 
-await startServer({
-  token: TOKEN,
-  port: Number(process.env.TANDEM_PORT ?? 8787),
-  host: process.env.TANDEM_HOST ?? "127.0.0.1",
+if (fleetToken && fleetToken.length < 16) {
+  console.error("tandem will not start: TANDEM_FLEET_TOKEN must contain at least 16 characters");
+  process.exit(1);
+}
+if (fleetToken && !new Set(["127.0.0.1", "::1", "localhost"]).has(fleetHost)) {
+  console.error("tandem will not start: private fleet listener host must be loopback");
+  process.exit(1);
+}
+if (fleetToken && (!Number.isInteger(fleetPort) || fleetPort < 0 || fleetPort > 65_535)) {
+  console.error("tandem will not start: private fleet port is invalid");
+  process.exit(1);
+}
+
+const { createFleetRuntime, buildDefaultDeviceIdFromEnv } = await import("../bridge/fleet-runtime.ts");
+const { capabilityReport } = await import("../bridge/engine-registry.ts");
+const localCapabilities = await capabilityReport();
+const fleetRuntime = createFleetRuntime({
+  defaultDeviceId: buildDefaultDeviceIdFromEnv(),
+  localEngines: localCapabilities.filter((entry) => entry.enabled && entry.available).map((entry) => entry.engine),
 });
+
+type ClosableHandle = { readonly port: number; close(): Promise<void> };
+let publicHandle: ClosableHandle | undefined;
+let privateHandle: ClosableHandle | undefined;
+
+try {
+  if (legacyAuth) {
+    const token = (process.env.TANDEM_TOKEN ?? "").trim();
+    if (token.length < 16) throw new Error("TANDEM_TOKEN must contain at least 16 characters in legacy mode");
+    console.error("WARNING: TANDEM_LEGACY_TOKEN_AUTH=1 enables deprecated static bearer authentication; migrate to OAuth");
+    const { startServer } = await import("./http-mcp.ts");
+    publicHandle = await startServer({ token, host: publicHost, port: publicPort, fleet: fleetRuntime });
+  } else {
+    const { loadOAuthConfigFromEnv } = await import("./auth-config.ts");
+    const config = loadOAuthConfigFromEnv();
+    const { startOAuthServer } = await import("./public-server.ts");
+    publicHandle = await startOAuthServer({ host: publicHost, port: publicPort, config, fleet: fleetRuntime });
+  }
+
+  if (fleetToken) {
+    const { startPrivateFleetServer } = await import("../bridge/fleet-private-server.ts");
+    const { FleetEnrollmentStore } = await import("../bridge/fleet-enrollment.ts");
+    const { audit } = await import("../bridge/audit.ts");
+    const enrollmentStore = await FleetEnrollmentStore.open(
+      process.env.TANDEM_ENROLLMENT_STATE_DIR,
+    );
+    try {
+      privateHandle = await startPrivateFleetServer({
+        host: fleetHost,
+        port: fleetPort,
+        fleetToken,
+        runtime: fleetRuntime,
+        enrollment: { store: enrollmentStore, fleetToken },
+        auditEvent: audit,
+      });
+    } catch (error) {
+      await publicHandle.close();
+      publicHandle = undefined;
+      throw error;
+    }
+    console.error(`tandem private fleet listener on loopback port ${privateHandle.port}`);
+  }
+} catch (error) {
+  // Do not echo filesystem paths, bind addresses, tailnet names, or secrets
+  // from lower-level errors. Detailed errors belong in local debugging, not
+  // the default startup surface.
+  void error;
+  console.error("tandem will not start: configuration, protected state, or listener startup failed");
+  process.exit(1);
+}
+
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.error(`tandem: received ${signal}, shutting down`);
+  const results = await Promise.allSettled([
+    publicHandle?.close() ?? Promise.resolve(),
+    privateHandle?.close() ?? Promise.resolve(),
+  ]);
+  process.exit(results.some((result) => result.status === "rejected") ? 1 : 0);
+}
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));

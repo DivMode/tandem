@@ -24,6 +24,15 @@ describe("ntfyPayload — completion (unchanged phase-5 behavior)", () => {
     expect(p.body).toContain("999");
     expect(p.body).toContain("lead reported DONE");
   });
+  it("has no Claude.ai or other client click default", () => {
+    expect(ntfyPayload(baseEvent).click).toBeUndefined();
+  });
+  it("accepts an explicit safe click URL and rejects credential-bearing URLs", () => {
+    expect(ntfyPayload(baseEvent, { clickUrl: "https://ops.example/runbook" }).click).toBe(
+      "https://ops.example/runbook",
+    );
+    expect(ntfyPayload(baseEvent, { clickUrl: "https://user:secret@ops.example" }).click).toBeUndefined();
+  });
 });
 
 describe("ntfyPayload — escalation (manager is stuck, needs the human)", () => {

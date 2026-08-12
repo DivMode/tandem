@@ -1,22 +1,26 @@
 /**
- * terminal-session.ts — drive a REAL interactive `claude` TUI inside tmux.
+ * terminal-session.ts — drive a REAL interactive engine TUI (or shell) inside
+ * tmux, parameterized by an EngineDescriptor (./drivable.ts). Phase 1 only used
+ * this for `claude`; Phase 2 generalizes it so `codex` and `shell` reuse the
+ * SAME tmux lifecycle — spawn, warmup/readiness, injection, idle detection,
+ * interrupt, close — with zero per-engine duplication of that lifecycle.
  *
- * BILLING (see spec §1b): we manipulate Max's real interactive `claude` TUI via
- * terminal keystrokes — NOT `claude -p` / headless — so usage stays on his
- * subscription windows. The bridge SPAWNS a fresh interactive claude inside a
- * tmux session ("tmux new-session -d -s ccm-<name> claude") and drives it by
- * injecting keys + scraping the pane. Max can "tmux attach -t ccm-<name>" to
- * watch or type alongside.
+ * BILLING (see spec §1b): for `claude` we manipulate the owner's real
+ * interactive TUI via terminal keystrokes — NOT `claude -p` / headless — so
+ * usage stays on their subscription windows. The bridge SPAWNS a fresh
+ * interactive process inside a tmux session ("tmux new-session -d -s ccm-<name>
+ * <engine>") and drives it by injecting keys + scraping the pane. The owner can
+ * "tmux attach -t ccm-<name>" to watch or type alongside.
  *
- * IDLE DETECTION (the crux — empirically probed, see bridge/NOTES-terminal.md):
- *   Working marker  = the footer string "esc to interrupt" is PRESENT.
- *   Idle            = "esc to interrupt" ABSENT *and* the trimmed capture-pane
- *                     content is byte-stable across IDLE_STABLE_POLLS (default 3)
- *                     consecutive ~750ms polls. The two-condition rule matters:
- *                     right after Enter there is a brief window where the spinner
- *                     hasn't rendered yet (footer still shows "auto mode on"), so
- *                     a single glance can falsely read as idle — content-stability
- *                     guards against that.
+ * IDLE DETECTION — marker-based (claude) vs markerless (codex/shell):
+ *   Claude has a proven footer marker: "esc to interrupt" PRESENT means working;
+ *   ABSENT plus N stable polls means idle (see EngineDescriptor.isWorking).
+ *   Codex/shell have no invented marker (binding — Phase 2 correction B: a
+ *   guessed marker risks FALSE completion the moment the real UI text changes).
+ *   Their idle/ready state is decided ENTIRELY by pane-stability: the pane must
+ *   be byte-stable for >= descriptor.minStableMs before a turn/warmup counts as
+ *   done/ready (see stepStability below). Both paths share one state machine so
+ *   "changing output is working" holds uniformly, marker or not.
  *
  * INJECTION SAFETY: text is injected with
  *   tmux send-keys -t <tgt> -l -- <text>     (literal; -- ends option parsing)
@@ -24,7 +28,18 @@
  *   tmux send-keys -t <tgt> Enter
  * The user's text is passed as an execFile argv element, never interpolated into
  * a shell string, so it can never be reinterpreted as tmux key names or shell
- * metacharacters.
+ * metacharacters. NOTE: for the `shell` engine, the whole POINT of send() is
+ * that the injected text is executed AS a shell command by the pane's real
+ * shell once it hits Enter — that is the feature (arbitrary OS-user command
+ * execution beginning in the allowlisted cwd), not a vulnerability of this
+ * file. The cwd admission check is not an OS sandbox.
+ *
+ * PROVENANCE (binding — Phase 2 correction A, see ./ownership.ts): every
+ * spawned session is tagged with tmux user options `@tandem_engine` (which
+ * descriptor spawned it) and `@tandem_owner` (this installation's durable
+ * random owner id). attachExisting() refuses to adopt a same-named session
+ * unless BOTH tags match exactly — an `@tandem_engine` tag alone is not proof
+ * Tandem created the session.
  *
  * TRANSCRIPT + CURSOR: on spawn we attach
  *   tmux pipe-pane -o -t <tgt> 'cat >> <transcriptsDir>/<name>.log'
@@ -37,24 +52,31 @@ import { existsSync, realpathSync, statSync } from 'node:fs'
 import { open, mkdir } from 'node:fs/promises'
 import { cpus, homedir, loadavg } from 'node:os'
 import { join, sep } from 'node:path'
+import { CLAUDE_DESCRIPTOR, type EngineDescriptor } from './drivable.ts'
+import { makeOwnerIdProvider, type OwnerIdProvider } from './ownership.ts'
 
 const HOME = homedir()
 const TRANSCRIPTS_DIR = join(HOME, '.tandem', 'transcripts')
 
-/** tmux session-name prefix. Only ccm-* sessions are drivable by the bridge. */
+/** tmux session-name prefix. Only ccm-* sessions are drivable by the bridge,
+ *  regardless of engine — the engine identity lives in the @tandem_engine tag. */
 const SESSION_PREFIX = 'ccm-'
 
-/** The footer string Claude Code shows ONLY while a turn is running. */
-const WORKING_MARKER = 'esc to interrupt'
+/** Session names must be tmux/file safe. */
+const SESSION_NAME_RE = /^[A-Za-z0-9._-]+$/
 
-/** Trust-folder prompt shown on first run in an un-trusted directory. */
+/** The footer string Claude Code shows ONLY while a turn is running (used only
+ *  by report-cleaning below; the authoritative check is CLAUDE_DESCRIPTOR). */
+const CLAUDE_WORKING_MARKER = 'esc to interrupt'
+
+/** Trust-folder prompt shown on first run in an un-trusted directory (claude only). */
 const TRUST_PROMPT_MARKER = 'trust this folder'
 
 const POLL_MS = 750
-const IDLE_STABLE_POLLS = 3 // consecutive stable polls required to call it idle
 // Soft cap for a single send() wait, configurable via env TANDEM_WAIT_MS (ms).
-// At the cap, send() returns status:'running' so the caller can call again — the
-// proven idle/done detection below is unchanged; only this bound is tunable.
+// At the cap, send() returns status:'running' so the caller can poll/read again
+// without resending the prompt. The proven idle/done detection below is
+// unchanged; only this bound is tunable.
 const SEND_SOFT_CAP_MS =
   Number(process.env.TANDEM_WAIT_MS) > 0 ? Number(process.env.TANDEM_WAIT_MS) : 25_000
 const SEND_HARD_CAP_MS = 180_000 // a send() can never hang past this
@@ -63,29 +85,45 @@ const PANE_WIDTH = 200
 const PANE_HEIGHT = 50
 
 /** Marker on the first-run "Bypass Permissions mode" acceptance dialog (distinct
- *  from the normal "bypass permissions on (shift+tab…)" running footer). */
+ *  from the normal "bypass permissions on (shift+tab…)" running footer). Claude only. */
 const BYPASS_ACCEPT_MARKER = 'yes, i accept'
 
 /**
- * Skip-permissions ("autonomous"/no-confirm) is the DEFAULT so turns don't stall
- * on Claude Code's allow-prompts. Disable per host via TANDEM_SKIP_PERMISSIONS set
- * to one of: 0 / false / no / off.
+ * Claude permission bypass (`--dangerously-skip-permissions`) is OFF by default —
+ * an unattended session must not silently gain the power to run any tool without
+ * a human present to approve it. Enable it only with TANDEM_ALLOW_BYPASS=1.
  *
- * SECURITY: this ONLY suppresses Claude Code's in-session tool-permission prompts.
- * It does NOT touch cwd and CANNOT widen which directories are reachable — the cwd
- * allowlist is enforced BEFORE spawn (in spawn() below AND again in
- * router.handleOpen), and the pane is created with `-c <already-validated cwd>`.
+ * SECURITY: even when enabled, this ONLY suppresses Claude Code's in-session
+ * tool-permission prompts. It does not change the admitted starting cwd: the
+ * cwd allowlist is enforced BEFORE spawn (in spawn() below AND again in
+ * router.handleOpen), and the pane is created with `-c <validated real cwd>`.
+ * The allowlist is an admission gate, not an OS sandbox, so the spawned process
+ * still has the reach of its OS user. Bypass is Claude-only; every other engine
+ * rejects an explicit bypass request rather than silently ignoring it.
  */
-export function skipPermissionsEnabled(): boolean {
-  const v = (process.env.TANDEM_SKIP_PERMISSIONS ?? '').trim().toLowerCase()
-  return !(v === '0' || v === 'false' || v === 'no' || v === 'off')
+export function bypassPermissionsEnabled(): boolean {
+  return (process.env.TANDEM_ALLOW_BYPASS ?? '').trim() === '1'
 }
 
-/** Accepted `--effort` levels (mirrors `claude --effort`). */
+/**
+ * The legacy TANDEM_SKIP_PERMISSIONS variable used to enable bypass BY DEFAULT
+ * (opt-out). It no longer has any effect — only TANDEM_ALLOW_BYPASS=1 enables
+ * bypass. If a host still sets it, warn to stderr rather than silently ignoring
+ * it, so the change in behavior is visible instead of surprising.
+ */
+export function warnLegacySkipPermissionsIfSet(): void {
+  if (process.env.TANDEM_SKIP_PERMISSIONS === undefined) return
+  process.stderr.write(
+    '[bridge] TANDEM_SKIP_PERMISSIONS is ignored and does not enable bypass. ' +
+      'Set TANDEM_ALLOW_BYPASS=1 to run Claude with --dangerously-skip-permissions.\n',
+  )
+}
+
+/** Accepted `--effort` levels (mirrors `claude --effort`). Claude only. */
 export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 export type EffortLevel = (typeof EFFORT_LEVELS)[number]
 
-/** Accepted model ALIASES; a full model id (claude-*) is also accepted as-is. */
+/** Accepted model ALIASES; a full model id (claude-*) is also accepted as-is. Claude only. */
 export const MODEL_ALIASES = ['default', 'opus', 'sonnet', 'haiku'] as const
 
 /** Validate/normalize a model value; throws a CLEAR error if unsupported (never
@@ -112,12 +150,20 @@ export interface SpawnOptions {
   cwd: string
   /** Allowlist roots; cwd is validated against this before spawning. */
   allowlist: string[]
-  /** Optional model alias/id → session-scoped `claude --model`. Validated. */
+  /** Optional model alias/id → session-scoped `claude --model`. Claude only; any
+   *  other engine's spawn() REJECTS this rather than silently ignoring it. */
   model?: string
-  /** Optional effort level → session-scoped `claude --effort`. Validated. */
+  /** Optional effort level → session-scoped `claude --effort`. Claude only; see `model`. */
   effort?: string
-  /** Override the skip-permissions default for this spawn (else env/default). */
-  skipPermissions?: boolean
+  /** Override the bypass-permissions default for this spawn (else env/default).
+   *  Claude only; see `model`. */
+  allowBypass?: boolean
+  /** Which engine's tmux lifecycle to run. Defaults to CLAUDE_DESCRIPTOR so
+   *  relay.ts (which never sets this) is completely unaffected by Phase 2. */
+  descriptor?: EngineDescriptor
+  /** Injectable owner-id provider — tests supply one bound to a temp state dir
+   *  so the real `~/.tandem/owner-id` is never touched. */
+  ownerIdProvider?: OwnerIdProvider
 }
 
 export interface SendResult {
@@ -147,6 +193,29 @@ function tmux(args: string[]): Promise<string> {
       resolve(stdout)
     })
   })
+}
+
+/** Read a spawned session's `@tandem_engine` / `@tandem_owner` tmux user options
+ *  in one round trip. Empty strings mean "tag absent" (tmux prints nothing for
+ *  an unset user option in `display-message`, never throws). */
+async function readProvenanceTags(target: string): Promise<{ engine: string; owner: string }> {
+  try {
+    const raw = await tmux(['display-message', '-p', '-t', target, '#{@tandem_engine}\t#{@tandem_owner}'])
+    const [engine = '', owner = ''] = raw.replace(/\n$/, '').split('\t')
+    return { engine, owner }
+  } catch {
+    return { engine: '', owner: '' }
+  }
+}
+
+/** Public: the `@tandem_engine` / `@tandem_owner` provenance tags of an
+ *  existing ccm-<name> tmux session (bare name, no prefix). Used by
+ *  sessions.ts's list_sessions to decide whether a live ccm-* tmux session was
+ *  actually created by THIS installation (binding — Phase 2 correction E:
+ *  "missing/mismatched tmux provenance must never appear as drivable") — never
+ *  by reading the `@tandem_engine` tag alone. */
+export async function readSessionProvenance(name: string): Promise<{ engine: string; owner: string }> {
+  return readProvenanceTags(SESSION_PREFIX + name)
 }
 
 /**
@@ -185,33 +254,38 @@ function isCwdAllowedLocal(cwd: string, allowlist: string[]): boolean {
   try {
     real = realpathSync(cwd)
   } catch {
-    real = cwd
+    return false
   }
-  return allowlist.some((root) => isUnder(real, root))
+  return allowlist.some((root) => {
+    try {
+      return isUnder(real, realpathSync(root))
+    } catch {
+      return false
+    }
+  })
 }
 
-/**
- * Diagnose why a freshly-spawned pane is not usable yet — turns the #1 silent
- * failure ("session won't boot / no banner / commands don't go through") into a
- * clear, actionable message.
- *
- * Returns null when the pane shows the prompt (ready), otherwise a human-readable
- * reason. The classic failure observed in the field: a BLANK pane under HIGH
- * system load — the interactive `claude` TUI is CPU-starved (e.g. macOS Spotlight
- * / mediaanalysisd indexing, or too many live sessions) and never finishes its
- * first render, so warmup never sees the prompt and any later send() injects into
- * a dead TUI. `claude -p` still works in that state because it's a short burst,
- * which is exactly why "the bridge looks broken but claude is fine" is confusing.
- *
- * Pure (load/cpu are injected) so it is unit-testable without a real machine.
- */
-export function describeReadiness(
-  pane: string,
-  load1: number,
-  cpuCount: number,
-  name: string,
-): string | null {
-  if (pane.includes('❯')) return null
+/** Pure adoption policy extracted from attachExisting so provenance refusal is
+ *  regression-testable without launching or driving tmux. */
+export function canAdoptTerminalSession(
+  provenance: { engine: string; owner: string },
+  expectedEngine: EngineDescriptor['id'],
+  expectedOwner: string,
+  cwd: string,
+  allowlist: string[],
+): boolean {
+  return (
+    provenance.engine === expectedEngine &&
+    provenance.owner.length > 0 &&
+    provenance.owner === expectedOwner &&
+    isCwdAllowedLocal(cwd, allowlist)
+  )
+}
+
+/** Shared "why isn't this pane ready" formatter used by both describeReadiness
+ *  (marker-based) and describeMarkerlessReadiness (stability-based) — the two
+ *  differ only in HOW they decide "not ready", not in how they explain it. */
+function formatUnreadyMessage(pane: string, load1: number, cpuCount: number, name: string): string {
   const where = pane.trim().length === 0 ? 'the pane is still blank' : 'the prompt never appeared'
   const overloaded = cpuCount > 0 && load1 > cpuCount * 1.5
   if (overloaded) {
@@ -228,10 +302,92 @@ export function describeReadiness(
   )
 }
 
+/**
+ * Diagnose why a freshly-spawned MARKER-BASED pane (claude) is not usable yet —
+ * turns the #1 silent failure ("session won't boot / no banner / commands don't
+ * go through") into a clear, actionable message.
+ *
+ * Returns null when the pane shows the prompt (ready), otherwise a human-readable
+ * reason. The classic failure observed in the field: a BLANK pane under HIGH
+ * system load — the interactive TUI is CPU-starved (e.g. macOS Spotlight /
+ * mediaanalysisd indexing, or too many live sessions) and never finishes its
+ * first render, so warmup never sees the prompt and any later send() injects into
+ * a dead TUI. `claude -p` still works in that state because it's a short burst,
+ * which is exactly why "the bridge looks broken but claude is fine" is confusing.
+ *
+ * Pure (load/cpu are injected) so it is unit-testable without a real machine.
+ */
+export function describeReadiness(
+  pane: string,
+  load1: number,
+  cpuCount: number,
+  name: string,
+): string | null {
+  if (pane.includes('❯')) return null
+  return formatUnreadyMessage(pane, load1, cpuCount, name)
+}
+
+/**
+ * The markerless-engine (codex/shell) equivalent of describeReadiness: called
+ * only once the caller has ALREADY determined (via pane-stability, not a
+ * guessed marker) that warmup timed out without reaching a stable prompt.
+ * Pure, same reasoning as describeReadiness minus the claude-specific "❯" check.
+ */
+export function describeMarkerlessReadiness(
+  pane: string,
+  load1: number,
+  cpuCount: number,
+  name: string,
+): string {
+  return formatUnreadyMessage(pane, load1, cpuCount, name)
+}
+
+/** Stability-tracking state threaded through stepStability() across polls. */
+export interface StabilityState {
+  stablePolls: number
+  lastPane: string
+}
+
+export const INITIAL_STABILITY_STATE: StabilityState = { stablePolls: 0, lastPane: '' }
+
+/** How many consecutive POLL_MS-spaced observations the pane must be unchanged
+ *  before a descriptor's minStableMs policy is satisfied. The first observation
+ *  occurs at elapsed time zero, so a positive duration needs one more observation
+ *  than the number of intervals. */
+export function requiredStablePolls(descriptor: EngineDescriptor, pollMs = POLL_MS): number {
+  if (descriptor.minStableMs <= 0) return 1
+  return Math.ceil(descriptor.minStableMs / pollMs) + 1
+}
+
+/**
+ * Pure state-machine step shared by send()'s completion loop AND markerless
+ * warmup: given the newly captured pane text and the previous state, decides
+ * whether the engine is "working" (marker-based; always false when the
+ * descriptor has no isWorking) and whether it is now idle (not working AND
+ * stable for >= `required` consecutive polls). Exported so captured/synthetic
+ * pane sequences are unit-testable without tmux (binding — Phase 2 correction
+ * B: no live Codex/shell process required in automated tests). "Changing
+ * output is working" holds even without a marker: any pane change resets
+ * stablePolls to 1 (or 0 while a marker reports working).
+ */
+export function stepStability(
+  pane: string,
+  prev: StabilityState,
+  descriptor: EngineDescriptor,
+  required: number,
+): { working: boolean; idle: boolean; state: StabilityState } {
+  const working = descriptor.isWorking ? descriptor.isWorking(pane) : false
+  const trimmed = pane.trimEnd()
+  const stablePolls = !working && trimmed === prev.lastPane ? prev.stablePolls + 1 : working ? 0 : 1
+  const idle = !working && stablePolls >= required
+  return { working, idle, state: { stablePolls, lastPane: trimmed } }
+}
+
 export class TerminalSession {
   private readonly _name: string
   private readonly _cwd: string
   private readonly logPath: string
+  private readonly descriptor: EngineDescriptor
   /** Set by warmup(): did the TUI reach its prompt? */
   private _ready = false
   /** Set by warmup() when NOT ready: an actionable reason (load/blank/attach). */
@@ -240,10 +396,11 @@ export class TerminalSession {
   // Explicit field assignment (NOT TS "parameter properties") — the bridge runs
   // under `node --experimental-strip-types`, whose strip-only mode rejects the
   // `private x: T` constructor-parameter shorthand.
-  private constructor(name: string, cwd: string, logPath: string) {
+  private constructor(name: string, cwd: string, logPath: string, descriptor: EngineDescriptor) {
     this._name = name
     this._cwd = cwd
     this.logPath = logPath
+    this.descriptor = descriptor
   }
 
   get name(): string {
@@ -254,7 +411,11 @@ export class TerminalSession {
     return this._cwd
   }
 
-  /** True once the TUI has shown its prompt (warmup saw `❯`). */
+  get engine(): EngineDescriptor['id'] {
+    return this.descriptor.id
+  }
+
+  /** True once the TUI has shown its prompt (warmup saw its ready condition). */
   get ready(): boolean {
     return this._ready
   }
@@ -273,22 +434,36 @@ export class TerminalSession {
   }
 
   /**
-   * Spawn a fresh interactive `claude` inside a new tmux session. The cwd is
+   * Spawn a fresh interactive engine (or, for a descriptor with no executable,
+   * the pane's default login shell) inside a new tmux session. The cwd is
    * validated against the allowlist (the caller should pass an already-realpath'd
    * cwd and the matching allowlist from sessions.ts). Attaches a pipe-pane
-   * transcript and waits for the TUI to become ready (handling the first-run
-   * trust-folder prompt).
-   */
+   * transcript, tags the session with provenance (@tandem_engine/@tandem_owner),
+   * and waits for the engine to become ready.
+  */
   static async spawn(opts: SpawnOptions): Promise<TerminalSession> {
-    const { name, cwd, allowlist } = opts
-    if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+    const { name, allowlist } = opts
+    const requestedCwd = opts.cwd
+    const descriptor = opts.descriptor ?? CLAUDE_DESCRIPTOR
+    if (!SESSION_NAME_RE.test(name)) {
       throw new Error(`invalid session name: ${name}`)
     }
-    if (!allowlist.some((root) => isUnder(cwd, root))) {
-      throw new Error(`cwd not allowed: ${cwd}`)
+    // No silent option loss (binding — Phase 2 correction C): a non-Claude
+    // engine REJECTS model/effort/bypass rather than quietly ignoring them.
+    if (descriptor.id !== 'claude') {
+      if (opts.model !== undefined || opts.effort !== undefined) {
+        throw new Error(`model/effort are Claude-only options; not supported for engine "${descriptor.id}"`)
+      }
+      if (opts.allowBypass !== undefined) {
+        throw new Error(`bypass is a Claude-only option; not supported for engine "${descriptor.id}"`)
+      }
     }
-    if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
-      throw new Error(`cwd does not exist or is not a directory: ${cwd}`)
+    if (!existsSync(requestedCwd) || !statSync(requestedCwd).isDirectory()) {
+      throw new Error(`cwd does not exist or is not a directory: ${requestedCwd}`)
+    }
+    const cwd = realpathSync(requestedCwd)
+    if (!isCwdAllowedLocal(cwd, allowlist)) {
+      throw new Error(`cwd not allowed: ${requestedCwd}`)
     }
 
     const target = SESSION_PREFIX + name
@@ -297,25 +472,43 @@ export class TerminalSession {
       throw new Error(`tmux session already exists: ${target}`)
     }
 
+    // Resolve the durable owner id BEFORE creating any tmux state, so a failure
+    // here (e.g. unwritable state dir) never leaves an orphaned/untagged session.
+    const ownerIdProvider = opts.ownerIdProvider ?? makeOwnerIdProvider()
+    const ownerId = await ownerIdProvider()
+
     await mkdir(TRANSCRIPTS_DIR, { recursive: true })
     const logPath = join(TRANSCRIPTS_DIR, `${name}.log`)
     // Truncate any stale transcript so the byte cursor starts clean.
     await (await open(logPath, 'w')).close()
 
-    // Build the `claude` argv. cwd was ALREADY allowlist-checked above (and again
-    // in router.handleOpen) BEFORE we reach here; none of these flags touch cwd, so
-    // skip-permissions/model/effort can never widen which directory is reachable.
-    // Validation (model/effort) runs here, pre-spawn, so a bad value fails clearly
-    // instead of launching a misconfigured session.
-    const skip = opts.skipPermissions ?? skipPermissionsEnabled()
-    const claudeArgv: string[] = ['claude']
-    if (skip) claudeArgv.push('--dangerously-skip-permissions')
-    if (opts.model !== undefined) claudeArgv.push('--model', validateModel(opts.model))
-    if (opts.effort !== undefined) claudeArgv.push('--effort', validateEffort(opts.effort))
+    // Build the engine argv. The real cwd was already allowlist-checked above
+    // (and again in router.handleOpen). These flags do not change the admitted
+    // start directory. The cwd gate is not an OS sandbox: the process retains
+    // the filesystem reach of its OS user. Validation (model/effort) runs here,
+    // pre-spawn, so a bad value fails clearly instead of launching a
+    // misconfigured session.
+    const engineArgv: string[] = []
+    if (descriptor.executable) {
+      engineArgv.push(descriptor.executable)
+      if (descriptor.id === 'claude') {
+        warnLegacySkipPermissionsIfSet()
+        const skip = opts.allowBypass ?? bypassPermissionsEnabled()
+        if (skip) engineArgv.push('--dangerously-skip-permissions')
+        if (opts.model !== undefined) engineArgv.push('--model', validateModel(opts.model))
+        if (opts.effort !== undefined) engineArgv.push('--effort', validateEffort(opts.effort))
+      }
+    } else {
+      // Shell engine: the pane's default login shell — SHELL env if set, else a
+      // portable fallback. Never a shell STRING; this is one argv element handed
+      // straight to tmux/execFile, so it can't be reinterpreted.
+      const shellBin = (process.env.SHELL ?? '').trim() || '/bin/sh'
+      engineArgv.push(shellBin, '-l')
+    }
 
     // Inject text injection-safe — but here the args are all bridge-controlled
-    // (constants + validated flags), so this is a normal new-session. `claude` is
-    // the command run INSIDE the pane; the cwd is set via -c.
+    // (constants + validated flags), so this is a normal new-session. The engine
+    // binary (or login shell) runs INSIDE the pane; the cwd is set via -c.
     await tmux([
       'new-session',
       '-d',
@@ -327,15 +520,23 @@ export class TerminalSession {
       String(PANE_HEIGHT),
       '-c',
       cwd,
-      ...claudeArgv,
+      ...engineArgv,
     ])
+
+    // Provenance tags (binding — Phase 2 correction A): required before a later
+    // restart may ever consider this session adoptable. Set right after create,
+    // before the transcript pipe, so a crash in between leaves, at worst, a
+    // correctly-tagged session with a short transcript gap — never a mistagged
+    // one that could be adopted without real provenance.
+    await tmux(['set-option', '-t', target, '@tandem_engine', descriptor.id])
+    await tmux(['set-option', '-t', target, '@tandem_owner', ownerId])
 
     // Attach the append-only transcript pipe. Single-quote the redirect target;
     // the path is bridge-controlled (transcripts dir + validated name).
     const safeLog = logPath.replace(/'/g, `'\\''`)
     await tmux(['pipe-pane', '-o', '-t', target, `cat >> '${safeLog}'`])
 
-    const session = new TerminalSession(name, cwd, logPath)
+    const session = new TerminalSession(name, cwd, logPath, descriptor)
     await session.warmup()
     return session
   }
@@ -343,21 +544,33 @@ export class TerminalSession {
   /**
    * Re-attach to an existing ccm-* session the bridge previously created.
    *
-   * SECURITY (allowlist re-validation at the trust boundary): the session's REAL
-   * cwd is read from tmux (`pane_current_path`) and re-checked against the SAME
-   * allowlist spawn uses. Adoption is the only path into the registry that does
-   * not run spawn's allowlist gate, so without this check a ccm-* session created
-   * by hand outside the allowlist (e.g. `tmux new -s ccm-x -c /etc`) — or one
-   * whose claude process later cd'd out of bounds — would become fully drivable
-   * by a remote caller that just guesses/lists the name. We REFUSE to adopt (return
-   * undefined) any session whose real cwd is not allowlisted, mirroring spawn.
+   * SECURITY (provenance + allowlist re-validation at the trust boundary):
+   * adoption is the only path into the registry that does not run spawn's
+   * allowlist gate, and (binding — Phase 2 correction A) an `@tandem_engine` tag
+   * alone is not proof Tandem created the session — anyone on the same OS user
+   * account could hand-create a matching tmux session. We therefore require, IN
+   * ORDER and WITHOUT sending any keys if any check fails:
+   *   1. the session's `@tandem_engine` tag exactly matches the requested engine;
+   *   2. its `@tandem_owner` tag exactly matches this installation's durable
+   *      owner id (see ./ownership.ts);
+   *   3. the session's REAL cwd (read from tmux `pane_current_path`) is still
+   *      inside the SAME allowlist spawn uses.
+   * Any missing/mismatched provenance, or a disallowed cwd, refuses adoption
+   * (returns undefined) — mirroring spawn's fail-closed behavior.
    */
   static async attachExisting(
     name: string,
     allowlist: string[],
+    descriptor: EngineDescriptor = CLAUDE_DESCRIPTOR,
+    ownerIdProvider: OwnerIdProvider = makeOwnerIdProvider(),
   ): Promise<TerminalSession | undefined> {
+    if (!SESSION_NAME_RE.test(name)) return undefined
     const target = SESSION_PREFIX + name
     if (!(await TerminalSession.tmuxSessionExists(target))) return undefined
+
+    const provenance = await readProvenanceTags(target)
+    const expectedOwner = await ownerIdProvider()
+
     const logPath = join(TRANSCRIPTS_DIR, `${name}.log`)
     // Read the cwd tmux recorded for the session (the session's actual pane cwd).
     let cwd = HOME
@@ -368,15 +581,50 @@ export class TerminalSession {
     }
     // Re-validate the ADOPTED cwd against the allowlist — do not drive a session
     // whose real cwd is outside the boundary.
-    if (!isCwdAllowedLocal(cwd, allowlist)) {
+    if (!canAdoptTerminalSession(provenance, descriptor.id, expectedOwner, cwd, allowlist)) {
       return undefined
     }
-    return new TerminalSession(name, cwd, logPath)
+    return new TerminalSession(name, cwd, logPath, descriptor)
   }
 
   /** Public: does a ccm-<name> tmux session exist? (name is the bare name.) */
   static async exists(name: string): Promise<boolean> {
     return TerminalSession.tmuxSessionExists(SESSION_PREFIX + name)
+  }
+
+  /** Public: the `@tandem_engine` tag of an existing ccm-<name> session, or
+   *  undefined if the session doesn't exist or was never tagged. Used by the
+   *  router to distinguish "name taken by a DIFFERENT engine" (409) from a
+   *  provenance/cwd adoption failure (403) — reading the tag alone reveals
+   *  nothing the caller didn't already know (it supplied the name). */
+  static async engineTagOf(name: string): Promise<string | undefined> {
+    const target = SESSION_PREFIX + name
+    if (!(await TerminalSession.tmuxSessionExists(target))) return undefined
+    const { engine } = await readProvenanceTags(target)
+    return engine || undefined
+  }
+
+  /** True if THIS session's tmux target is still alive. */
+  async isAlive(): Promise<boolean> {
+    return TerminalSession.tmuxSessionExists(this.tmuxTarget)
+  }
+
+  /** True if a turn is currently running. Marker-based engines check the pane
+   *  once. Markerless engines return false only after the pane has remained
+   *  unchanged across their full stability window; any change returns true
+   *  immediately. This intentionally makes a markerless read/status call wait
+   *  before claiming idle rather than guessing from one short quiet interval. */
+  async isCurrentlyWorking(): Promise<boolean> {
+    let pane = await this.capture()
+    if (this.descriptor.isWorking) return this.descriptor.isWorking(pane)
+    const required = requiredStablePolls(this.descriptor)
+    for (let observation = 1; observation < required; observation += 1) {
+      await sleep(POLL_MS)
+      const next = await this.capture()
+      if (next.trimEnd() !== pane.trimEnd()) return true
+      pane = next
+    }
+    return false
   }
 
   private static async tmuxSessionExists(target: string): Promise<boolean> {
@@ -398,12 +646,25 @@ export class TerminalSession {
   }
 
   private isWorking(pane: string): boolean {
-    return pane.includes(WORKING_MARKER)
+    return this.descriptor.isWorking ? this.descriptor.isWorking(pane) : false
   }
 
-  /** Wait for the TUI to be ready: dismiss the first-run trust prompt if shown,
-   *  then wait until the input box exists and nothing is working. */
+  /**
+   * Wait for the engine to be ready. Marker-based descriptors (claude) dismiss
+   * the first-run trust/bypass dialogs and wait for `isReady`. Markerless
+   * descriptors (codex/shell) optionally submit `warmupPrompt` once, then wait
+   * for the pane to be byte-stable for >= minStableMs (binding — Phase 2
+   * correction B) — never a guessed readiness marker.
+   */
   private async warmup(): Promise<void> {
+    if (this.descriptor.isReady) {
+      await this.warmupMarkerBased(this.descriptor.isReady)
+      return
+    }
+    await this.warmupMarkerless()
+  }
+
+  private async warmupMarkerBased(isReady: (pane: string) => boolean): Promise<void> {
     const deadline = Date.now() + SPAWN_WARMUP_MS
     let trusted = false
     let bypassAccepted = false
@@ -430,8 +691,8 @@ export class TerminalSession {
         await sleep(POLL_MS)
         continue
       }
-      // Ready = the prompt box marker present and not working.
-      if (pane.includes('❯') && !this.isWorking(pane)) {
+      // Ready = the descriptor's readiness marker present and not working.
+      if (isReady(pane) && !this.isWorking(pane)) {
         this._ready = true
         return
       }
@@ -451,6 +712,33 @@ export class TerminalSession {
     this._ready = false
     this._readinessWarning = warning
     process.stderr.write(`[bridge] ${warning}\n`)
+  }
+
+  private async warmupMarkerless(): Promise<void> {
+    if (this.descriptor.warmupPrompt) {
+      await this.injectMultiline(this.descriptor.warmupPrompt)
+      await tmux(['send-keys', '-t', this.tmuxTarget, 'Enter'])
+    }
+    const deadline = Date.now() + SPAWN_WARMUP_MS
+    let state = INITIAL_STABILITY_STATE
+    const required = requiredStablePolls(this.descriptor)
+    while (Date.now() < deadline) {
+      const pane = await this.capture()
+      const step = stepStability(pane, state, this.descriptor, required)
+      state = step.state
+      // Require non-blank content too: an all-empty pane can look "stable"
+      // (unchanged) while genuinely never having rendered anything yet — avoid
+      // false readiness on a pane that simply hasn't started printing.
+      if (step.idle && pane.trim().length > 0) {
+        this._ready = true
+        return
+      }
+      await sleep(POLL_MS)
+    }
+    const finalPane = await this.capture()
+    this._ready = false
+    this._readinessWarning = describeMarkerlessReadiness(finalPane, loadavg()[0], cpus().length, this._name)
+    process.stderr.write(`[bridge] ${this._readinessWarning}\n`)
   }
 
   /**
@@ -504,26 +792,18 @@ export class TerminalSession {
     const softDeadline = Date.now() + SEND_SOFT_CAP_MS
     const hardDeadline = Date.now() + SEND_HARD_CAP_MS
 
-    // Give the spinner a moment to appear so we don't read the pre-spinner
-    // "looks idle" window as completion.
+    // Give the spinner/output a moment to appear so we don't read the
+    // pre-output "looks idle" window as completion.
     await sleep(POLL_MS)
 
-    let stablePolls = 0
-    let lastPane = ''
+    let state = INITIAL_STABILITY_STATE
+    const required = requiredStablePolls(this.descriptor)
     for (;;) {
       const pane = await this.capture()
-      const working = this.isWorking(pane)
-      const trimmed = pane.trimEnd()
+      const step = stepStability(pane, state, this.descriptor, required)
+      state = step.state
 
-      if (!working && trimmed === lastPane) {
-        stablePolls++
-      } else {
-        stablePolls = working ? 0 : 1
-      }
-      lastPane = trimmed
-
-      const idle = !working && stablePolls >= IDLE_STABLE_POLLS
-      if (idle) {
+      if (step.idle) {
         return { report: await this.reportSince(startCursor), cursor: this.cursor(), status: 'done' }
       }
       if (Date.now() >= hardDeadline) {
@@ -540,8 +820,9 @@ export class TerminalSession {
   /**
    * Apply per-turn model/effort overrides to this LIVE session via its in-session
    * slash controls (`/effort <v>`, `/model <v>`), submitted as a preamble BEFORE
-   * the next prompt. Values are validated (throws clearly on unsupported). Returns
-   * the controls applied (e.g. ["effort=high","model=opus"]).
+   * the next prompt. Values are validated (throws clearly on unsupported). Claude
+   * only — callers must not invoke this for another engine. Returns the controls
+   * applied (e.g. ["effort=high","model=opus"]).
    *
    * NOTE (Claude Code behavior): these in-session controls also persist as the
    * saved default for NEW sessions. For strictly session-scoped control with no
@@ -566,8 +847,8 @@ export class TerminalSession {
   /**
    * Submit a single slash control line (e.g. "/effort high") and let the TUI apply
    * it. A slash control is a UI action, not a model turn — it doesn't raise the
-   * "esc to interrupt" marker — so we just inject, Enter, and pause briefly to let
-   * the autocomplete's exact match resolve and the setting take effect.
+   * working marker — so we just inject, Enter, and pause briefly to let the
+   * autocomplete's exact match resolve and the setting take effect.
    */
   private async submitControl(line: string): Promise<void> {
     await this.injectMultiline(line)
@@ -592,8 +873,8 @@ export class TerminalSession {
   async readSince(cursor: number): Promise<ReadResult> {
     const size = this.cursor()
     const text = stripAnsi(await this.readRaw(cursor, size))
-    const pane = await this.capture()
-    return { text, cursor: size, idle: !this.isWorking(pane) }
+    const working = await this.isCurrentlyWorking()
+    return { text, cursor: size, idle: !working }
   }
 
   /** Read raw transcript bytes in [from, to) as UTF-8. */
@@ -631,7 +912,9 @@ export class TerminalSession {
   }
 
   /** Drop blank/duplicate lines, spinner frames, progress lines, the input box,
-   *  the bordered rules, and the status footer. */
+   *  the bordered rules, and the status footer. The Claude-specific patterns
+   *  below are harmless no-ops for codex/shell output, which doesn't contain
+   *  Claude Code's exact spinner glyphs/footer text. */
   private cleanReportLines(lines: string[]): string {
     const out: string[] = []
     for (const line of lines) {
@@ -646,7 +929,7 @@ export class TerminalSession {
       // The empty input prompt / "esc to interrupt" footer / auto-mode footer.
       if (trimmed === '❯' || trimmed.startsWith('❯ ←')) continue
       if (trimmed.includes('auto mode on (shift+tab')) continue
-      if (trimmed.includes(WORKING_MARKER)) continue
+      if (trimmed.includes(CLAUDE_WORKING_MARKER)) continue
       if (out.length && out[out.length - 1] === t) continue
       out.push(t)
     }
@@ -654,7 +937,9 @@ export class TerminalSession {
   }
 
   /** Interrupt a running turn: Escape (Claude Code's "esc to interrupt"), then
-   *  a C-c as a fallback if the TUI is wedged. */
+   *  a C-c as a fallback if the TUI is wedged. Works uniformly for codex/shell
+   *  since Ctrl-C is the standard terminal interrupt signal for any foreground
+   *  process, not a Claude-specific behavior. */
   async interrupt(): Promise<void> {
     try {
       await tmux(['send-keys', '-t', this.tmuxTarget, 'Escape'])

@@ -1,427 +1,409 @@
 #!/usr/bin/env bash
-#
-# tandem one-command setup.
-#
-# Three modes, picked once at the top:
-#   tailscale (default) — your own bridge behind Tailscale Funnel: a PERSISTENT
-#                         public URL (https://<machine>.<tailnet>.ts.net) that
-#                         never changes across restarts, gated by a fresh
-#                         random token. Recommended for web chat (claude.ai).
-#                         Needs the tailscale CLI + a one-time login.
-#   quick               — your own bridge behind your own free Cloudflare quick
-#                         tunnel + the same token gate, for web chat with zero
-#                         accounts. Instant, but the URL changes every run.
-#                         ('web' is accepted as a legacy alias.)
-#   desktop             — a local stdio connector for desktop chat apps
-#                         (Claude Desktop, ChatGPT desktop). No HTTP server,
-#                         no tunnel, no token.
-#
-#   ./setup.sh                            # asks (defaults to tailscale)
-#   TANDEM_SETUP_MODE=quick ./setup.sh    # non-interactive override
-#
+# Tandem setup: Tailscale-first hub, tailnet device, or local stdio.
 set -euo pipefail
+umask 077
 
 cd "$(dirname "$0")"
 ROOT="$(pwd)"
-# Remember an explicit TANDEM_PORT from the caller's env — it must survive
-# sourcing .env below (final precedence: env > .env > 8787).
-PORT_OVERRIDE="${TANDEM_PORT:-}"
-HOST="127.0.0.1"
+STATE_ROOT="${TANDEM_STATE_DIR:-${HOME}/.tandem}"
+PUBLIC_HOST="127.0.0.1"
+PUBLIC_PORT="${TANDEM_PORT:-8787}"
+FLEET_HOST="127.0.0.1"
+FLEET_PORT="${TANDEM_FLEET_PORT:-8788}"
+FLEET_HTTPS_PORT="${TANDEM_FLEET_HTTPS_PORT:-8443}"
+VERIFY_TRIES="${TANDEM_SETUP_VERIFY_TRIES:-15}"
 
 say()  { printf '\033[1;36m%s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m%s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
 
-say "tandem setup"
-echo
+usage() {
+  printf '%s\n' \
+    "Usage:" \
+    "  ./setup.sh hub                 configure the always-on OAuth/Tailscale hub" \
+    "  ./setup.sh invite              create an independent device invitation" \
+    "  ./setup.sh device [bundle]     enroll this Tailscale device once" \
+    "  ./setup.sh desktop             write a local stdio connector" \
+    "" \
+    "Non-interactive setup requires TANDEM_CWD_ALLOWLIST. Claude is enabled by" \
+    "default. Add only deliberate extras with TANDEM_ENABLED_ENGINES."
+}
 
-# ── 0. Pick the mode: tailscale (persistent) / quick (instant) / desktop ────
-MODE="${TANDEM_SETUP_MODE:-}"
-if [ -z "$MODE" ]; then
-  if [ -t 0 ]; then
-    read -r -p "Connect how? [t]ailscale funnel (persistent URL, recommended) / [q]uick tunnel (instant, no account) / [d]esktop app (local stdio)? [t] " MODE
-  fi
-  MODE="${MODE:-t}"
-fi
-case "$MODE" in
-  t|T|tailscale) MODE="tailscale" ;;
-  q|Q|quick)     MODE="quick" ;;
-  w|W|web)       warn "mode 'web' is now called 'quick' (Cloudflare quick tunnel) — using that. For a persistent URL use 'tailscale'."
-                 MODE="quick" ;;
-  d|D|desktop)   MODE="desktop" ;;
-  *) die "unknown mode '$MODE' (use t/tailscale, q/quick, or d/desktop)" ;;
+ROLE="${1:-${TANDEM_SETUP_MODE:-}}"
+case "$ROLE" in
+  ""|h|hub|tailscale|t) ROLE="hub" ;;
+  invite|i) ROLE="invite" ;;
+  device|d) ROLE="device" ;;
+  desktop) ROLE="desktop" ;;
+  quick|q|web|w)
+    die "Cloudflare quick tunnels and URL bearer tokens were removed. Use './setup.sh hub' with Tailscale."
+    ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) usage >&2; die "unknown setup role '${ROLE}'" ;;
 esac
-say "✓ mode: ${MODE}"
 
-# ── 1. Prerequisites ────────────────────────────────────────────────────────
-command -v node >/dev/null 2>&1 || die \
-  "node is not installed. Install Node 22.6+ from https://nodejs.org (or: brew install node)."
+say "tandem setup: ${ROLE}"
 
-NODE_MAJOR="$(node -p 'process.versions.node.split(".").map(Number)[0]')"
-NODE_MINOR="$(node -p 'process.versions.node.split(".").map(Number)[1]')"
-if [ "$NODE_MAJOR" -lt 22 ] || { [ "$NODE_MAJOR" -eq 22 ] && [ "$NODE_MINOR" -lt 6 ]; }; then
-  die "Node $(node -v) is too old. tandem needs >= 22.6 (it runs TypeScript via native type-stripping)."
-fi
+command -v node >/dev/null 2>&1 || die "Node 22.6 or newer is required."
+NODE_OK="$(node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.stdout.write(a>22||(a===22&&b>=6)?"yes":"no")')"
+[ "$NODE_OK" = "yes" ] || die "Node $(node -v) is too old. Tandem requires Node 22.6 or newer."
 
-# cloudflared is only needed for the quick (Cloudflare tunnel) path.
-if [ "$MODE" = "quick" ] && ! command -v cloudflared >/dev/null 2>&1; then
-  die "cloudflared is not installed. Install it, then re-run ./setup.sh
-       macOS:  brew install cloudflared
-       other:  https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
-fi
+validate_port() {
+  case "$2" in ''|*[!0-9]*) die "$1 must be an integer from 1 to 65535." ;; esac
+  [ "$2" -ge 1 ] && [ "$2" -le 65535 ] || die "$1 must be an integer from 1 to 65535."
+}
 
-# The tailscale CLI is only needed for the tailscale (Funnel) path.
-# TANDEM_TS_APP_BIN exists so tests can point the macOS app fallback elsewhere.
-TS_BIN=""
-TS_APP_BIN="${TANDEM_TS_APP_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
-if [ "$MODE" = "tailscale" ]; then
-  if command -v tailscale >/dev/null 2>&1; then
-    TS_BIN="tailscale"
-  elif [ -x "$TS_APP_BIN" ]; then
-    # macOS standalone app: ships the CLI inside the bundle, not on PATH.
-    TS_BIN="$TS_APP_BIN"
-  else
-    die "tailscale is not installed (or not on PATH). Install it, then re-run ./setup.sh
-       macOS:  brew install --cask tailscale-app   (the STANDALONE app)
-               NOTE: the sandboxed Mac App Store version of Tailscale cannot run
-               Funnel — if you installed from the App Store, replace it with the
-               standalone app (or the open-source CLI: brew install tailscale).
-       linux:  curl -fsSL https://tailscale.com/install.sh | sh"
+secure_directory() {
+  mkdir -p "$1"
+  [ ! -L "$1" ] || die "Protected state directories may not be symbolic links."
+  [ -d "$1" ] && [ -O "$1" ] || die "Protected state directory ownership is unsafe."
+  chmod 700 "$1"
+}
+
+prepare_state_root() {
+  case "$STATE_ROOT" in /*) ;; *) die "TANDEM_STATE_DIR must be an absolute path." ;; esac
+  STATE_ROOT="$(TANDEM_RESOLVE_STATE="$STATE_ROOT" node -e 'process.stdout.write(require("node:path").resolve(process.env.TANDEM_RESOLVE_STATE))')"
+  [ "$STATE_ROOT" != "/" ] || die "TANDEM_STATE_DIR may not be a filesystem root."
+  case "$STATE_ROOT" in "$ROOT"|"$ROOT"/*) die "TANDEM_STATE_DIR must stay outside the repository." ;; esac
+  secure_directory "$STATE_ROOT"
+}
+
+validate_setup_values() {
+  [ -n "${TANDEM_CWD_ALLOWLIST:-}" ] || {
+    if [ -t 0 ]; then
+      read -r -p "Exact project roots this device may start sessions in (colon-separated): " TANDEM_CWD_ALLOWLIST
+      export TANDEM_CWD_ALLOWLIST
+    fi
+  }
+  [ -n "${TANDEM_CWD_ALLOWLIST:-}" ] || die "TANDEM_CWD_ALLOWLIST is required and may not be empty."
+  TANDEM_VALIDATE_ALLOWLIST="$TANDEM_CWD_ALLOWLIST" node -e '
+    const path = require("node:path"); const fs = require("node:fs");
+    const roots = process.env.TANDEM_VALIDATE_ALLOWLIST.split(":");
+    if (!roots.length || roots.some((root) => !path.isAbsolute(root) || path.resolve(root) === path.parse(path.resolve(root)).root || !fs.statSync(root).isDirectory())) process.exit(1);
+  ' || die "Every allowlist entry must be an existing absolute directory, and filesystem roots are refused."
+
+  case "${TANDEM_ENABLED_ENGINES:-}" in
+    *$'\n'*|*$'\r'*|*' '*|*[!a-z,:_-]*) die "TANDEM_ENABLED_ENGINES contains invalid characters." ;;
+  esac
+  TANDEM_VALIDATE_ENGINES="${TANDEM_ENABLED_ENGINES:-}" node --experimental-strip-types --input-type=module -e '
+    import { buildEnabledEngines } from "./bridge/engine-registry.ts";
+    try { buildEnabledEngines(process.env.TANDEM_VALIDATE_ENGINES); } catch { process.exit(1); }
+  ' || die "TANDEM_ENABLED_ENGINES may contain only codex, shell, or hermes. Claude is already enabled."
+  if printf '%s' ",${TANDEM_ENABLED_ENGINES:-}," | grep -Eq '[:,]shell[:,]'; then
+    warn "shell grants callers OS-user command execution from an admitted cwd. It is not a sandbox."
   fi
+}
 
-  # Logged in + daemon up? Funnel needs both. Login is a ONE-TIME browser step
-  # we never automate — detect, instruct, exit.
-  TS_STATUS_OUT="$("$TS_BIN" status 2>&1)" && TS_STATUS_RC=0 || TS_STATUS_RC=$?
-  if [ "$TS_STATUS_RC" -ne 0 ]; then
-    case "$TS_STATUS_OUT" in
-      *"Logged out"*|*NeedsLogin*|*"not logged in"*)
-        die "Tailscale is installed but not logged in.
-       Run:  tailscale up        (macOS standalone app: open Tailscale.app → Log in)
-       Finish the one-time browser login, then re-run ./setup.sh." ;;
-      *"Tailscale is stopped"*|*stopped*)
-        die "Tailscale is stopped. Run:  tailscale up   — then re-run ./setup.sh." ;;
-      *"failed to connect"*|*"is Tailscale running"*|*"no running tailscaled"*)
-        die "The Tailscale daemon isn't running.
-       macOS standalone app:        open Tailscale.app
-       macOS (brew open-source):    sudo brew services start tailscale
-       linux:                       sudo systemctl start tailscaled
-       Then re-run ./setup.sh." ;;
-      *)
-        printf '%s\n' "$TS_STATUS_OUT" >&2
-        die "tailscale status failed (output above). Fix it, then re-run ./setup.sh." ;;
+generate_secret() {
+  if command -v openssl >/dev/null 2>&1; then openssl rand -hex 32
+  else node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))'
+  fi
+}
+
+config_digest() {
+  TANDEM_HASH_FILE="$1" node -e '
+    const { createHash } = require("node:crypto");
+    const { readFileSync } = require("node:fs");
+    process.stdout.write(createHash("sha256").update(readFileSync(process.env.TANDEM_HASH_FILE)).digest("hex"));
+  '
+}
+
+write_config_from_env() {
+  TANDEM_WRITE_CONFIG_FILE="$1" node --experimental-strip-types --input-type=module -e '
+    import { writeProtectedRuntimeConfig } from "./src/runtime-config.ts";
+    const values = {};
+    for (const [key, value] of Object.entries(process.env)) if (key.startsWith("TANDEM_CONFIG_VALUE_")) values[key.slice(20)] = value;
+    await writeProtectedRuntimeConfig(process.env.TANDEM_WRITE_CONFIG_FILE, values);
+  '
+}
+
+install_dependencies() {
+  say "Installing dependencies..."
+  npm install --silent
+}
+
+find_tailscale() {
+  local app_bin="${TANDEM_TS_APP_BIN:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+  if command -v tailscale >/dev/null 2>&1; then TS_BIN="tailscale"
+  elif [ -x "$app_bin" ]; then TS_BIN="$app_bin"
+  else
+    die "Tailscale is required. Install the standalone app or CLI, run 'tailscale up', then retry."
+  fi
+  local status_out status_rc
+  status_out="$("$TS_BIN" status 2>&1)" && status_rc=0 || status_rc=$?
+  if [ "$status_rc" -ne 0 ]; then
+    case "$status_out" in
+      *Logged*out*|*NeedsLogin*|*not*logged*in*) die "Tailscale is not logged in. Run 'tailscale up', then retry." ;;
+      *stopped*|*failed*to*connect*|*Tailscale*running*) die "The Tailscale daemon is not running. Start it, run 'tailscale up', then retry." ;;
+      *) die "Tailscale status failed. Fix the local Tailscale installation, then retry." ;;
     esac
   fi
-fi
-
-if ! command -v tmux >/dev/null 2>&1; then
-  die "tmux is not installed. The bridge drives Claude Code inside tmux.
-       macOS:  brew install tmux
-       linux:  apt install tmux  (or your package manager)"
-fi
-
-if ! command -v claude >/dev/null 2>&1; then
-  warn "the 'claude' CLI (Claude Code) was not found on PATH."
-  warn "Install it from https://claude.com/claude-code — the bridge spawns 'claude' sessions."
-fi
-
-case "$MODE" in
-  tailscale) say "✓ node $(node -v), tailscale, tmux present" ;;
-  quick)     say "✓ node $(node -v), cloudflared, tmux present" ;;
-  *)         say "✓ node $(node -v), tmux present" ;;
-esac
-
-# ── 2. Dependencies ─────────────────────────────────────────────────────────
-say "Installing dependencies (npm install)…"
-npm install --silent
-
-# ── 2b. Install the tandem skills + build the Claude.ai skill bundle ─────────
-# Idempotent: copies this repo's skills/tandem-* folders into Claude Code's
-# skills dir, and rebuilds tandem-orchestration.zip (the bundle you upload to
-# Claude.ai as a chat-side skill). Safe to re-run — copies overwrite, the zip
-# is regenerated from scratch.
-SKILLS_SRC="${ROOT}/skills"
-SKILLS_DEST="${HOME}/.claude/skills"
-SKILL_COUNT=0
-if [ -d "$SKILLS_SRC" ]; then
-  mkdir -p "$SKILLS_DEST"
-  for d in "$SKILLS_SRC"/tandem-*/; do
-    [ -d "$d" ] || continue
-    name="$(basename "$d")"
-    rm -rf "${SKILLS_DEST:?}/${name}"
-    cp -R "$d" "${SKILLS_DEST}/${name}"
-    SKILL_COUNT=$((SKILL_COUNT + 1))
-  done
-
-  # Build tandem-orchestration.zip in the repo root (contents zipped so the
-  # archive holds the tandem-orchestration/ folder at its top level).
-  if [ -d "${SKILLS_SRC}/tandem-orchestration" ] && command -v zip >/dev/null 2>&1; then
-    rm -f "${ROOT}/tandem-orchestration.zip"
-    ( cd "$SKILLS_SRC" && zip -qr "${ROOT}/tandem-orchestration.zip" tandem-orchestration )
-  fi
-  say "Installed ${SKILL_COUNT} tandem skills into Claude Code; built tandem-orchestration.zip for Claude.ai."
-fi
-
-# ── 3. .env (token is TUNNEL-ONLY: the stdio path is local and needs none) ──
-[ -f .env ] || cp .env.example .env
-
-if [ "$MODE" != "desktop" ]; then
-  gen_token() {
-    if command -v openssl >/dev/null 2>&1; then openssl rand -hex 32
-    else node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))'
-    fi
-  }
-
-  # Read current value (if any) from .env. Reusing an existing token is what
-  # keeps the tailscale MCP URL identical across re-runs of this script.
-  CUR_TOKEN="$(grep -E '^TANDEM_TOKEN=' .env | head -1 | cut -d= -f2- || true)"
-  if [ -z "$CUR_TOKEN" ]; then
-    TOKEN="$(gen_token)"
-    # portable in-place edit (macOS + GNU sed)
-    if sed --version >/dev/null 2>&1; then
-      sed -i "s|^TANDEM_TOKEN=.*|TANDEM_TOKEN=${TOKEN}|" .env
-    else
-      sed -i '' "s|^TANDEM_TOKEN=.*|TANDEM_TOKEN=${TOKEN}|" .env
-    fi
-    say "✓ generated a fresh TANDEM_TOKEN into .env"
-  else
-    TOKEN="$CUR_TOKEN"
-    say "✓ using existing TANDEM_TOKEN from .env"
-  fi
-fi
-
-# Ensure an allowlist exists; default to ~/code so first run is usable.
-CUR_ALLOW="$(grep -E '^TANDEM_CWD_ALLOWLIST=' .env | head -1 | cut -d= -f2- || true)"
-if [ -z "$CUR_ALLOW" ]; then
-  DEFAULT_ALLOW="${HOME}/code"
-  mkdir -p "$DEFAULT_ALLOW"
-  if sed --version >/dev/null 2>&1; then
-    sed -i "s|^TANDEM_CWD_ALLOWLIST=.*|TANDEM_CWD_ALLOWLIST=${DEFAULT_ALLOW}|" .env
-  else
-    sed -i '' "s|^TANDEM_CWD_ALLOWLIST=.*|TANDEM_CWD_ALLOWLIST=${DEFAULT_ALLOW}|" .env
-  fi
-  warn "TANDEM_CWD_ALLOWLIST was empty — defaulted to ${DEFAULT_ALLOW}."
-  warn "Edit .env to add/restrict the folders the bridge may operate in."
-fi
-
-# Load .env into this shell for launching the processes.
-set -a; . ./.env; set +a
-
-# Resolve the port AFTER .env so the precedence is: explicit env > .env > 8787.
-# Export the winner so the bridge binds exactly the port we report and check.
-PORT="${PORT_OVERRIDE:-${TANDEM_PORT:-8787}}"
-export TANDEM_PORT="${PORT}"
-
-# ── DESKTOP MODE: print the local stdio connector and stop ──────────────────
-# No bridge process, no tunnel, no token: the desktop app spawns the server
-# itself over stdio (same trust as your own terminal; the cwd allowlist still
-# applies — the server reads .env on its own via process.loadEnvFile).
-if [ "$MODE" = "desktop" ]; then
-  mkdir -p .tandem
-  cat > .tandem/desktop-connector.json <<JSON
-{
-  "mcpServers": {
-    "tandem": {
-      "command": "node",
-      "args": ["--experimental-strip-types", "${ROOT}/src/stdio-server.ts"]
-    }
-  }
 }
-JSON
 
-  say "Smoke-testing the stdio server (initialize + tools/list)…"
-  SMOKE_OUT="$(printf '%s\n%s\n%s\n' \
-    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"setup-smoke","version":"0"}}}' \
-    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-    | node --experimental-strip-types src/stdio-server.ts 2>/dev/null || true)"
-  for TOOL in open_session list_sessions send_to_session interrupt_session close_session relay; do
-    printf '%s' "$SMOKE_OUT" | grep -q "\"name\":\"${TOOL}\"" || \
-      die "stdio smoke test failed: tool '${TOOL}' missing from tools/list. Run 'npm run start:stdio' to debug."
-  done
-  say "✓ stdio server answers with all 6 tools"
+tailscale_hostname() {
+  "$TS_BIN" status --json 2>/dev/null | node -e '
+    const fs=require("node:fs");
+    try { const j=JSON.parse(fs.readFileSync(0,"utf8")); const n=String(j.Self?.DNSName??"").replace(/\.$/,""); if (!n.endsWith(".ts.net")) process.exit(1); process.stdout.write(n); } catch { process.exit(1); }
+  '
+}
 
-  echo
-  say "──────────────────────────────────────────────────────────────"
-  say " tandem is ready (desktop / local stdio — no tunnel, no token)"
-  say "──────────────────────────────────────────────────────────────"
-  echo
-  echo " Add this to your desktop app's MCP config (also saved to"
-  echo " .tandem/desktop-connector.json):"
-  echo
-  cat .tandem/desktop-connector.json
-  echo
-  echo " Claude Desktop:  merge the \"tandem\" entry under \"mcpServers\" in"
-  echo "   ~/Library/Application Support/Claude/claude_desktop_config.json"
-  echo "   then restart the app."
-  echo " ChatGPT desktop: add a local MCP server with the same command + args."
-  echo
-  echo " Nothing keeps running — the app spawns the server on demand."
-  echo " For web chat (claude.ai in a browser) re-run with:"
-  echo "   TANDEM_SETUP_MODE=tailscale ./setup.sh   (persistent URL, recommended)"
-  echo "   TANDEM_SETUP_MODE=quick ./setup.sh       (instant, URL changes per run)"
-  say "──────────────────────────────────────────────────────────────"
-  exit 0
-fi
+pid_is_running() {
+  [ -f "$1" ] || return 1
+  local pid
+  pid="$(sed -n '1p' "$1" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null
+}
 
-# ── 4. Start the bridge (shared by both tunnel modes) ───────────────────────
-mkdir -p .tandem
-BRIDGE_PID=""
-if command -v curl >/dev/null 2>&1 \
-   && curl -fsS --max-time 2 "http://${HOST}:${PORT}/health" >/dev/null 2>&1; then
-  # A bridge already answers on this port — reuse it instead of double-binding.
-  BRIDGE_PID="$(cat .tandem/bridge.pid 2>/dev/null || echo '?')"
-  say "✓ bridge already running on http://${HOST}:${PORT} (PID ${BRIDGE_PID}) — reusing it"
-  warn "  changed .env since it started? kill it (kill \$(cat .tandem/bridge.pid)) and re-run."
-else
-  say "Starting the bridge on http://${HOST}:${PORT}…"
-  node --experimental-strip-types src/server.ts >.tandem/bridge.log 2>&1 &
-  BRIDGE_PID=$!
-  echo "$BRIDGE_PID" > .tandem/bridge.pid
-  sleep 2
-  if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
-    cat .tandem/bridge.log >&2
-    die "bridge failed to start (see output above)."
-  fi
-fi
-
-# ── 5a. QUICK MODE: your own Cloudflare quick tunnel ────────────────────────
-if [ "$MODE" = "quick" ]; then
-  say "Opening your own free Cloudflare quick tunnel…"
-  : > .tandem/tunnel.log
-  cloudflared tunnel --url "http://${HOST}:${PORT}" >.tandem/tunnel.log 2>&1 &
-  TUNNEL_PID=$!
-  echo "$TUNNEL_PID" > .tandem/tunnel.pid
-
-  # Wait (up to ~30s) for the trycloudflare URL to appear.
-  TUNNEL_URL=""
+wait_for_local_health() {
+  local port="$1"
   for _ in $(seq 1 30); do
-    TUNNEL_URL="$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' .tandem/tunnel.log | head -1 || true)"
-    [ -n "$TUNNEL_URL" ] && break
+    if curl -fsS --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then return 0; fi
     sleep 1
   done
-  [ -n "$TUNNEL_URL" ] || { cat .tandem/tunnel.log >&2; die "could not obtain a quick tunnel URL."; }
-  echo "$TUNNEL_URL" > .tandem/tunnel.url
-
-  MCP_URL="${TUNNEL_URL}/${TOKEN}/mcp"
-  cat > .tandem/connector.json <<JSON
-{
-  "name": "tandem",
-  "url": "${MCP_URL}"
+  return 1
 }
-JSON
 
-  echo
-  say "──────────────────────────────────────────────────────────────"
-  say " tandem is live (quick tunnel)"
-  say "──────────────────────────────────────────────────────────────"
-  echo " Tunnel URL : ${TUNNEL_URL}"
-  echo " Token      : ${TOKEN}"
-  echo " MCP URL    : ${MCP_URL}"
-  echo
-  echo " Paste this into Claude.ai → Settings → Connectors → Add custom connector:"
-  echo
-  cat .tandem/connector.json
-  echo
-  warn " This URL changes every restart. For a PERMANENT URL, re-run with:"
-  warn "   TANDEM_SETUP_MODE=tailscale ./setup.sh"
-  warn " Keep this terminal open. Bridge PID ${BRIDGE_PID}, tunnel PID ${TUNNEL_PID}."
-  warn " To stop: kill ${BRIDGE_PID} ${TUNNEL_PID}"
-  echo " Logs: .tandem/bridge.log , .tandem/tunnel.log"
-  say "──────────────────────────────────────────────────────────────"
-  exit 0
-fi
-
-# ── 5b. TAILSCALE MODE: persistent Funnel URL ───────────────────────────────
-# `funnel --bg` writes the forward (public 443 → local PORT) into tailscaled's
-# persisted config and returns: it survives this script, the terminal, and
-# reboots. The hostname is the machine's stable MagicDNS name, so the MCP URL
-# never changes as long as the machine name, tailnet, and token stay the same.
-say "Enabling Tailscale Funnel (public 443 → local ${PORT})…"
-: > .tandem/funnel.log
-if ! "$TS_BIN" funnel --bg "${PORT}" >.tandem/funnel.log 2>&1; then
-  cat .tandem/funnel.log >&2
-  FUNNEL_OUT="$(cat .tandem/funnel.log 2>/dev/null || true)"
-  echo
-  # Order matters: Tailscale's HTTPS-disabled error also starts with
-  # "Funnel not available", so match the HTTPS wording first.
-  case "$FUNNEL_OUT" in
-    *"HTTPS must be enabled"*|*"enable HTTPS"*|*"tailscale.com/s/https"*)
-      die "HTTPS certificates are disabled for your tailnet (Funnel needs them).
-     Enable them (one toggle): https://login.tailscale.com/admin/dns → 'Enable HTTPS'
-     Then re-run ./setup.sh." ;;
-    *"node attribute"*|*"Funnel not available"*|*"not allowed"*|*"tailscale.com/s/no-funnel"*)
-      die "Your tailnet policy doesn't permit Funnel on this node yet.
-     Tailscale usually prints an enable link above — open it (one click), or see
-     https://tailscale.com/kb/1223/funnel for the 'funnel' node attribute.
-     Then re-run ./setup.sh." ;;
-    *"Access denied"*|*operator*)
-      die "Funnel needs operator rights for your user.
-     Run once:  sudo tailscale up --operator=\$USER   (or re-run setup with sudo)
-     Then re-run ./setup.sh." ;;
-    *)
-      die "tailscale funnel failed (output above).
-     Docs: https://tailscale.com/kb/1223/funnel" ;;
-  esac
-fi
-
-# Read back the stable ts.net hostname: primary = the funnel output itself;
-# fallback = the machine's MagicDNS name from `status --json` (no jq — node is
-# already a prerequisite).
-TS_URL="$(grep -Eo 'https://[a-zA-Z0-9.-]+\.ts\.net' .tandem/funnel.log | head -1 || true)"
-if [ -n "$TS_URL" ]; then
-  TS_HOST="${TS_URL#https://}"
-else
-  TS_HOST="$("$TS_BIN" status --json 2>/dev/null \
-    | node -e 'const j=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(((j.Self&&j.Self.DNSName)||"").replace(/\.$/,""))' \
-    || true)"
-fi
-[ -n "$TS_HOST" ] || { cat .tandem/funnel.log >&2; die "could not determine your ts.net hostname (funnel output above)."; }
-echo "https://${TS_HOST}" > .tandem/funnel.url
-
-MCP_URL="https://${TS_HOST}/${TOKEN}/mcp"
-cat > .tandem/connector.json <<JSON
-{
-  "name": "tandem",
-  "url": "${MCP_URL}"
+setup_desktop() {
+  validate_setup_values
+  install_dependencies
+  local desktop_dir="${STATE_ROOT}/desktop"
+  local connector="${desktop_dir}/connector.json"
+  prepare_state_root
+  secure_directory "$desktop_dir"
+  TANDEM_CONFIG_VALUE_TANDEM_CWD_ALLOWLIST="$TANDEM_CWD_ALLOWLIST" \
+  TANDEM_CONFIG_VALUE_TANDEM_ENABLED_ENGINES="${TANDEM_ENABLED_ENGINES:-}" \
+    write_config_from_env "${desktop_dir}/config.json"
+  TANDEM_CONNECTOR_FILE="$connector" TANDEM_STDIO_PATH="${ROOT}/src/stdio-server.ts" TANDEM_CONFIG_FILE="${desktop_dir}/config.json" node --experimental-strip-types --input-type=module -e '
+    import { writeProtectedFile } from "./src/runtime-config.ts";
+    const connector={mcpServers:{tandem:{command:"node",args:["--experimental-strip-types",process.env.TANDEM_STDIO_PATH],env:{TANDEM_CONFIG_FILE:process.env.TANDEM_CONFIG_FILE}}}};
+    await writeProtectedFile(process.env.TANDEM_CONNECTOR_FILE, JSON.stringify(connector,null,2)+"\n");
+  '
+  say "Desktop connector written to ${connector}"
+  say "No listener or tunnel was started. Your MCP client spawns Tandem over stdio."
 }
-JSON
 
-# Verify end-to-end (DNS + cert + funnel + bridge). First activation can take
-# ~30s while the TLS cert is minted, so retry; a miss is a warn, not a fail.
-FUNNEL_VERIFY_TRIES="${TANDEM_FUNNEL_VERIFY_TRIES:-15}"
-HEALTH_OK=""
-if command -v curl >/dev/null 2>&1; then
-  say "Verifying https://${TS_HOST}/health (first run can take ~30s while the TLS cert is minted)…"
-  for _ in $(seq 1 "$FUNNEL_VERIFY_TRIES"); do
-    if curl -fsS --max-time 5 "https://${TS_HOST}/health" >/dev/null 2>&1; then HEALTH_OK=1; break; fi
-    sleep 3
+setup_hub() {
+  validate_port TANDEM_PORT "$PUBLIC_PORT"
+  validate_port TANDEM_FLEET_PORT "$FLEET_PORT"
+  validate_port TANDEM_FLEET_HTTPS_PORT "$FLEET_HTTPS_PORT"
+  [ "$FLEET_HTTPS_PORT" != "443" ] || die "TANDEM_FLEET_HTTPS_PORT must differ from public Funnel port 443."
+  validate_setup_values
+  find_tailscale
+  command -v tmux >/dev/null 2>&1 || die "tmux is required to drive terminal engines."
+  command -v curl >/dev/null 2>&1 || die "curl is required for setup verification."
+  install_dependencies
+  prepare_state_root
+
+  local hub_dir="${STATE_ROOT}/hub"
+  local config_file="${hub_dir}/config.json"
+  local password_file="${hub_dir}/owner-password"
+  local pid_file="${hub_dir}/hub.pid"
+  local log_file="${hub_dir}/hub.log"
+  local marker_file="${hub_dir}/provisioned"
+  local active_config_hash_file="${hub_dir}/active-config.sha256"
+  local enrollment_file="${hub_dir}/device-enrollment.json"
+  local enrollment_state="${STATE_ROOT}/fleet/enrollments"
+  local new_install=0 started=0 funnel_changed=0 serve_changed=0
+  [ -f "$marker_file" ] || new_install=1
+  secure_directory "$hub_dir"
+  secure_directory "${STATE_ROOT}/fleet"
+  secure_directory "$enrollment_state"
+
+  local ts_host public_url private_url fleet_token owner_password
+  ts_host="$(tailscale_hostname)" || die "Could not determine this device's stable Tailscale DNS name."
+  public_url="https://${ts_host}/mcp"
+  private_url="wss://${ts_host}:${FLEET_HTTPS_PORT}/"
+
+  if [ -f "$config_file" ]; then
+    fleet_token="$(TANDEM_READ_CONFIG="$config_file" node --experimental-strip-types --input-type=module -e 'import {readProtectedRuntimeConfig} from "./src/runtime-config.ts"; const c=await readProtectedRuntimeConfig(process.env.TANDEM_READ_CONFIG); process.stdout.write(c.TANDEM_FLEET_TOKEN??"")')"
+  else
+    fleet_token="$(generate_secret)"
+  fi
+  [ "${#fleet_token}" -ge 16 ] || die "Existing protected hub configuration is invalid."
+  if [ ! -f "$password_file" ]; then
+    owner_password="$(generate_secret)"
+    TANDEM_SECRET_FILE="$password_file" TANDEM_SECRET_VALUE="$owner_password" node --experimental-strip-types --input-type=module -e 'import {writeProtectedFile} from "./src/runtime-config.ts"; await writeProtectedFile(process.env.TANDEM_SECRET_FILE, process.env.TANDEM_SECRET_VALUE+"\n")'
+    unset owner_password
+  fi
+
+  TANDEM_CONFIG_VALUE_TANDEM_PUBLIC_URL="$public_url" \
+  TANDEM_CONFIG_VALUE_TANDEM_HOST="$PUBLIC_HOST" \
+  TANDEM_CONFIG_VALUE_TANDEM_PORT="$PUBLIC_PORT" \
+  TANDEM_CONFIG_VALUE_TANDEM_CWD_ALLOWLIST="$TANDEM_CWD_ALLOWLIST" \
+  TANDEM_CONFIG_VALUE_TANDEM_ENABLED_ENGINES="${TANDEM_ENABLED_ENGINES:-}" \
+  TANDEM_CONFIG_VALUE_TANDEM_FLEET_TOKEN="$fleet_token" \
+  TANDEM_CONFIG_VALUE_TANDEM_FLEET_HOST="$FLEET_HOST" \
+  TANDEM_CONFIG_VALUE_TANDEM_FLEET_PORT="$FLEET_PORT" \
+  TANDEM_CONFIG_VALUE_TANDEM_PRIVATE_URL="$private_url" \
+  TANDEM_CONFIG_VALUE_TANDEM_OWNER_PASSWORD_FILE="$password_file" \
+  TANDEM_CONFIG_VALUE_TANDEM_OAUTH_STATE_DIR="${STATE_ROOT}/oauth" \
+  TANDEM_CONFIG_VALUE_TANDEM_ENROLLMENT_STATE_DIR="$enrollment_state" \
+    write_config_from_env "$config_file"
+  unset fleet_token
+  local desired_config_hash
+  desired_config_hash="$(config_digest "$config_file")"
+
+  rollback() {
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+      warn "Setup failed. Rolling back changes from this attempt."
+      if [ "$new_install" -eq 1 ]; then
+        [ "$serve_changed" -eq 0 ] || "$TS_BIN" serve --bg --https="$FLEET_HTTPS_PORT" off >/dev/null 2>&1 || true
+        [ "$funnel_changed" -eq 0 ] || "$TS_BIN" funnel --bg --https=443 off >/dev/null 2>&1 || true
+        rm -f "$enrollment_file"
+      fi
+      if [ "$started" -eq 1 ] && pid_is_running "$pid_file"; then kill "$(sed -n '1p' "$pid_file")" 2>/dev/null || true; fi
+      [ "$started" -eq 0 ] || rm -f "$pid_file"
+    fi
+    trap - EXIT
+    exit "$rc"
+  }
+  trap rollback EXIT
+
+  local active_config_hash=""
+  if [ -f "$active_config_hash_file" ] && [ ! -L "$active_config_hash_file" ] && [ -O "$active_config_hash_file" ]; then
+    active_config_hash="$(sed -n '1p' "$active_config_hash_file" 2>/dev/null || true)"
+  fi
+  if pid_is_running "$pid_file" && [ "$active_config_hash" = "$desired_config_hash" ] && curl -fsS --max-time 2 "http://127.0.0.1:${PUBLIC_PORT}/health" >/dev/null 2>&1; then
+    say "Hub process is already healthy. Reusing it."
+  else
+    if pid_is_running "$pid_file"; then
+      say "Hub configuration changed. Restarting the recorded Tandem process."
+      kill "$(sed -n '1p' "$pid_file")" 2>/dev/null || true
+      for _ in $(seq 1 20); do pid_is_running "$pid_file" || break; sleep 0.1; done
+    fi
+    rm -f "$pid_file"
+    TANDEM_CONFIG_FILE="$config_file" node --experimental-strip-types src/server.ts >"$log_file" 2>&1 &
+    local hub_pid=$!
+    printf '%s\n' "$hub_pid" > "$pid_file"
+    chmod 600 "$pid_file" "$log_file"
+    started=1
+    wait_for_local_health "$PUBLIC_PORT" || die "The hub did not become healthy. Review the protected hub log."
+    TANDEM_SECRET_FILE="$active_config_hash_file" TANDEM_SECRET_VALUE="$desired_config_hash" node --experimental-strip-types --input-type=module -e 'import {writeProtectedFile} from "./src/runtime-config.ts"; await writeProtectedFile(process.env.TANDEM_SECRET_FILE, process.env.TANDEM_SECRET_VALUE+"\n")'
+  fi
+
+  say "Publishing only the OAuth/MCP port through Tailscale Funnel..."
+  "$TS_BIN" funnel --bg "$PUBLIC_PORT" >/dev/null 2>&1 || die "Tailscale Funnel could not publish the public MCP listener."
+  funnel_changed=1
+  say "Publishing only the fleet port through tailnet-only Tailscale Serve..."
+  "$TS_BIN" serve --bg --https="$FLEET_HTTPS_PORT" "http://127.0.0.1:${FLEET_PORT}" >/dev/null 2>&1 || die "Tailscale Serve could not publish the private fleet listener."
+  serve_changed=1
+
+  local public_ok=0 private_ok=0
+  local public_verify_origin="https://${ts_host}"
+  local private_verify_ws="$private_url"
+  local private_verify_health="https://${ts_host}:${FLEET_HTTPS_PORT}/health"
+  if [ "${NODE_ENV:-}" = "test" ] && [ "${TANDEM_SETUP_TEST_LOOPBACK:-0}" = "1" ]; then
+    public_verify_origin="http://127.0.0.1:${PUBLIC_PORT}"
+    private_verify_ws="ws://127.0.0.1:${FLEET_PORT}/"
+    private_verify_health="http://127.0.0.1:${FLEET_PORT}/health"
+  fi
+  for _ in $(seq 1 "$VERIFY_TRIES"); do
+    if curl -fsS --max-time 5 "${public_verify_origin}/health" >/dev/null 2>&1 && \
+       curl -fsS --max-time 5 "${public_verify_origin}/.well-known/oauth-authorization-server" | grep -q 'authorization_endpoint'; then public_ok=1; break; fi
+    sleep 2
   done
-fi
-if [ -n "$HEALTH_OK" ]; then
-  say "✓ funnel is live: https://${TS_HOST}/health answers"
-else
-  warn "Funnel is configured but not answering yet — certs can take a minute on"
-  warn "first use. Check later with: curl https://${TS_HOST}/health"
-fi
+  [ "$public_ok" -eq 1 ] || die "Public Funnel health or OAuth metadata verification failed."
 
-# ── 6. Report ───────────────────────────────────────────────────────────────
-echo
-say "──────────────────────────────────────────────────────────────"
-say " tandem is live — persistent URL (Tailscale Funnel)"
-say "──────────────────────────────────────────────────────────────"
-echo " Funnel URL : https://${TS_HOST}"
-echo " Token      : ${TOKEN}"
-echo " MCP URL    : ${MCP_URL}"
-echo
-echo " Paste this into Claude.ai → Settings → Connectors → Add custom connector:"
-echo
-cat .tandem/connector.json
-echo
-echo " This URL is PERSISTENT: same machine name + same token = same URL after"
-echo " every restart. Re-running ./setup.sh just re-attaches to it."
-echo
-warn " The funnel itself is daemon-owned (it survives reboots); only the bridge"
-warn " runs from this setup. Bridge PID ${BRIDGE_PID}."
-warn " Stop sharing:  tailscale funnel reset    (and: kill \$(cat .tandem/bridge.pid))"
-echo " Logs: .tandem/bridge.log , .tandem/funnel.log"
-say "──────────────────────────────────────────────────────────────"
+  TANDEM_VERIFY_FLEET_URL="$private_verify_ws" node --experimental-strip-types --input-type=module -e '
+    import { WebSocket } from "ws";
+    const result = await new Promise((resolve) => { const ws=new WebSocket(process.env.TANDEM_VERIFY_FLEET_URL); const done=(ok)=>{ws.terminate();resolve(ok)}; ws.once("unexpected-response",(_r,res)=>done(res.statusCode===401)); ws.once("open",()=>done(false)); ws.once("error",()=>done(false)); setTimeout(()=>done(false),5000); });
+    if (!result) process.exit(1);
+  ' && private_ok=1
+  [ "$private_ok" -eq 1 ] || die "Private Serve accepted an unauthenticated WebSocket or could not be verified."
+  curl -fsS --max-time 5 "$private_verify_health" | grep -q '"localDevice":true' \
+    || die "Private Serve could not verify the hub's local device registration."
+
+  TANDEM_CONFIG_FILE="$config_file" node --experimental-strip-types src/enrollment-cli.ts create "$enrollment_file" >/dev/null
+  TANDEM_CONNECTOR_FILE="${hub_dir}/connector.json" TANDEM_CONNECTOR_URL="$public_url" node --experimental-strip-types --input-type=module -e '
+    import {writeProtectedFile} from "./src/runtime-config.ts";
+    await writeProtectedFile(process.env.TANDEM_CONNECTOR_FILE, JSON.stringify({name:"tandem",url:process.env.TANDEM_CONNECTOR_URL},null,2)+"\n");
+  '
+  printf 'ready\n' > "$marker_file"
+  chmod 600 "$marker_file"
+  trap - EXIT
+
+  say "Tandem hub is ready."
+  printf 'MCP URL: %s\n' "$public_url"
+  printf 'Owner consent password: stored in %s\n' "$password_file"
+  printf 'First device: securely copy %s, then run ./setup.sh device <copied-bundle>\n' "$enrollment_file"
+  printf 'The invitation expires in 15 minutes and can be consumed once. The enrolled device does not expire.\n'
+  printf 'Run ./setup.sh invite once for every additional device. No credential was printed.\n'
+}
+
+setup_invite() {
+  [ "$#" -le 1 ] || die "Usage: ./setup.sh invite"
+  prepare_state_root
+  local hub_dir="${STATE_ROOT}/hub"
+  local config_file="${hub_dir}/config.json"
+  local invitations_dir="${hub_dir}/invitations"
+  [ -f "$config_file" ] || die "The Tandem hub is not configured. Run './setup.sh hub' first."
+  secure_directory "$invitations_dir"
+  local bundle_file="${invitations_dir}/device-enrollment-$(generate_secret | cut -c1-12).json"
+  TANDEM_CONFIG_FILE="$config_file" node --experimental-strip-types src/enrollment-cli.ts create "$bundle_file" >/dev/null
+  say "Independent device invitation created."
+  printf 'Invitation file: %s\n' "$bundle_file"
+  printf 'Securely copy it to one device and run ./setup.sh device <copied-bundle> within 15 minutes.\n'
+  printf 'Once enrolled, that device stays authorized and reconnects automatically. Repeat ./setup.sh invite for more devices.\n'
+}
+
+setup_device() {
+  find_tailscale
+  command -v tmux >/dev/null 2>&1 || die "tmux is required to drive terminal engines."
+  install_dependencies
+  prepare_state_root
+  local device_dir="${STATE_ROOT}/device"
+  local config_file="${device_dir}/config.json"
+  local ready_file="${device_dir}/ready"
+  local pid_file="${device_dir}/device.pid"
+  local log_file="${device_dir}/device.log"
+  secure_directory "$device_dir"
+
+  if [ ! -f "$config_file" ]; then
+    validate_setup_values
+    local bundle="${2:-${TANDEM_ENROLLMENT_FILE:-}}"
+    [ -n "$bundle" ] || die "A protected one-time enrollment bundle is required for the first device setup."
+    [ -f "$bundle" ] || die "The enrollment bundle does not exist."
+    local device_id="${TANDEM_DEVICE_ID:-}"
+    if [ -z "$device_id" ]; then device_id="device-$(generate_secret | cut -c1-10)"; fi
+    local device_name="${TANDEM_DEVICE_NAME:-device}"
+    TANDEM_SETUP_DEVICE_ID="$device_id" \
+    TANDEM_SETUP_DEVICE_NAME="$device_name" \
+    TANDEM_SETUP_ALLOWLIST="$TANDEM_CWD_ALLOWLIST" \
+    TANDEM_SETUP_ENABLED_ENGINES="${TANDEM_ENABLED_ENGINES:-}" \
+    TANDEM_SETUP_DEVICE_CONFIG="$config_file" \
+    TANDEM_SETUP_READY_FILE="$ready_file" \
+      node --experimental-strip-types src/enrollment-cli.ts consume "$bundle"
+  else
+    say "Using the existing protected device configuration."
+  fi
+
+  if pid_is_running "$pid_file" && [ -f "$ready_file" ]; then
+    say "Tandem device is already registered and running."
+    return
+  fi
+  rm -f "$ready_file" "$pid_file"
+  TANDEM_CONFIG_FILE="$config_file" node --experimental-strip-types src/device-server.ts >"$log_file" 2>&1 &
+  local device_pid=$!
+  printf '%s\n' "$device_pid" > "$pid_file"
+  chmod 600 "$pid_file" "$log_file"
+  for _ in $(seq 1 20); do
+    if [ -f "$ready_file" ]; then
+      say "Device registered with the hub and reported its enabled capabilities."
+      return
+    fi
+    kill -0 "$device_pid" 2>/dev/null || break
+    sleep 1
+  done
+  kill "$device_pid" 2>/dev/null || true
+  rm -f "$pid_file" "$config_file" "$ready_file"
+  die "Device registration failed. The invitation was burned and no fleet credential was retained. Create a new invitation on the hub."
+}
+
+case "$ROLE" in
+  hub) setup_hub ;;
+  invite) setup_invite "$@" ;;
+  device) setup_device "$@" ;;
+  desktop) setup_desktop ;;
+esac

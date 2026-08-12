@@ -49,6 +49,10 @@ coverage/
 CLAUDE.md
 AGENTS.md
 
+# Local implementation plans and agent prompts can contain absolute paths.
+# They are development state, not part of the public package.
+.claude/
+
 # internal launch/distribution planning (contains local paths + strategy) — never publish
 LAUNCH_LOG.md
 LAUNCH_QUEUE.md

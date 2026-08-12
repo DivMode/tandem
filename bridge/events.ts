@@ -16,23 +16,25 @@
  * the current stateless Streamable-HTTP setup — see the README "Completion
  * events / waking the client" section for what a client would need to do.
  */
-import { appendFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, chmodSync, mkdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { audit } from './audit.ts'
 
 const EVENTS_DIR = join(homedir(), '.tandem')
 const EVENTS_LOG = join(EVENTS_DIR, 'events.log')
-const BRIDGE_LOG = join(EVENTS_DIR, 'bridge.log')
-
-/** Append a structured line to ~/.tandem/bridge.log; never throws. */
+/** Append a metadata-only bridge record using the central redaction policy. */
 function logBridge(fields: Record<string, unknown>): void {
-  try {
-    mkdirSync(EVENTS_DIR, { recursive: true })
-    appendFileSync(BRIDGE_LOG, JSON.stringify({ ts: new Date().toISOString(), ...fields }) + '\n')
-  } catch (e) {
-    process.stderr.write(`[events] bridge.log write failed: ${e instanceof Error ? e.message : String(e)}\n`)
-  }
+  audit(fields)
+}
+
+/** Append private event content without inheriting a permissive process umask. */
+function appendEventLine(line: string): void {
+  mkdirSync(EVENTS_DIR, { recursive: true, mode: 0o700 })
+  chmodSync(EVENTS_DIR, 0o700)
+  appendFileSync(EVENTS_LOG, line, { encoding: 'utf8', mode: 0o600 })
+  chmodSync(EVENTS_LOG, 0o600)
 }
 
 export interface CompletionEvent {
@@ -48,9 +50,9 @@ export interface CompletionEvent {
   /** relay end reason, when applicable. */
   reason?: string
   /**
-   * A chat-ready, copy-pasteable handoff block (plain text, multi-line). Pasting
-   * it into a claude.ai chat tells the chat Claude what finished, what to check,
-   * and what to do next. Computed by emitCompletion; absent on escalation /
+   * A client-neutral, copy-pasteable handoff block (plain text, multi-line).
+   * Pasting it into any capable agent or chat tells it what finished and what
+   * to check next. Computed by emitCompletion; absent on escalation and
    * needs-input events.
    */
   handoff?: string
@@ -93,13 +95,12 @@ function gitInfo(cwd?: string): GitInfo {
 }
 
 /**
- * Build the chat-ready handoff block. Worded so it can be pasted straight into a
- * claude.ai chat: the chat Claude immediately knows what happened, what to check,
- * and what to do next.
+ * Build a client-neutral handoff block for any capable agent, chat, or
+ * automation consuming Tandem's completion event.
  */
 export function buildHandoff(event: { id: string; status: string; summary: string }, git: GitInfo): string {
   return [
-    `CC check — session "${event.id}" finished (${event.status}).`,
+    `Tandem check: session "${event.id}" finished (${event.status}).`,
     `Summary: ${event.summary}`,
     `Commit: ${git.commit}`,
     `Files changed: ${git.filesChanged}`,
@@ -123,6 +124,24 @@ export interface NtfyPayload {
   click?: string
 }
 
+interface NtfyPayloadOptions {
+  escalation?: boolean
+  needsInput?: boolean
+  reason?: string
+  clickUrl?: string
+}
+
+function safeClickUrl(raw?: string): string | undefined {
+  if (!raw?.trim()) return undefined
+  try {
+    const url = new URL(raw)
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) return undefined
+    return url.toString()
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Build the ntfy notification for an event. A normal completion is a quiet
  * "<id> done"; an escalation (the manager is stuck and needs the human) is an
@@ -131,8 +150,9 @@ export interface NtfyPayload {
  */
 export function ntfyPayload(
   event: CompletionEvent,
-  opts?: { escalation?: boolean; needsInput?: boolean; reason?: string },
+  opts?: NtfyPayloadOptions,
 ): NtfyPayload {
+  const click = safeClickUrl(opts?.clickUrl)
   if (opts?.needsInput) {
     // Non-terminal question: the manager is alive and waiting for an answer.
     // Distinct title from both 'done' and the terminal BLOCKED 'NEEDS YOU'.
@@ -142,15 +162,17 @@ export function ntfyPayload(
       body: summarize(`${event.type} ${event.id} asked: ${reason || 'needs your answer'}`),
       priority: 'urgent',
       tags: 'question,speech_balloon',
+      ...(click ? { click } : {}),
     }
   }
   if (opts?.escalation) {
     const reason = (opts.reason ?? event.reason ?? event.summary ?? '').trim()
     return {
       title: `tandem: ${event.id} NEEDS YOU`,
-      body: summarize(`${event.type} ${event.id} is BLOCKED — ${reason || 'needs your input'}`),
+      body: summarize(`${event.type} ${event.id} is BLOCKED: ${reason || 'needs your input'}`),
       priority: 'urgent',
       tags: 'warning,sos',
+      ...(click ? { click } : {}),
     }
   }
   return {
@@ -158,11 +180,10 @@ export function ntfyPayload(
     // collapsed) so you can copy it straight from the notification into a chat.
     // Falls back to the old one-line summary if no handoff was computed.
     title: `tandem: ${event.id} done`,
-    body: event.handoff ?? summarize(`${event.type} ${event.id} ${event.status} @${event.cursor} — ${event.summary}`),
+    body: event.handoff ?? summarize(`${event.type} ${event.id} ${event.status} @${event.cursor}: ${event.summary}`),
     priority: 'default',
     tags: 'white_check_mark',
-    // Tapping the notification opens claude.ai so you can paste the handoff.
-    click: 'https://claude.ai',
+    ...(click ? { click } : {}),
   }
 }
 
@@ -173,13 +194,16 @@ export function ntfyPayload(
  *
  * NOTE: this reaches a DEVICE (your phone/the ntfy app), not the chat client.
  */
-function notifyNtfy(event: CompletionEvent, opts?: { escalation?: boolean; needsInput?: boolean; reason?: string }): void {
+function notifyNtfy(event: CompletionEvent, opts?: NtfyPayloadOptions): void {
   const topic = process.env.TANDEM_NTFY_TOPIC
   if (!topic) return // ntfy off unless a topic is configured
 
   const server = (process.env.TANDEM_NTFY_SERVER || 'https://ntfy.sh').replace(/\/+$/, '')
   const url = `${server}/${encodeURIComponent(topic)}`
-  const { title, body, priority, tags, click } = ntfyPayload(event, opts)
+  const { title, body, priority, tags, click } = ntfyPayload(event, {
+    ...opts,
+    clickUrl: process.env.TANDEM_NTFY_CLICK_URL,
+  })
 
   try {
     void fetch(url, {
@@ -188,9 +212,9 @@ function notifyNtfy(event: CompletionEvent, opts?: { escalation?: boolean; needs
       // Click (if present) is a plain URL — also single-line ASCII.
       headers: { Title: title, Priority: priority, Tags: tags, ...(click ? { Click: click } : {}) },
       body,
-    }).catch((e) => logBridge({ event: 'ntfy', ok: false, topic, error: String(e) }))
+    }).catch((e) => logBridge({ event: 'ntfy', ok: false, error: String(e) }))
   } catch (e) {
-    logBridge({ event: 'ntfy', ok: false, topic, error: e instanceof Error ? e.message : String(e) })
+    logBridge({ event: 'ntfy', ok: false, error: e instanceof Error ? e.message : String(e) })
   }
 }
 
@@ -215,10 +239,9 @@ export function emitCompletion(
 
   // 1) Durable local log.
   try {
-    mkdirSync(EVENTS_DIR, { recursive: true })
-    appendFileSync(EVENTS_LOG, line)
-  } catch (e) {
-    process.stderr.write(`[events] log write failed: ${e instanceof Error ? e.message : String(e)}\n`)
+    appendEventLine(line)
+  } catch {
+    process.stderr.write('[events] event log write failed\n')
   }
 
   // 2) Optional outbound webhook.
@@ -229,9 +252,9 @@ export function emitCompletion(
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: line,
-      }).catch((e) => process.stderr.write(`[events] webhook POST failed: ${e}\n`))
+      }).catch((e) => logBridge({ event: 'webhook', ok: false, error: String(e) }))
     } catch (e) {
-      process.stderr.write(`[events] webhook error: ${e instanceof Error ? e.message : String(e)}\n`)
+      logBridge({ event: 'webhook', ok: false, error: e instanceof Error ? e.message : String(e) })
     }
   }
 
@@ -251,10 +274,9 @@ export function emitNeedsInput(ev: Omit<CompletionEvent, 'status'> & { reason: s
   const line = JSON.stringify({ event: 'needs_input', ...event }) + '\n'
 
   try {
-    mkdirSync(EVENTS_DIR, { recursive: true })
-    appendFileSync(EVENTS_LOG, line)
-  } catch (e) {
-    process.stderr.write(`[events] needs_input log write failed: ${e instanceof Error ? e.message : String(e)}\n`)
+    appendEventLine(line)
+  } catch {
+    process.stderr.write('[events] needs_input log write failed\n')
   }
 
   const url = process.env.TANDEM_DONE_WEBHOOK
@@ -264,9 +286,9 @@ export function emitNeedsInput(ev: Omit<CompletionEvent, 'status'> & { reason: s
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: line,
-      }).catch((e) => process.stderr.write(`[events] webhook POST failed: ${e}\n`))
+      }).catch((e) => logBridge({ event: 'webhook', ok: false, error: String(e) }))
     } catch (e) {
-      process.stderr.write(`[events] webhook error: ${e instanceof Error ? e.message : String(e)}\n`)
+      logBridge({ event: 'webhook', ok: false, error: e instanceof Error ? e.message : String(e) })
     }
   }
 
@@ -286,10 +308,9 @@ export function emitEscalation(ev: Omit<CompletionEvent, 'status'> & { reason: s
 
   // 1) Durable local log (tagged so watchers can distinguish from completions).
   try {
-    mkdirSync(EVENTS_DIR, { recursive: true })
-    appendFileSync(EVENTS_LOG, line)
-  } catch (e) {
-    process.stderr.write(`[events] escalation log write failed: ${e instanceof Error ? e.message : String(e)}\n`)
+    appendEventLine(line)
+  } catch {
+    process.stderr.write('[events] escalation log write failed\n')
   }
 
   // 2) Optional outbound webhook (same raw JSON line).
@@ -300,9 +321,9 @@ export function emitEscalation(ev: Omit<CompletionEvent, 'status'> & { reason: s
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: line,
-      }).catch((e) => process.stderr.write(`[events] webhook POST failed: ${e}\n`))
+      }).catch((e) => logBridge({ event: 'webhook', ok: false, error: String(e) }))
     } catch (e) {
-      process.stderr.write(`[events] webhook error: ${e instanceof Error ? e.message : String(e)}\n`)
+      logBridge({ event: 'webhook', ok: false, error: e instanceof Error ? e.message : String(e) })
     }
   }
 

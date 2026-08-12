@@ -1,11 +1,12 @@
 /**
  * Shared MCP server builder for tandem.
  *
- * Defines the ONE tool surface (6 tools) used by BOTH transports:
- *   - src/http-mcp.ts   — Streamable-HTTP behind TANDEM_TOKEN (web/tunnel use)
- *   - src/stdio-server.ts — stdio for local desktop apps (no tunnel, no token)
+ * Defines the one seven-tool surface used by both transports:
+ *   - src/public-server.ts: OAuth-protected Streamable HTTP (production)
+ *   - src/http-mcp.ts: explicit legacy bearer-header migration only
+ *   - src/stdio-server.ts: stdio for local desktop apps (no tunnel, no token)
  *
- * Each tool calls the local router (../bridge/router.ts) in-process — the same
+ * Each local tool call reaches the router (../bridge/router.ts) in-process. The same
  * proven handlers regardless of transport. The cwd allowlist, relay isolation,
  * and audit log all live in the router and apply identically to both paths.
  *
@@ -14,7 +15,7 @@
  * TANDEM_* env vars to the engine's CCM_* names BEFORE importing this module
  * (both entrypoints use a dynamic `await import(...)` after env setup).
  *
- * Tool surface is consolidated (phase 3): 6 tools. read_session is folded into
+ * The tool surface contains seven tools. read_session is folded into
  * send_to_session (empty text = poll mode); the four relay tools are folded into
  * one `relay` tool with an `action`. The underlying routes are unchanged, so the
  * full capability set remains reachable.
@@ -22,13 +23,23 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { routeForTest } from "../bridge/router.ts";
+import {
+  dispatchListDevices,
+  dispatchListSessions,
+  dispatchOpenSession,
+  dispatchSessionOp,
+} from "../bridge/fleet-dispatch.ts";
+import { createFleetRuntime, type FleetRuntime } from "../bridge/fleet-runtime.ts";
 import { ICON_MIME, ICON_DATA_URI } from "./icon.ts";
 
 /** Standing warning prepended to every tool description (real machine, real actions). */
 const BLAST_RADIUS =
-  "WARNING: this runs REAL Claude Code on the host machine (an interactive claude " +
-  "TUI in tmux, on the user's subscription) and may read, edit, or delete files and " +
-  "run shell commands in the chosen working directory. Treat every call as a real action.";
+  "WARNING: this controls a REAL interactive engine session on the host machine. Claude " +
+  "Code in tmux is the default. codex/shell/hermes are " +
+  "DISABLED unless the host explicitly enables them (TANDEM_ENABLED_ENGINES); shell, " +
+  "if enabled, is arbitrary OS-user command execution starting in the allowlisted cwd, " +
+  "not a sandbox. May read, edit, or delete files and run shell commands in the chosen " +
+  "working directory. Treat every call as a real action.";
 
 const q = (params: Record<string, string | number | undefined>) => {
   const usp = new URLSearchParams();
@@ -48,10 +59,27 @@ async function call(
   return { content: [{ type: "text" as const, text: JSON.stringify(result.body) }] };
 }
 
-export function buildMcpServer(): McpServer {
+/** Wraps an already-computed { status, body } (local OR fleet-routed) the
+ *  same way `call()` wraps a direct router result. Status is intentionally
+ *  dropped from the text body, matching call()'s existing shape exactly. */
+function wrap(result: { status: number; body: unknown }) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(result.body) }] };
+}
+
+/**
+ * Builds the MCP server. `fleet`, when supplied, is the SAME FleetRuntime the
+ * production HTTP entrypoint shares with its private fleet listener.
+ * Every tool call below routes through bridge/fleet-dispatch.ts, which
+ * falls back to the exact pre-Phase-3 local behavior whenever no `device` is
+ * given and the call resolves to local (see fleet-dispatch.ts for the full
+ * resolution rules). The stdio transport uses a local-only runtime, so callers
+ * get the same device-aware schema without opening a network listener.
+ */
+export function buildMcpServer(fleet?: FleetRuntime): McpServer {
+  const runtime = fleet ?? createFleetRuntime({ localEngines: ["claude"] });
   // `icons` rides in the server's implementation info (a self-contained data:
-  // URI, so no public URL is needed) — a spec-aware client renders the Claude
-  // Code crab next to the connector / its tools. The HTTP transport's
+  // URI, so no public URL is needed). A spec-aware client renders the Tandem
+  // agent mark next to the connector and its tools. The HTTP transport's
   // /favicon.ico + /icon.png routes cover clients that instead fetch the
   // origin's favicon.
   const server = new McpServer({
@@ -62,58 +90,92 @@ export function buildMcpServer(): McpServer {
 
   /* ---- sessions ---- */
 
+  const deviceParamDescription =
+    "Fleet device id to route to, or \"local\" for this hub. Omit to use the configured default device or the sole online device (local counts as one) uniquely capable of the requested engine; an unresolvable ambiguity fails with a 409 listing candidates. A composite \"device:localName\" session name implies its device and must not conflict with an explicit device here (400 if it does).";
+
   server.tool(
     "open_session",
-    `${BLAST_RADIUS}\n\nSpawn a fresh, visible, INTERACTIVE Claude Code session in tmux ("ccm-<name>") in the given working directory; returns { name, cwd, attachHint }. Idempotent. cwd must be on the bridge allowlist. Launches in skip-permissions (autonomous) mode by default so turns don't stall on allow-prompts (set TANDEM_SKIP_PERMISSIONS=0 to disable); the cwd allowlist is enforced BEFORE spawn regardless, so this never widens reachable directories. Optional model/effort are session-scoped (claude --model / --effort).`,
+    `${BLAST_RADIUS}\n\nOpen or attach to a visible interactive session. Supported engine ids are claude, codex, shell, and hermes. Claude is enabled by default; every other engine needs host opt-in and must be available. Claude, Codex, and shell run in tmux and require an admitted start cwd. Hermes attaches only to an explicitly allowlisted writable agent id through a loopback gateway and does not accept cwd.\n\nClaude permission bypass is off by default. model and effort are also Claude-only. Unknown, disabled, unavailable, or incompatible options fail before spawn or gateway contact. A remote open returns a stable global name in the form "<deviceId>:<localName>". Preserve that exact name for later calls so routing cannot drift.`,
     {
-      name: z.string().optional().describe("Short name (A-Z a-z 0-9 . _ -); auto-generated if omitted."),
-      cwd: z.string().optional().describe("Working dir; must be on the allowlist (default the configured cwd)."),
-      model: z.string().optional().describe("Session model: alias (default|opus|sonnet|haiku) or a full claude-* id. Session-scoped; unsupported values are rejected (400)."),
-      effort: z.string().optional().describe("Thinking effort: low|medium|high|xhigh|max. Session-scoped; unsupported values are rejected (400)."),
+      name: z.string().optional().describe("Short name (A-Z a-z 0-9 . _ -); auto-generated if omitted. For engine=hermes this is the writable agent id (required, must be allowlisted)."),
+      cwd: z.string().optional().describe("Working dir; must be on the allowlist (default the configured cwd). Not supported for engine=hermes."),
+      model: z.string().optional().describe("Claude-only session model: alias (default|opus|sonnet|haiku) or a full claude-* id. Rejected (400) for any other engine."),
+      effort: z.string().optional().describe("Claude-only thinking effort: low|medium|high|xhigh|max. Rejected (400) for any other engine."),
+      engine: z.enum(["claude", "codex", "shell", "hermes"]).optional().describe("Engine to drive this session. Defaults to claude. codex/shell/hermes require TANDEM_ENABLED_ENGINES opt-in."),
+      device: z.string().optional().describe(deviceParamDescription),
     },
-    async ({ name, cwd, model, effort }) => call("POST", "/sessions/open", { name, cwd, model, effort }),
+    async ({ name, cwd, model, effort, engine, device }) => {
+      return wrap(await dispatchOpenSession(runtime, { name, cwd, model, effort, engine, device }));
+    },
   );
 
   server.tool(
     "list_sessions",
-    `${BLAST_RADIUS}\n\nList Claude Code sessions: LIVE tmux sessions the bridge is driving (with a "tmux attach -t ccm-<name>" hint) first, then recent local history. Read-only.`,
-    { limit: z.number().int().positive().optional(), project: z.string().optional() },
-    async ({ limit, project }) => call("GET", "/sessions", {}, q({ limit, project }).slice(1)),
+    `${BLAST_RADIUS}\n\nRead-only. List live sessions Tandem owns and can drive on the local hub or one selected device. Tandem does not scan arbitrary tmux sessions or return history. Remote ids are rewritten as stable "<deviceId>:<localName>" names and include device and localName fields.`,
+    {
+      limit: z.number().int().positive().optional(),
+      project: z.string().optional(),
+      device: z.string().optional().describe("Fleet device id to list, or omit for local."),
+    },
+    async ({ limit, project, device }) => {
+      return wrap(await dispatchListSessions(runtime, device, { limit, project }));
+    },
   );
 
   server.tool(
     "send_to_session",
-    `${BLAST_RADIUS}\n\nSend a prompt to a live session and wait (BOUNDED by TANDEM_WAIT_MS) for the turn to finish, returning { status, report, cursor }. If the turn is still running at the cap it returns { status:"running", cursor } — call again to keep waiting (never an infinite internal loop). POLL MODE: omit/empty 'text' to just fetch new output since 'cursor' without sending a new instruction → { text, cursor, idle } (idle:true means the turn is done). When a turn finishes the bridge ALSO emits a completion event (see README "Completion events"), so polling is optional.\n\nSLASH COMMANDS: any slash command sent as 'text' reaches the TUI verbatim and executes — e.g. "/status", "/mcp", "/model opus", "/goal ...", and custom commands. PER-TURN OVERRIDE: optional model/effort set the model/thinking effort for this turn via in-session controls applied before the prompt (these also persist as the saved default for new sessions; for strictly session-scoped control set them at open_session instead).`,
+    `${BLAST_RADIUS}\n\nSend one instruction to a live session and wait up to TANDEM_WAIT_MS. A bounded timeout returns status "running" and a cursor; poll again with empty text and that cursor instead of resending the instruction. Empty text reads only newer output and returns idle when the turn is done. Completion events are also written as described in README.\n\nSlash commands and shell lines are passed through verbatim and execute in the target session. Optional model and effort controls are Claude-only and are rejected for every other engine.`,
     {
-      name: z.string(),
+      name: z.string().describe("A bare local name (always local), or a fleet-routed \"<deviceId>:<localName>\" name returned by open_session/list_sessions."),
       text: z.string().optional().describe("Instruction OR a slash command (verbatim). Omit/empty = poll mode (read new output only)."),
       cursor: z.number().int().nonnegative().optional().describe("Poll mode: byte cursor from a previous result; returns only newer output."),
-      model: z.string().optional().describe("Override model for this turn: default|opus|sonnet|haiku or a full claude-* id. Unsupported values rejected (400)."),
-      effort: z.string().optional().describe("Override thinking effort for this turn: low|medium|high|xhigh|max. Unsupported values rejected (400)."),
+      model: z.string().optional().describe("Claude-only: override model for this turn (default|opus|sonnet|haiku or a full claude-* id). Rejected (400) for any other engine."),
+      effort: z.string().optional().describe("Claude-only: override thinking effort for this turn (low|medium|high|xhigh|max). Rejected (400) for any other engine."),
+      device: z.string().optional().describe(deviceParamDescription),
     },
-    async ({ name, text, cursor, model, effort }) =>
-      call("POST", `/sessions/${encodeURIComponent(name)}/send`, { text: text ?? "", cursor, model, effort }),
+    async ({ name, text, cursor, model, effort, device }) => {
+      return wrap(await dispatchSessionOp(runtime, "send", name, device, { text: text ?? "", cursor, model, effort }));
+    },
   );
 
   server.tool(
     "interrupt_session",
     `${BLAST_RADIUS}\n\nStop a runaway turn (sends Escape / Ctrl-C to the TUI). The session stays open. Returns { ok, name }.`,
-    { name: z.string() },
-    async ({ name }) => call("POST", `/sessions/${encodeURIComponent(name)}/interrupt`),
+    {
+      name: z.string().describe("A bare local name (always local), or a fleet-routed \"<deviceId>:<localName>\" name returned by open_session/list_sessions."),
+      device: z.string().optional().describe(deviceParamDescription),
+    },
+    async ({ name, device }) => {
+      return wrap(await dispatchSessionOp(runtime, "interrupt", name, device, {}));
+    },
   );
 
   server.tool(
     "close_session",
     `${BLAST_RADIUS}\n\nKill the live tmux session (ends the interactive TUI). Idempotent. Returns { ok, name }.`,
-    { name: z.string() },
-    async ({ name }) => call("POST", `/sessions/${encodeURIComponent(name)}/close`),
+    {
+      name: z.string().describe("A bare local name (always local), or a fleet-routed \"<deviceId>:<localName>\" name returned by open_session/list_sessions."),
+      device: z.string().optional().describe(deviceParamDescription),
+    },
+    async ({ name, device }) => {
+      return wrap(await dispatchSessionOp(runtime, "close", name, device, {}));
+    },
+  );
+
+  server.tool(
+    "list_devices",
+    "List this hub and every connected fleet device. Returns { devices: [{ id, name, online, engines }] } with exactly those four fields. IP addresses, hostnames, usernames, tailnet identities, filesystem paths, tokens, and nonces are never included.",
+    {},
+    async () => {
+      return wrap(dispatchListDevices(runtime));
+    },
   );
 
   /* ---- relay (one tool, five actions) ---- */
 
   server.tool(
     "relay",
-    `${BLAST_RADIUS}\n\nControl the autonomous, NO-HUMAN-IN-THE-LOOP lead/worker relay (two interactive Claude Code sessions that message each other). The lead is a PERSISTENT manager: when a task finishes it PARKS (stays alive, idle) and waits for the next task instead of dying; it tears down on stop, an idle-timeout, when it asks an unanswered question too long, or when it escalates terminal "BLOCKED". action:\n- "start": begin a relay — needs { goal, cwd?, maxTurns? } → { status:"running", loopId, leadName, workerName }\n- "read": fetch the lead<->worker transcript — needs { loopId, cursor? } → { text, cursor, running } (running:false = finished)\n- "enqueue": give the parked/running manager the NEXT task — needs { loopId, task } → { ok, queued }. ALSO the channel to ANSWER a question: if the manager asked NEEDS_INPUT and is awaiting an answer, the first enqueue is treated as that answer and RESUMES the same task.\n- "inject": steer the lead mid-task (only while a task is actively RUNNING; rejected while parked/awaiting-answer — use enqueue to answer) — needs { loopId, message }\n- "stop": halt promptly — needs { loopId }\nNotifications: routine task completions are SILENT (logged, no phone push); the manager buzzes the phone only when it NEEDS YOUR ANSWER (urgent, stays alive) or is FULLY FINISHED; a terminal BLOCKED emits an urgent escalation (see README "Completion events").`,
+    `${BLAST_RADIUS}\n\nControl the optional persistent Claude-only lead and worker loop. This is not the general multi-engine fleet mechanism and cannot route to a device. start requires TANDEM_ALLOW_BYPASS=1 and fails before opening sessions when bypass is off. The lead parks after a task and can accept more work until stopped or bounded cleanup ends the loop.\n\nActions: start begins a goal; read fetches transcript output; enqueue supplies the next task or answers NEEDS_INPUT; inject steers an actively running task; stop ends the loop. Completion and escalation events follow the README notification policy.`,
     {
       action: z.enum(["start", "read", "inject", "stop", "enqueue"]),
       goal: z.string().optional().describe('action=start: the relay objective.'),
