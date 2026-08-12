@@ -1,47 +1,58 @@
 /**
- * sessions.ts — TerminalSession registry, live-session listing, and the
- * cwd-allowlist security helpers (the trust boundary the reviewer scrutinizes).
+ * sessions.ts — the live DrivableSession registry, live-session listing, and
+ * the cwd-allowlist security helpers (the trust boundary the reviewer scrutinizes).
  *
- * ENGINE = tmux (see spec §1b/§2). A "session" is an interactive `claude` TUI
- * running in a tmux session named "ccm-<name>". The bridge spawns and drives it;
- * only ccm-* tmux sessions are ever drivable from claude.ai. listSessions()
- * reports the LIVE ccm-* tmux sessions (from `tmux ls`) with their cwd + an
- * attach hint, and best-effort merges recent ~/.claude/projects history so the
- * web chat can resume past work.
+ * A "session" is an interactive engine (claude/codex/shell) TUI running in a
+ * tmux session named "ccm-<name>", or an attached Hermes writable-agent id
+ * (not tmux-hosted). listSessions() reports ONLY sessions Tandem currently
+ * OWNS and can safely address (binding — Phase 2 correction E): live ccm-*
+ * tmux sessions whose `@tandem_engine`/`@tandem_owner` provenance tags match
+ * THIS installation (see ./ownership.ts and ./terminal-session.ts
+ * readSessionProvenance), each tagged with its engine. A tmux session with
+ * missing or mismatched provenance is NEVER listed as drivable, even if its
+ * name matches the ccm-* prefix. There is no history surface: Tandem does not
+ * scan or report ~/.claude/projects (or any other engine's local history) —
+ * doing so would leak past prompts/paths this process never owned or created.
  *
  * The allowlist helpers (buildAllowlist / isCwdAllowed) are exported here and
  * consumed by bridge/index.ts and bridge/relay.ts. Rules (SECURITY):
  *   - realpath-canonicalize candidate + roots before comparing (defeats symlink
  *     and `..` escapes).
- *   - default allowlist = $HOME + $HOME's immediate non-dot child dirs.
- *   - explicit override via CCM_CWD_ALLOWLIST (colon-separated). When set, $HOME
- *     is NOT implicitly allowed.
- *   - prefix match uses a TRAILING SEPARATOR so "/Users/max" does not match
- *     "/Users/maxfoo" (prefix-confusion guard).
+ *   - no implicit roots: CCM_CWD_ALLOWLIST must explicitly name every allowed
+ *     root and an unset/blank value fails closed.
+ *   - prefix match uses a TRAILING SEPARATOR so "/srv/code" does not match
+ *     "/srv/code-evil" (prefix-confusion guard).
  */
 
 import { execFile } from 'node:child_process'
-import { readdir, readFile, stat } from 'node:fs/promises'
-import { readdirSync, realpathSync, statSync } from 'node:fs'
+import { realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, resolve, sep } from 'node:path'
-import { TerminalSession } from './terminal-session.ts'
+import { basename, dirname, join, resolve, sep } from 'node:path'
+import type { DrivableSession, EngineId } from './drivable.ts'
+import { buildEnabledEngines } from './engine-registry.ts'
+import { makeOwnerIdProvider, type OwnerIdProvider } from './ownership.ts'
+import { readSessionProvenance } from './terminal-session.ts'
 
 const HOME = homedir()
-const PROJECTS_DIR = join(HOME, '.claude', 'projects')
 const SESSION_PREFIX = 'ccm-'
 
+/** Engine ids that are tmux-hosted (i.e. can appear as a ccm-* tmux session).
+ *  `hermes` is intentionally excluded — it is never tmux-hosted, so a tmux
+ *  session claiming `@tandem_engine=hermes` is never valid provenance. */
+const TMUX_ENGINE_IDS = new Set<EngineId>(['claude', 'codex', 'shell'])
+const SESSION_NAME_RE = /^[A-Za-z0-9._-]+$/
+const RELAY_NAME_RE = /^relay-/
+
 export interface SessionInfo {
-  /** session name (without the ccm- prefix) for live sessions, or the history
-   *  session-uuid for history-only entries. */
+  /** session name, without the ccm- prefix. */
   id: string
+  engine: EngineId
   project: string
   cwd: string
-  lastMessage: string
-  updatedAt: number
   live: boolean
-  /** present for live tmux sessions: how Max attaches to watch/type. */
-  attachHint?: string
+  updatedAt: number
+  /** how the owner attaches to watch/type (a tmux attach command). */
+  attachHint: string
 }
 
 // ---- allowlist (the security boundary) ------------------------------------
@@ -60,46 +71,33 @@ export function safeResolve(p: string, home = HOME): string {
       const real = realpathSync(abs)
       return tail.length ? join(real, ...tail.reverse()) : real
     } catch {
-      const parent = resolve(abs, '..')
+      const parent = dirname(abs)
       if (parent === abs) return tail.length ? join(abs, ...tail.reverse()) : abs
-      tail.push(abs.slice(parent.length + 1))
+      // basename/dirname handle the filesystem root correctly. Slicing by
+      // `parent.length + 1` turned `/allowed` into `llowed` because `/` already
+      // contains the separator.
+      tail.push(basename(abs))
       abs = parent
     }
   }
 }
 
-/** Build the allowlist: explicit roots from env, else $HOME + its child dirs. */
+/** Build only explicit allowlist roots. Missing or blank configuration fails closed. */
 export function buildAllowlist(
   envValue = process.env.CCM_CWD_ALLOWLIST,
   home = HOME,
 ): string[] {
-  if (envValue && envValue.trim()) {
-    return envValue
-      .split(':')
-      .map((p) => p.trim())
-      .filter(Boolean)
-      .map((p) => safeResolve(p, home))
-  }
-  const roots = new Set<string>([safeResolve(home, home)])
-  try {
-    for (const entry of readdirSync(home)) {
-      if (entry.startsWith('.')) continue
-      const full = join(home, entry)
-      try {
-        if (statSync(full).isDirectory()) roots.add(safeResolve(full, home))
-      } catch {
-        /* skip unreadable */
-      }
-    }
-  } catch {
-    /* home unreadable — just the home root */
-  }
-  return [...roots]
+  if (!envValue?.trim()) return []
+  return envValue
+    .split(':')
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => safeResolve(p, home))
 }
 
 /** True if `candidate` resolves to an allowlisted root or a descendant of one.
- *  Prefix comparison uses a trailing separator so "/Users/max" does NOT match
- *  "/Users/maxfoo". */
+ *  Prefix comparison uses a trailing separator so "/srv/code" does NOT match
+ *  "/srv/code-evil". */
 export function isCwdAllowed(candidate: string, allowlist: string[]): boolean {
   let real: string
   try {
@@ -115,16 +113,18 @@ export function isCwdAllowed(candidate: string, allowlist: string[]): boolean {
   return false
 }
 
-// ---- live TerminalSession registry ----------------------------------------
+// ---- live DrivableSession registry -----------------------------------------
+// Stores the generic DrivableSession contract, not a raw TerminalSession or an
+// adapter constructed on demand (binding — Phase 1 plan review amendment #2).
 
-const registry = new Map<string, TerminalSession>()
+const registry = new Map<string, DrivableSession>()
 
-export function getLive(name: string): TerminalSession | undefined {
+export function getLive(name: string): DrivableSession | undefined {
   return registry.get(name)
 }
 
-export function registerLive(session: TerminalSession): void {
-  registry.set(session.name, session)
+export function registerLive(session: DrivableSession): void {
+  registry.set(session.id, session)
 }
 
 export function unregisterLive(name: string): void {
@@ -135,7 +135,7 @@ export function liveSessionNames(): string[] {
   return [...registry.keys()]
 }
 
-// ---- tmux live listing ----------------------------------------------------
+// ---- tmux live listing (provenance-checked) --------------------------------
 
 function tmux(args: string[]): Promise<string> {
   return new Promise<string>((resolve, reject) => {
@@ -149,164 +149,135 @@ function tmux(args: string[]): Promise<string> {
   })
 }
 
+export interface LiveListingDependencies {
+  ownerIdProvider?: OwnerIdProvider
+  tmuxFn?: (args: string[]) => Promise<string>
+  provenanceReader?: (name: string) => Promise<{ engine: string; owner: string }>
+}
+
 interface LiveTmuxSession {
   name: string // without prefix
   target: string // ccm-<name>
+  engine: EngineId
   cwd: string
   createdAt: number
 }
 
-/** Enumerate live ccm-* tmux sessions with their cwd + creation time. */
-export async function listLiveTmuxSessions(): Promise<LiveTmuxSession[]> {
+/**
+ * Enumerate live ccm-* tmux sessions THIS installation actually owns and can
+ * safely address. A raw `ccm-*` tmux session name is not sufficient proof —
+ * anyone on the same OS user account could hand-create one (see
+ * ./ownership.ts). A session is only included when its `@tandem_engine` tag is
+ * a known tmux-hosted engine id AND its `@tandem_owner` tag exactly matches
+ * this installation's durable owner id (binding — Phase 2 correction E:
+ * "Missing/mismatched tmux provenance must never appear as drivable").
+ */
+export async function listLiveTmuxSessions(
+  deps: LiveListingDependencies = {},
+): Promise<LiveTmuxSession[]> {
+  const ownerIdProvider = deps.ownerIdProvider ?? makeOwnerIdProvider()
+  const tmuxFn = deps.tmuxFn ?? tmux
+  const provenanceReader = deps.provenanceReader ?? readSessionProvenance
   let raw: string
   try {
-    raw = await tmux([
-      'list-sessions',
-      '-F',
-      '#{session_name}\t#{session_created}\t#{pane_current_path}',
-    ])
+    raw = await tmuxFn(['list-sessions', '-F', '#{session_name}\t#{session_created}\t#{pane_current_path}'])
   } catch {
     return [] // tmux absent or no server running
   }
-  const out: LiveTmuxSession[] = []
+  const candidates: { name: string; created: string; cwd: string }[] = []
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue
     const [name, created, cwd] = line.split('\t')
     if (!name || !name.startsWith(SESSION_PREFIX)) continue
+    const bareName = name.slice(SESSION_PREFIX.length)
+    if (!SESSION_NAME_RE.test(bareName) || RELAY_NAME_RE.test(bareName)) continue
+    candidates.push({ name: bareName, created, cwd })
+  }
+  if (candidates.length === 0) return []
+
+  const expectedOwner = await ownerIdProvider()
+  const out: LiveTmuxSession[] = []
+  for (const c of candidates) {
+    const provenance = await provenanceReader(c.name)
+    if (!provenance.owner || provenance.owner !== expectedOwner) continue
+    if (!TMUX_ENGINE_IDS.has(provenance.engine as EngineId)) continue
     out.push({
-      name: name.slice(SESSION_PREFIX.length),
-      target: name,
-      cwd: cwd || HOME,
-      createdAt: Number(created) * 1000 || Date.now(),
+      name: c.name,
+      target: SESSION_PREFIX + c.name,
+      engine: provenance.engine as EngineId,
+      cwd: c.cwd || HOME,
+      createdAt: Number(c.created) * 1000 || Date.now(),
     })
   }
   return out
 }
 
-// ---- ~/.claude/projects history (best-effort) -----------------------------
-
-function decodeProjectDir(name: string): string {
-  return name.replace(/-/g, '/')
-}
-
-function extractText(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content
-      .map((b) => (b && typeof b === 'object' && 'text' in b ? String((b as { text: unknown }).text) : ''))
-      .join(' ')
-      .trim()
-  }
-  return ''
-}
-
-async function readHistoryFile(dir: string, file: string): Promise<SessionInfo | undefined> {
-  const id = file.replace(/\.jsonl$/, '')
-  const full = join(dir, file)
-  let st
-  try {
-    st = await stat(full)
-  } catch {
-    return undefined
-  }
-  let cwd = decodeProjectDir(dir.slice(PROJECTS_DIR.length + 1))
-  let lastMessage = ''
-  try {
-    const rawText = await readFile(full, 'utf8')
-    const lines = rawText.split('\n').filter((l) => l.trim())
-    let cwdFound = false
-    for (const line of lines) {
-      let o: Record<string, unknown>
-      try {
-        o = JSON.parse(line) as Record<string, unknown>
-      } catch {
-        continue
-      }
-      if (!cwdFound && typeof o['cwd'] === 'string') {
-        cwd = o['cwd'] as string
-        cwdFound = true
-      }
-      const type = o['type']
-      if (type === 'user' || type === 'assistant') {
-        const msg = o['message'] as { content?: unknown } | undefined
-        const txt = extractText(msg?.content)
-        if (txt) lastMessage = txt
-      }
-    }
-  } catch {
-    /* keep decoded cwd + empty lastMessage */
-  }
-  return {
-    id,
-    project: cwd.split('/').filter(Boolean).pop() ?? cwd,
-    cwd,
-    lastMessage: lastMessage.slice(0, 200),
-    updatedAt: st.mtimeMs,
-    live: false,
-  }
-}
-
-async function readHistory(): Promise<SessionInfo[]> {
-  let projectDirs: string[]
-  try {
-    projectDirs = await readdir(PROJECTS_DIR)
-  } catch {
-    return []
-  }
-  const all: SessionInfo[] = []
-  for (const projDir of projectDirs) {
-    const dir = join(PROJECTS_DIR, projDir)
-    let files: string[]
-    try {
-      const dstat = await stat(dir)
-      if (!dstat.isDirectory()) continue
-      files = (await readdir(dir)).filter((f) => f.endsWith('.jsonl'))
-    } catch {
-      continue
-    }
-    for (const file of files) {
-      const info = await readHistoryFile(dir, file)
-      if (info) all.push(info)
-    }
-  }
-  return all
-}
-
-// ---- merged listing -------------------------------------------------------
+// ---- listing ----------------------------------------------------------------
 
 /**
- * List sessions for the MCP `list_sessions` tool: LIVE ccm-* tmux sessions first
- * (with attach hint), then recent ~/.claude/projects history. Sorted newest
- * first, limited.
+ * List sessions for the MCP `list_sessions` tool: LIVE, provenance-verified
+ * ccm-* tmux sessions ONLY (with attach hint and engine). No history, no
+ * sessions Tandem did not create. Sorted newest first, limited.
  */
 export async function listSessions(
-  opts: { limit?: number; project?: string } = {},
+  opts: {
+    limit?: number
+    project?: string
+    allowlist?: string[]
+    enabledEngines?: Set<EngineId>
+    listingDependencies?: LiveListingDependencies
+  } = {},
 ): Promise<{ sessions: SessionInfo[] }> {
   const limit = opts.limit ?? 20
-  const [live, history] = await Promise.all([listLiveTmuxSessions(), readHistory()])
+  const allowlist = opts.allowlist ?? buildAllowlist()
+  const enabledEngines = opts.enabledEngines ?? buildEnabledEngines()
+  const live = await listLiveTmuxSessions(opts.listingDependencies)
 
-  const all: SessionInfo[] = []
-  for (const s of live) {
-    all.push({
+  // Registry entries are sessions this running bridge already admitted. This
+  // is also the only source for Hermes, which has no tmux inventory and is
+  // deliberately never discovered by listing a gateway or personal files.
+  const registered = (
+    await Promise.all(
+      [...registry.values()].map(async (session) => ({ session, alive: await session.isAlive().catch(() => false) })),
+    )
+  )
+    .filter(({ session, alive }) => alive && enabledEngines.has(session.engine) && !RELAY_NAME_RE.test(session.id))
+    .map(({ session }): SessionInfo => ({
+      id: session.id,
+      engine: session.engine,
+      project: session.engine === 'hermes'
+        ? 'hermes'
+        : session.cwd.split('/').filter(Boolean).pop() ?? session.cwd,
+      cwd: session.cwd,
+      live: true,
+      updatedAt: Date.now(),
+      attachHint: session.attachHint(),
+    }))
+
+  const registeredIds = new Set(registered.map((s) => s.id))
+  const adoptedCandidates: SessionInfo[] = live
+    .filter(
+      (s) =>
+        !registeredIds.has(s.name) &&
+        enabledEngines.has(s.engine) &&
+        isCwdAllowed(s.cwd, allowlist),
+    )
+    .map((s) => ({
       id: s.name,
+      engine: s.engine,
       project: s.cwd.split('/').filter(Boolean).pop() ?? s.cwd,
       cwd: s.cwd,
-      lastMessage: '',
-      updatedAt: s.createdAt,
       live: true,
+      updatedAt: s.createdAt,
       attachHint: `tmux attach -t ${s.target}`,
-    })
-  }
-  for (const h of history) all.push(h)
+    }))
+
+  const all = [...registered, ...adoptedCandidates]
 
   const filtered = opts.project
     ? all.filter((s) => s.cwd.includes(opts.project as string) || s.project === opts.project)
     : all
 
-  filtered.sort((a, b) => {
-    // Live sessions always sort above history.
-    if (a.live !== b.live) return a.live ? -1 : 1
-    return b.updatedAt - a.updatedAt
-  })
+  filtered.sort((a, b) => b.updatedAt - a.updatedAt)
   return { sessions: filtered.slice(0, limit) }
 }

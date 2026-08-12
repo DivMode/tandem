@@ -5,13 +5,18 @@
   "license": "MIT",
   "author": "Max Medawar",
   "type": "module",
-  "description": "An MCP bridge that lets a chat AI drive interactive Claude Code sessions on your own machine, over your own free Cloudflare quick tunnel.",
+  "description": "A self-hosted MCP bridge for orchestrating Claude, Codex, shell, and Hermes sessions across your own Tailscale-connected devices.",
   "keywords": [
     "mcp",
     "claude",
+    "multi-agent",
+    "orchestration",
+    "codex",
     "claude-code",
+    "hermes",
     "tmux",
-    "cloudflare-tunnel",
+    "tailscale",
+    "multi-device",
     "bridge"
   ],
   "repository": {
@@ -22,22 +27,40 @@
   "bugs": {
     "url": "https://github.com/Maxmedawar/tandem/issues"
   },
+  "files": [
+    ".env.example",
+    "bridge",
+    "src",
+    "skills",
+    "assets/tandem-logo.png",
+    "tandem-orchestration.zip",
+    "setup.sh",
+    "SECURITY.md",
+    "SETUP.md",
+    "SETUP-PROMPT.md"
+  ],
   "engines": {
     "node": ">=22.6"
   },
   "scripts": {
     "start": "node --experimental-strip-types src/server.ts",
     "start:stdio": "node --experimental-strip-types src/stdio-server.ts",
+    "start:device": "node --experimental-strip-types src/device-server.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
-    "zod": "^3.24.0"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.6.2",
+    "ws": "^8.18.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.13",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0"
+    "vitest": "^4.1.10"
   }
 }

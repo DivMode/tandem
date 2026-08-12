@@ -1,81 +1,54 @@
-# tandem - one-paste setup
+# Let your coding agent install Tandem
 
-Paste the prompt below into a new Claude Code session. It does the whole install for you and pauses with simple instructions whenever you need to click something in your own account.
+Paste this into Claude Code, Codex, or another trusted local coding agent on the computer you want to use as the Tandem hub.
 
-(You need Claude Code installed first: `npm i -g @anthropic-ai/claude-code`, which needs Node 22.6+. Then run `claude`.)
+```text
+Install Tandem on this computer for me from:
+https://github.com/Maxmedawar/tandem
 
----
+Tandem lets an MCP-capable browser chat or AI client see, start, steer, and stop
+my coding agents across all of my enrolled computers.
 
-```
-You are setting up "tandem" on this machine for me. tandem is an MCP bridge (public repo: https://github.com/Maxmedawar/tandem) that lets my chat AI drive Claude Code sessions here over a persistent Tailscale Funnel URL. Do the whole setup yourself and only stop when you genuinely need me to click something in my own account.
+Do the setup yourself. Keep explanations short. Stop only when you need me to
+sign in, approve an account setting, or answer a required question.
 
-<rules>
-- Run network and tailscale commands plainly (macOS has no `timeout` command, so do NOT prefix anything with `timeout 40` or `gtimeout 40`). Where a command supports its own time limit, use it — e.g. the /health check uses `curl --max-time 40 ...`. If a command hangs or errors, treat it as a failure, tell me plainly, and move to the matching STOP block below.
-- Do the install steps silently. Do not explain what you are about to do or narrate progress. Only talk to me when you hit a STOP block or when you are finished.
-- You CANNOT click inside my browser or my Tailscale account. When a step needs that, use a STOP block: print the exact simple instructions, then wait for me before doing anything else. Never guess past a STOP. When I reply: if I say "continue" or "done", re-check the step worked and move on; if I describe a problem or say I am stuck, help me fix it in plain language, then continue once it is sorted.
-- Keep STOP instructions plain and non-technical: numbered, short, no jargon. Give me the exact link to click when there is one.
-- Never print my token anywhere except the single final MCP URL at the very end.
-</rules>
+Safety rules:
+- Read README.md, SETUP.md, SECURITY.md, and .env.example before changing anything.
+- Preserve unrelated files and working-tree changes.
+- Ask me which exact project folders Tandem may use. Never choose my home folder
+  or a filesystem root. Do not continue until I answer.
+- Ask which extra engines I want. Claude is the only default. Do not enable
+  Codex, Hermes, shell, or Claude permission bypass unless I explicitly request it.
+- Never print or paste a consent password, OAuth token, fleet credential,
+  invitation token, private Tailscale address, or tailnet identity. You may report
+  only the protected local file paths that setup intentionally prints, without
+  reading or copying those files' contents.
+- Never put a secret in a URL, command argument, issue, screenshot, or log.
+- Use Tailscale Funnel only for the public MCP service. Use the separate,
+  tailnet-only Tailscale Serve service for device traffic.
+- Stop if a verification fails. Do not report partial setup as success.
 
-<steps>
-1. PREREQS. Check for: Node 22.6+, tmux, the `claude` CLI, and `tailscale`. Install missing Node / tmux / `claude` using the system package manager (on macOS use Homebrew). For Tailscale on macOS, DO NOT use brew or sudo — installing the standalone app by hand is far more reliable. If `tailscale` is missing on macOS, do this STOP block:
-   PAUSE. Install Tailscale by hand (takes a minute):
-   1. Open this link: https://tailscale.com/download/mac
-   2. Download the standalone Tailscale app (not the Mac App Store version).
-   3. Drag Tailscale into your Applications folder.
-   4. Open it and sign in (any account, it is free).
-   Then come back here and type: continue
-   (On Linux, install with: `curl -fsSL https://tailscale.com/install.sh | sh`.) If any other tool cannot be auto-installed, use a STOP block telling me how to install it.
+Steps:
+1. Check for Node.js 22.6+, tmux, Tailscale, and at least one supported coding
+   agent. Install missing prerequisites with the normal package manager when safe.
+   If an install needs administrator approval, ask me first.
+2. Check whether Tailscale is running and connected. If I must sign in or enable
+   HTTPS or Funnel in my account, give me short numbered instructions and wait.
+3. Clone the repository if it is not already present, then enter the repository.
+4. After I provide the allowed project folders and optional engines, run:
+   TANDEM_CWD_ALLOWLIST=<exact approved folders> ./setup.sh hub
+5. Confirm that setup verified public OAuth, rejected an unauthenticated private
+   device connection, and detected the hub as a local device.
+6. Confirm protected Tandem state is outside the repository and owner-only.
+   Check permissions without displaying any secret contents.
+7. Run npm run typecheck, npm test, and npm audit.
 
-2. TAILSCALE LOGIN. Run `tailscale status`. If it says logged out / needs login / not running, do this STOP block:
-   PAUSE. One quick thing:
-   1. Open the Tailscale app on this computer.
-   2. Click "Log in" and sign in (any account, it is free).
-   3. Wait until it says Connected.
-   Then come back here and type: continue
-
-3. GET THE CODE. If a `tandem` folder is not already here, run `git clone https://github.com/Maxmedawar/tandem.git`. cd into it.
-
-4. FREE THE PORT. Run `lsof -ti:8787 | xargs kill -9 2>/dev/null` to clear any old bridge, ignore errors.
-
-5. TURN ON THE FUNNEL (this is where the two one-time account switches live). Run `tailscale funnel --bg 8787` and read the result:
-   - If it succeeds, continue to step 6.
-   - If the output mentions Funnel is not enabled / not permitted / a node attribute, it will include a link. Do this STOP block, pasting the real link it gave:
-     PAUSE. One quick switch to flip (takes 30 seconds):
-     1. Open this link: <paste the exact link from the output>
-     2. Click the button to turn Funnel on.
-     3. Come back here and type: continue
-   - If the output mentions HTTPS is not enabled / certificates, do this STOP block:
-     PAUSE. One quick switch to flip (takes 30 seconds):
-     1. Open this link: https://login.tailscale.com/admin/dns
-     2. Find "HTTPS Certificates" and click Enable.
-     3. Come back here and type: continue
-   After I type continue, run the same funnel command again. Repeat until it succeeds (I may need to flip both switches, one at a time).
-
-6. START THE BRIDGE + PRINT THE URL. Run `TANDEM_SETUP_MODE=tailscale ./setup.sh`. It installs deps, reuses or makes the token, starts the bridge, and prints the MCP URL. If it asks anything interactively, pick tailscale.
-
-7. VERIFY. Get my funnel hostname from `tailscale status --json` (the DNSName), then run `curl --max-time 40 -s -o /dev/null -w "%{http_code}" https://<that-host>/health`. It must print 200. If it does not, tell me plainly what failed and stop.
-</steps>
-
-<finish>
-When /health returns 200, print exactly this and nothing else after it:
-
-tandem is live. Here is your connector:
-
-   URL:  <the full MCP URL ending in /<token>/mcp>
-
-To connect it in Claude.ai:
-   1. In the left sidebar, click your name / "Customize", then click "Connectors".
-   2. At the top of the Connectors panel, click the three dots (...) and choose "Add custom connector".
-   3. Give it a name: Tandem
-   4. Paste the URL above into the URL field (the second box). Click enter.
-   5. That is it - you are set.
-
-Then install the "Claude for Chrome" extension and sign in, and in any chat say: start tandem
-
-Now physically reveal the skill bundle so I can drag it: on macOS run `open -R <repo path>/tandem-orchestration.zip` (opens Finder with the file already selected/highlighted, ready to drag); on Linux run `xdg-open <repo path>` (opens the folder). Then print:
-
-A Finder window just opened with tandem-orchestration.zip selected. In Claude.ai, go to Settings > Customize > Skills, click + / Create skill, then drag that file in (or click to browse to it), and toggle it on. Your Claude Code already has all 3 skills.
-
-(If Claude.ai ever asks you to "sign in" to the connector instead of just adding it, the URL is wrong - re-paste the full one above, including the part after the last slash.)
+When everything passes, tell me only:
+- that Tandem is ready;
+- the stable MCP URL reported by setup;
+- where setup stored the consent password, without reading it;
+- where setup stored the first device invitation, without reading it;
+- that I can run ./setup.sh invite once for each additional computer;
+- that an invitation expires after 15 minutes if unused, but an enrolled device
+  stays connected and reconnects automatically.
 ```

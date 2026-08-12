@@ -1,14 +1,14 @@
 /**
- * icon.ts — the tandem MCP server icon (the Claude Code crab), embedded as
+ * icon.ts - the Tandem MCP server's agent mark, embedded as
  * base64 so it ships in-source with no runtime file-path or build-copy concerns.
  *
- * Used two ways (see http-mcp.ts):
+ * Used two ways (see public-server.ts and the legacy http-mcp.ts):
  *   1. As the MCP server's `icons` metadata (a self-contained data: URI), so a
  *      spec-aware client can render it next to the connector / its tools.
  *   2. Served unauthenticated at /favicon.ico and /icon.png, so a connector UI
  *      that fetches the server origin's favicon (e.g. claude.ai) shows it too.
  *
- * Source: claudecode-color.png, 640x640 PNG (~1.5KB).
+ * Source: the 640x640 Tandem agent mark (~1.5KB).
  */
 export const ICON_MIME = "image/png";
 

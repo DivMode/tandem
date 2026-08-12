@@ -1,96 +1,78 @@
 ---
 name: tandem-engineering-workflow
-description: "The STANDARD engineering workflow for the tandem system. Trigger on any development, debugging, or feature work driven through tandem — build, create, implement, fix, add, develop, code, debug, or when a Claude Code session's output is being reviewed, or a plan/phase is being discussed. This is the discipline the director and the manager layer follow. If anyone tries to skip steps (no spec, no plan mode, no plan review), STOP THEM. When triggered, begin your first message with 📋📋📋📋📋 so the user knows the workflow is active."
+description: "Engineering discipline for development work orchestrated through Tandem, regardless of whether the worker is Claude, Codex, or another supported engine. Trigger for implementation, debugging, review, test, or architecture work. Begin the first response with 📋📋📋📋📋 when active."
 ---
 
-# Tandem Engineering Workflow
+# Tandem engineering workflow
 
-📋📋📋📋📋 — When you see this, the engineering workflow is active.
+📋📋📋📋📋 The engineering workflow is active.
 
-Start EVERY response in this workflow with `📋📋📋📋📋`.
+This skill defines how an MCP-capable director should plan, delegate, verify, and report engineering work performed through Tandem. It is engine-neutral. Engine-specific features, such as Claude model controls or the Claude-only relay, are optional special cases.
 
-This is the **standard** every layer holds to. In tandem the director (chatbot), the manager, and the worker are all AI — the human is only in the loop when they want to be. This workflow defines the review discipline that keeps autonomous work honest.
+## Roles
 
----
+- Human: sets the goal, grants authority, makes consequential product decisions.
+- Director: clarifies the outcome, selects devices and engines, assigns bounded work, and owns the final answer.
+- Worker session: implements or investigates one defined part of the goal.
+- Reviewer session: independently checks the result when the risk or scope warrants it.
 
-## ROLES (all AI except the human)
+One session may hold several roles on a small task. Keep ownership explicit on larger work.
 
-- **Human** — sets the goal, makes final calls, steps out whenever.
-- **Director (chatbot: Claude.ai or ChatGPT)** — brainstorms with the human, writes the spec, audits final output, drives sessions over the tandem MCP.
-- **Manager CC session** — owns the build: plans phases, reviews the worker, never rubber-stamps, escalates blockers. Follows THIS workflow.
-- **Worker CC session** — does the hands-on work and spawns agent teams (see `tandem-agentic-engineering`).
+## Workflow
 
-The old "human pastes between two windows" model is gone. The director drives the sessions, and the manager reports back through the browser loop (see `tandem-orchestration`). The steps below are the quality gates each AI layer enforces on the next.
+### Understand
 
----
+1. Restate the concrete outcome and definition of done.
+2. Inspect the repository, current branch, local instructions, and existing changes before editing.
+3. Identify what is unknown and research only what affects the decision.
+4. Push back on unsafe, contradictory, or needlessly broad requests with concrete reasons.
 
-## THE WORKFLOW
+### Plan
 
-### PHASE 0: BRAINSTORM & RESEARCH
-1. The human gives the goal in as much detail as they have.
-2. Don't guess — research: search GitHub for implementations, look for prior art, libraries, patterns; verify what's actually possible and what the best approach is.
-3. Give honest takes. If something is a bad idea, say so. If there's a better way, present it with evidence.
-4. Back and forth until the approach is agreed.
+5. Break work into phases with clear file ownership and tests.
+6. Decide which assignments are independent and which depend on earlier output.
+7. Select a device and engine based on advertised capability and data locality. Do not route by guesswork.
+8. Use a planning mode when the chosen engine provides one and the work is non-trivial. Otherwise ask the worker for a written plan before implementation.
+9. Review the plan before authorizing broad writes. Correct scope drift before code is changed.
 
-### PHASE 1: IMPLEMENTATION PLAN
-5. The director writes the full implementation plan — phases, files, architecture, dependencies, tests, Definition of Done.
-6. The human (or the director on the human's behalf) reviews and tweaks it.
-7. Honest response — push back on bad tweaks, accept good ones.
-8. Agree on the final plan.
+### Build
 
-### PHASE 2: SPEC FILE
-9. Write the plan to `.claude/specs/[feature].md` in the project — the full implementation plan, architecture decisions, phase breakdown, file structure, agent roster, and all context the sessions need. This file carries context across fresh sessions.
+10. Give each worker a bounded assignment, the relevant context, and a measurable completion condition.
+11. Preserve user changes and avoid unrelated refactors.
+12. Keep security controls explicit: narrow cwd allowlists, opt-in engines, no secret output, and no permission bypass unless authorized.
+13. Poll a running turn instead of resending its prompt.
+14. Read the worker's actual result. A completion claim is not verification.
 
-### PHASE 3: PHASE EXECUTION (PLAN MODE FIRST)
-10. The director hands the manager the Phase 1 task (with the spec path).
-11. The work goes into Claude Code **in PLAN MODE first** — never straight to execution.
-12. Claude Code returns a plan.
-13. **The plan is reviewed before execution** — by the manager, and by the director when it's a real feature. If it's wrong, correct it before any code is written.
-14. Once approved, execute.
+### Verify
 
-### PHASE 4: AUDIT & DEBUG
-15. Audit the output against the spec. Read the actual diff (`git diff`), don't trust the summary.
-16. If bugs exist, follow **Reproduce -> Fix -> Verify**:
-    - **Reproduce:** confirm the bug is real by running the failing test/command.
-    - **Fix:** apply a targeted fix.
-    - **Verify:** re-run the same test to confirm the fix.
-    - **Full suite:** run all tests to confirm nothing else broke.
-17. Clean -> next phase. Issues -> stay here until resolved.
+15. Inspect the diff or resulting artifact directly.
+16. Run focused tests first, then the full relevant suite.
+17. Check failure paths, boundaries, cleanup, and compatibility, not only the happy path.
+18. Use an independent reviewer for high-risk changes involving authentication, remote execution, networking, secrets, or destructive operations.
+19. Fix findings and repeat verification until no required work remains.
 
-### PHASE 5: NEXT PHASE
-18. Move to the next phase prompt.
-19. **Open a FRESH Claude Code session** for it (clean context window). The spec file carries over because it's in the project.
-20. Repeat from Phase 3.
+### Report
 
----
+20. Lead with the outcome.
+21. State what changed, what was verified, and what remains limited.
+22. Do not claim deployment, merge, commit, publication, or external delivery unless it actually happened.
+23. Do not expose tokens, personal device identity, private URLs, paths, or raw session output in the report.
 
-## RULES — HOLD EVERY LAYER ACCOUNTABLE
+## Multi-device rules
 
-- **No skipping the spec.** Every project/feature gets a spec file before any code is written.
-- **Plan mode FIRST. Always.** If a prompt is about to run in Claude Code without plan mode, stop it.
-- **Review the plan.** Claude Code's plan gets reviewed before execution is approved.
-- **No cowboy coding.** No "just try this real quick" outside the workflow.
-- **Fresh sessions per phase.** Never continue a stale, compacted session for a new phase.
-- **Reproduce -> Fix -> Verify.** No blind fixes. Every bug is reproduced first, fixed, then verified.
-- **No assumptions.** Research before answering. Verify before claiming something works.
-- **Honest feedback only.** Never agree just to be agreeable. If it's wrong, say it plainly.
+- Call `list_devices` before choosing a remote target.
+- Preserve global names such as `studio:review` exactly.
+- A disconnected device is a recoverable operational state, not evidence that its work failed or succeeded.
+- Re-run selection only for new sessions. Existing global names remain pinned.
+- Integrate cross-device work in one explicitly owned place.
 
----
+## Quality gate
 
-## ACCOUNTABILITY TRIGGERS
+The work is ready only when:
 
-| Someone does this | You say this |
-|---|---|
-| Tries to code without a spec | "📋 Stop. We need the spec first. What are we building?" |
-| Runs a prompt without plan mode | "📋 Hold on. Plan mode first." |
-| Skips reviewing Claude Code's plan | "📋 Wait. Review the plan before executing." |
-| Tries to fix a bug without reproducing | "📋 Reproduce it first. Run the failing test, confirm it's broken, then fix." |
-| Continues in a stale session for a new phase | "📋 Fresh session for this phase." |
-| Asks you to just agree | "📋 I don't agree yet. Here's why: ..." |
-| Rubber-stamps a diff without reading it | "📋 Read the actual diff and run the tests. No vibes approvals." |
-
----
-
-## EMOJI SIGNAL
-
-📋📋📋📋📋 = Engineering workflow active. Appears at the START of every message in this workflow.
+- the requested behavior exists;
+- tests pass in proportion to risk;
+- security and privacy boundaries still hold;
+- documentation matches actual behavior;
+- the diff contains no unexplained unrelated changes;
+- the director can explain remaining limitations without relying on a worker's unsupported claim.

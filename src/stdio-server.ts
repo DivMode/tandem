@@ -2,16 +2,15 @@
  * tandem — local stdio entrypoint (desktop, no tunnel).
  *
  * Runs the SAME MCP server as the HTTP transport (src/mcp-server.ts → the same
- * router, the same 6 tools) over stdio, for desktop chat apps (Claude Desktop,
- * ChatGPT desktop) that spawn the bridge themselves as a child process. Nothing
+ * router and the same tools) over stdio, for MCP desktop apps and local agents
+ * that spawn the bridge as a child process. Nothing
  * listens on the network and no tunnel is involved.
  *
  * TRUST MODEL (why there is NO token here): a stdio server can only be driven
  * by whoever spawned it — a local app running as the same user, i.e. the same
- * trust as the user's own terminal. TANDEM_TOKEN exists to gate the
- * NETWORK-exposed HTTP path (src/server.ts) and stays required there; it is
- * deliberately not required for stdio. The cwd allowlist is still enforced by
- * the router before every spawn, exactly as on the HTTP path.
+ * trust as the user's own terminal. OAuth protects the public network path,
+ * while stdio deliberately needs no network credential. The cwd allowlist is
+ * still enforced before every spawn, exactly as on the HTTP path.
  *
  * PROTOCOL HYGIENE: stdout is the JSON-RPC wire. Every diagnostic in this
  * process goes to stderr (the router/engine already follow this rule).
@@ -19,12 +18,18 @@
 
 // Desktop apps spawn this process from an arbitrary cwd, so locate .env next to
 // package.json via the script's own path — never via process.cwd(). A missing
-// .env is fine (the engine falls back to its $HOME-derived defaults).
+// .env is fine, but an explicit allowlist is still required before sessions open.
 import { fileURLToPath } from "node:url";
+import { loadProtectedRuntimeConfigFromEnv } from "./runtime-config.ts";
 try {
-  process.loadEnvFile(fileURLToPath(new URL("../.env", import.meta.url)));
+  const loadedProtectedConfig = await loadProtectedRuntimeConfigFromEnv();
+  if (!loadedProtectedConfig) process.loadEnvFile(fileURLToPath(new URL("../.env", import.meta.url)));
 } catch {
-  /* no .env — defaults apply */
+  if (process.env.TANDEM_CONFIG_FILE) {
+    console.error("tandem stdio will not start: protected runtime configuration is unavailable or unsafe");
+    process.exit(1);
+  }
+  /* no development .env; explicit environment remains supported */
 }
 
 // Bridge the user-facing TANDEM_* config to the engine's CCM_* names. This MUST
@@ -36,11 +41,13 @@ if (process.env.TANDEM_DEFAULT_CWD) process.env.CCM_DEFAULT_CWD = process.env.TA
 const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
 const { buildMcpServer } = await import("./mcp-server.ts");
 const { getAllowlist } = await import("../bridge/router.ts");
+const { createFleetRuntime, buildDefaultDeviceIdFromEnv } = await import("../bridge/fleet-runtime.ts");
+const { capabilityReport } = await import("../bridge/engine-registry.ts");
 
 const allowlist = getAllowlist();
 if (allowlist.length === 0) {
   console.error(
-    "⚠  cwd allowlist is empty — open_session/relay will refuse every directory.\n" +
+    "⚠  cwd allowlist is empty: open_session/relay will refuse every directory.\n" +
       "   Set TANDEM_CWD_ALLOWLIST to the folders the bridge may work in.",
   );
 }
@@ -48,8 +55,13 @@ if (allowlist.length === 0) {
 // One long-lived server for the whole process (the SDK's stdio model), unlike
 // the HTTP path's per-request instances. Session/relay state lives in the
 // engine modules either way.
-const server = buildMcpServer();
+const localCapabilities = await capabilityReport();
+const fleet = createFleetRuntime({
+  defaultDeviceId: buildDefaultDeviceIdFromEnv(),
+  localEngines: localCapabilities.filter((entry) => entry.enabled && entry.available).map((entry) => entry.engine),
+});
+const server = buildMcpServer(fleet);
 await server.connect(new StdioServerTransport());
 
 console.error("tandem MCP bridge ready on stdio (local, no token)");
-console.error(`cwd allowlist: ${allowlist.join(":") || "(empty — set TANDEM_CWD_ALLOWLIST)"}`);
+console.error(`cwd allowlist roots: ${allowlist.length}`);
