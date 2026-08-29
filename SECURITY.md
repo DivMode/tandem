@@ -43,12 +43,14 @@ Every fleet machine must be controlled by the same operator and permitted by the
 
 ### Execution authority
 
-- `TANDEM_CWD_ALLOWLIST` is canonicalized and boundary checked before each tmux-backed spawn or owned-session reattachment.
+- `TANDEM_CWD_ALLOWLIST` is canonicalized and boundary checked before each terminal-backend spawn or owned-session reattachment.
 - An empty allowlist denies session creation.
 - Setup additionally refuses relative paths, missing directories, and filesystem roots.
 - The allowlist is a starting-directory admission gate, not an OS sandbox.
 - Only sessions with Tandem's exact engine and installation ownership tags may be driven after restart.
 - Arbitrary tmux panes are never adopted.
+- With `TANDEM_TERMINAL_BACKEND=herdr`, Tandem uses Herdr's local Unix-socket API directly. It creates no-focus workspaces, starts only Claude or Codex agents, and rediscovers only workspaces carrying this installation's owner/session/engine metadata. Reads, semantic waits, interrupts, native agent-session identity, and persistence remain Herdr-owned. Tandem never focuses or adopts unrelated Herdr workspaces.
+- The configured Herdr API path must be an owner-matching Unix socket. The selected Herdr server must already be running; Tandem never resets or reloads its configuration.
 - Claude permission bypass is off. Only exact `TANDEM_ALLOW_BYPASS=1` enables it.
 - The unattended relay requires that explicit bypass and remains Claude-only.
 - Codex, shell, and Hermes are disabled unless explicitly enabled.

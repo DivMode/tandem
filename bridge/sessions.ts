@@ -2,15 +2,12 @@
  * sessions.ts — the live DrivableSession registry, live-session listing, and
  * the cwd-allowlist security helpers (the trust boundary the reviewer scrutinizes).
  *
- * A "session" is an interactive engine (claude/codex/shell) TUI running in a
- * tmux session named "ccm-<name>", or an attached Hermes writable-agent id
- * (not tmux-hosted). listSessions() reports ONLY sessions Tandem currently
- * OWNS and can safely address (binding — Phase 2 correction E): live ccm-*
- * tmux sessions whose `@tandem_engine`/`@tandem_owner` provenance tags match
- * THIS installation (see ./ownership.ts and ./terminal-session.ts
- * readSessionProvenance), each tagged with its engine. A tmux session with
- * missing or mismatched provenance is NEVER listed as drivable, even if its
- * name matches the ccm-* prefix. There is no history surface: Tandem does not
+ * A "session" is an interactive engine TUI owned by the selected native
+ * terminal backend, or an attached Hermes writable-agent id. listSessions()
+ * reports ONLY sessions Tandem currently owns and can safely address: either
+ * provenance-tagged ccm-* tmux sessions or ownership-token-tagged Herdr
+ * workspaces. Missing or mismatched provenance is never listed as drivable.
+ * There is no history surface: Tandem does not
  * scan or report ~/.claude/projects (or any other engine's local history) —
  * doing so would leak past prompts/paths this process never owned or created.
  *
@@ -25,13 +22,15 @@
  */
 
 import { execFile } from 'node:child_process'
-import { realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, join, resolve, sep } from 'node:path'
 import type { DrivableSession, EngineId } from './drivable.ts'
+import { buildAllowlist, isCwdAllowed, safeResolve } from './cwd-allowlist.ts'
 import { buildEnabledEngines } from './engine-registry.ts'
 import { makeOwnerIdProvider, type OwnerIdProvider } from './ownership.ts'
 import { readSessionProvenance } from './terminal-session.ts'
+import { terminalBackend, type OwnedTerminalSession, type TerminalBackend } from './terminal-backend.ts'
+
+export { buildAllowlist, isCwdAllowed, safeResolve } from './cwd-allowlist.ts'
 
 const HOME = homedir()
 const SESSION_PREFIX = 'ccm-'
@@ -51,66 +50,8 @@ export interface SessionInfo {
   cwd: string
   live: boolean
   updatedAt: number
-  /** how the owner attaches to watch/type (a tmux attach command). */
+  /** how the owner attaches to watch/type through the selected runtime. */
   attachHint: string
-}
-
-// ---- allowlist (the security boundary) ------------------------------------
-
-/**
- * Resolve to an absolute, symlink-canonical path. For a path that doesn't yet
- * exist, realpath the deepest existing ancestor and re-append the rest, so a
- * not-yet-created child of an allowlisted (possibly symlinked) root still
- * canonicalizes under that root.
- */
-export function safeResolve(p: string, home = HOME): string {
-  let abs = resolve(p.replace(/^~(?=$|\/)/, home))
-  const tail: string[] = []
-  for (;;) {
-    try {
-      const real = realpathSync(abs)
-      return tail.length ? join(real, ...tail.reverse()) : real
-    } catch {
-      const parent = dirname(abs)
-      if (parent === abs) return tail.length ? join(abs, ...tail.reverse()) : abs
-      // basename/dirname handle the filesystem root correctly. Slicing by
-      // `parent.length + 1` turned `/allowed` into `llowed` because `/` already
-      // contains the separator.
-      tail.push(basename(abs))
-      abs = parent
-    }
-  }
-}
-
-/** Build only explicit allowlist roots. Missing or blank configuration fails closed. */
-export function buildAllowlist(
-  envValue = process.env.CCM_CWD_ALLOWLIST,
-  home = HOME,
-): string[] {
-  if (!envValue?.trim()) return []
-  return envValue
-    .split(':')
-    .map((p) => p.trim())
-    .filter(Boolean)
-    .map((p) => safeResolve(p, home))
-}
-
-/** True if `candidate` resolves to an allowlisted root or a descendant of one.
- *  Prefix comparison uses a trailing separator so "/srv/code" does NOT match
- *  "/srv/code-evil". */
-export function isCwdAllowed(candidate: string, allowlist: string[]): boolean {
-  let real: string
-  try {
-    real = safeResolve(candidate)
-  } catch {
-    return false
-  }
-  for (const root of allowlist) {
-    if (real === root) return true
-    const prefix = root.endsWith(sep) ? root : root + sep
-    if (real.startsWith(prefix)) return true
-  }
-  return false
 }
 
 // ---- live DrivableSession registry -----------------------------------------
@@ -161,6 +102,7 @@ interface LiveTmuxSession {
   engine: EngineId
   cwd: string
   createdAt: number
+  attachHint: string
 }
 
 /**
@@ -207,6 +149,7 @@ export async function listLiveTmuxSessions(
       engine: provenance.engine as EngineId,
       cwd: c.cwd || HOME,
       createdAt: Number(c.created) * 1000 || Date.now(),
+      attachHint: `tmux attach -t ${SESSION_PREFIX}${c.name}`,
     })
   }
   return out
@@ -226,12 +169,19 @@ export async function listSessions(
     allowlist?: string[]
     enabledEngines?: Set<EngineId>
     listingDependencies?: LiveListingDependencies
+    backend?: TerminalBackend
   } = {},
 ): Promise<{ sessions: SessionInfo[] }> {
   const limit = opts.limit ?? 20
   const allowlist = opts.allowlist ?? buildAllowlist()
   const enabledEngines = opts.enabledEngines ?? buildEnabledEngines()
-  const live = await listLiveTmuxSessions(opts.listingDependencies)
+  let live: Array<LiveTmuxSession | OwnedTerminalSession>
+  const backend = opts.backend ?? terminalBackend
+  if (backend.kind === 'herdr') {
+    live = backend.listOwned ? await backend.listOwned() : []
+  } else {
+    live = await listLiveTmuxSessions(opts.listingDependencies)
+  }
 
   // Registry entries are sessions this running bridge already admitted. This
   // is also the only source for Hermes, which has no tmux inventory and is
@@ -268,8 +218,8 @@ export async function listSessions(
       project: s.cwd.split('/').filter(Boolean).pop() ?? s.cwd,
       cwd: s.cwd,
       live: true,
-      updatedAt: s.createdAt,
-      attachHint: `tmux attach -t ${s.target}`,
+      updatedAt: 'createdAt' in s ? s.createdAt : s.updatedAt,
+      attachHint: s.attachHint,
     }))
 
   const all = [...registered, ...adoptedCandidates]

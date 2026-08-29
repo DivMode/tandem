@@ -186,7 +186,7 @@ describe("Tailscale hub setup", () => {
   it("creates OAuth and fleet state outside the repo without printing credentials", { timeout: 120_000 }, () => {
     const sb = makeSandbox();
     const result = runSetup(sb, ["hub"], { TANDEM_ENABLED_ENGINES: "codex" });
-    expect(result.status).toBe(0);
+    expect(result.status, result.out).toBe(0);
     expect(result.out).toContain("Tandem hub is ready");
     expect(result.out).toContain("https://synthetic-hub.example.ts.net/mcp");
     expect(result.out).not.toContain("/mcp?");
@@ -327,6 +327,27 @@ describe("device and desktop setup", () => {
     expect(connector.mcpServers.tandem.command).toBe("node");
     expect(connector.mcpServers.tandem.env.TANDEM_CONFIG_FILE).toBe(statePath(sb, "desktop", "config.json"));
     expect(readFileSync(statePath(sb, "desktop", "config.json"), "utf8")).not.toContain("TOKEN");
+  });
+
+  it("writes Herdr desktop settings after verifying an existing persistent session", { timeout: 120_000 }, () => {
+    const sb = makeSandbox(null);
+    stubBinary(join(sb.dir, "bin"), "herdr", `#!/bin/sh
+if [ "$1" = "session" ] && [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+  echo '{"sessions":[{"name":"default","running":true,"socket_path":"/tmp/herdr.sock"}]}'
+  exit 0
+fi
+exit 1
+`);
+    const result = runSetup(sb, ["desktop"], {
+      TANDEM_TERMINAL_BACKEND: "herdr",
+      TANDEM_HERDR_WORKSPACE_PATH: `${join(sb.dir, "bin")}:/usr/bin`,
+    });
+    expect(result.status, result.out).toBe(0);
+    const desktopConfig = JSON.parse(readFileSync(statePath(sb, "desktop", "config.json"), "utf8"));
+    expect(desktopConfig.TANDEM_TERMINAL_BACKEND).toBe("herdr");
+    expect(desktopConfig.TANDEM_HERDR_SESSION).toBe("default");
+    expect(desktopConfig.TANDEM_HERDR_BIN).toBe(join(sb.dir, "bin", "herdr"));
+    expect(desktopConfig.TANDEM_HERDR_WORKSPACE_PATH).toBe(`${join(sb.dir, "bin")}:/usr/bin`);
   });
 });
 

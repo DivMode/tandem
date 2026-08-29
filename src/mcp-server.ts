@@ -95,7 +95,7 @@ export function buildMcpServer(fleet?: FleetRuntime): McpServer {
 
   server.tool(
     "open_session",
-    `${BLAST_RADIUS}\n\nOpen or attach to a visible interactive session. Supported engine ids are claude, codex, shell, and hermes. Claude is enabled by default; every other engine needs host opt-in and must be available. Claude, Codex, and shell run in tmux and require an admitted start cwd. Hermes attaches only to an explicitly allowlisted writable agent id through a loopback gateway and does not accept cwd.\n\nClaude permission bypass is off by default. model and effort are also Claude-only. Unknown, disabled, unavailable, or incompatible options fail before spawn or gateway contact. A remote open returns a stable global name in the form "<deviceId>:<localName>". Preserve that exact name for later calls so routing cannot drift.`,
+    `${BLAST_RADIUS}\n\nOpen or attach to a visible interactive session. Supported engine ids are claude, codex, shell, and hermes. Claude is enabled by default; every other engine needs host opt-in and must be available. Claude and Codex use the host's configured native terminal backend (tmux or Herdr) and require an admitted start cwd. Shell is tmux-only. Hermes attaches only to an explicitly allowlisted writable agent id through a loopback gateway and does not accept cwd.\n\nClaude permission bypass is off by default. model and effort are also Claude-only. Unknown, disabled, unavailable, or incompatible options fail before spawn or gateway contact. A remote open returns a stable global name in the form "<deviceId>:<localName>". Preserve that exact name for later calls so routing cannot drift.`,
     {
       name: z.string().optional().describe("Short name (A-Z a-z 0-9 . _ -); auto-generated if omitted. For engine=hermes this is the writable agent id (required, must be allowlisted)."),
       cwd: z.string().optional().describe("Working dir; must be on the allowlist (default the configured cwd). Not supported for engine=hermes."),
@@ -152,7 +152,7 @@ export function buildMcpServer(fleet?: FleetRuntime): McpServer {
 
   server.tool(
     "close_session",
-    `${BLAST_RADIUS}\n\nKill the live tmux session (ends the interactive TUI). Idempotent. Returns { ok, name }.`,
+    `${BLAST_RADIUS}\n\nEnd the interactive TUI. With Herdr this closes only the Tandem-owned, provenance-checked workspace; with tmux it kills the owned tmux session. Idempotent. Returns { ok, name }.`,
     {
       name: z.string().describe("A bare local name (always local), or a fleet-routed \"<deviceId>:<localName>\" name returned by open_session/list_sessions."),
       device: z.string().optional().describe(deviceParamDescription),
@@ -175,7 +175,7 @@ export function buildMcpServer(fleet?: FleetRuntime): McpServer {
 
   server.tool(
     "relay",
-    `${BLAST_RADIUS}\n\nControl the optional persistent Claude-only lead and worker loop. This is not the general multi-engine fleet mechanism and cannot route to a device. start requires TANDEM_ALLOW_BYPASS=1 and fails before opening sessions when bypass is off. The lead parks after a task and can accept more work until stopped or bounded cleanup ends the loop.\n\nActions: start begins a goal; read fetches transcript output; enqueue supplies the next task or answers NEEDS_INPUT; inject steers an actively running task; stop ends the loop. Completion and escalation events follow the README notification policy.`,
+    `${BLAST_RADIUS}\n\nControl the optional persistent Claude-only lead and worker loop. This is not the general multi-engine fleet mechanism and cannot route to a device. It is unavailable with the Herdr terminal backend. start requires TANDEM_ALLOW_BYPASS=1 and fails before opening sessions when bypass is off. The lead parks after a task and can accept more work until stopped or bounded cleanup ends the loop.\n\nActions: start begins a goal; read fetches transcript output; enqueue supplies the next task or answers NEEDS_INPUT; inject steers an actively running task; stop ends the loop. Completion and escalation events follow the README notification policy.`,
     {
       action: z.enum(["start", "read", "inject", "stop", "enqueue"]),
       goal: z.string().optional().describe('action=start: the relay objective.'),

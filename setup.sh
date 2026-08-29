@@ -92,6 +92,39 @@ validate_setup_values() {
   if printf '%s' ",${TANDEM_ENABLED_ENGINES:-}," | grep -Eq '[:,]shell[:,]'; then
     warn "shell grants callers OS-user command execution from an admitted cwd. It is not a sandbox."
   fi
+
+  TANDEM_TERMINAL_BACKEND="${TANDEM_TERMINAL_BACKEND:-tmux}"
+  case "$TANDEM_TERMINAL_BACKEND" in
+    tmux) ;;
+    herdr)
+      if printf '%s' ",${TANDEM_ENABLED_ENGINES:-}," | grep -Eq '[:,]shell[:,]'; then
+        die "The Herdr terminal backend supports Claude and Codex, not shell."
+      fi
+      TANDEM_HERDR_BIN="${TANDEM_HERDR_BIN:-$(command -v herdr || true)}"
+      [ -n "$TANDEM_HERDR_BIN" ] && [ -x "$TANDEM_HERDR_BIN" ] || die "Herdr is required for TANDEM_TERMINAL_BACKEND=herdr."
+      TANDEM_HERDR_SESSION="${TANDEM_HERDR_SESSION:-default}"
+      case "$TANDEM_HERDR_SESSION" in
+        ''|*[!A-Za-z0-9._-]*|[-._]*) die "TANDEM_HERDR_SESSION is invalid." ;;
+      esac
+      if [ -n "${TANDEM_HERDR_WORKSPACE_PATH:-}" ]; then
+        TANDEM_VALIDATE_HERDR_PATH="$TANDEM_HERDR_WORKSPACE_PATH" node -e '
+          const fs = require("node:fs"); const path = require("node:path");
+          const entries = process.env.TANDEM_VALIDATE_HERDR_PATH.split(path.delimiter);
+          if (!entries.length || entries.some((entry) => !entry || !path.isAbsolute(entry) || !fs.statSync(entry).isDirectory())) process.exit(1);
+        ' || die "TANDEM_HERDR_WORKSPACE_PATH must contain only existing absolute directories."
+      fi
+      "$TANDEM_HERDR_BIN" session list --json | TANDEM_SETUP_HERDR_SESSION="$TANDEM_HERDR_SESSION" node -e '
+        const fs=require("node:fs");
+        try {
+          const j=JSON.parse(fs.readFileSync(0,"utf8"));
+          const s=j.sessions?.find((x)=>x.name===process.env.TANDEM_SETUP_HERDR_SESSION);
+          if (!s?.running || typeof s.socket_path!=="string") process.exit(1);
+        } catch { process.exit(1); }
+      ' || die "The selected Herdr session is not running."
+      ;;
+    *) die "TANDEM_TERMINAL_BACKEND must be tmux or herdr." ;;
+  esac
+  export TANDEM_TERMINAL_BACKEND TANDEM_HERDR_BIN TANDEM_HERDR_SESSION TANDEM_HERDR_WORKSPACE_PATH
 }
 
 generate_secret() {
@@ -173,6 +206,10 @@ setup_desktop() {
   secure_directory "$desktop_dir"
   TANDEM_CONFIG_VALUE_TANDEM_CWD_ALLOWLIST="$TANDEM_CWD_ALLOWLIST" \
   TANDEM_CONFIG_VALUE_TANDEM_ENABLED_ENGINES="${TANDEM_ENABLED_ENGINES:-}" \
+  TANDEM_CONFIG_VALUE_TANDEM_TERMINAL_BACKEND="$TANDEM_TERMINAL_BACKEND" \
+  TANDEM_CONFIG_VALUE_TANDEM_HERDR_BIN="${TANDEM_HERDR_BIN:-}" \
+  TANDEM_CONFIG_VALUE_TANDEM_HERDR_SESSION="${TANDEM_HERDR_SESSION:-}" \
+  TANDEM_CONFIG_VALUE_TANDEM_HERDR_WORKSPACE_PATH="${TANDEM_HERDR_WORKSPACE_PATH:-}" \
     write_config_from_env "${desktop_dir}/config.json"
   TANDEM_CONNECTOR_FILE="$connector" TANDEM_STDIO_PATH="${ROOT}/src/stdio-server.ts" TANDEM_CONFIG_FILE="${desktop_dir}/config.json" node --experimental-strip-types --input-type=module -e '
     import { writeProtectedFile } from "./src/runtime-config.ts";
@@ -232,6 +269,10 @@ setup_hub() {
   TANDEM_CONFIG_VALUE_TANDEM_PORT="$PUBLIC_PORT" \
   TANDEM_CONFIG_VALUE_TANDEM_CWD_ALLOWLIST="$TANDEM_CWD_ALLOWLIST" \
   TANDEM_CONFIG_VALUE_TANDEM_ENABLED_ENGINES="${TANDEM_ENABLED_ENGINES:-}" \
+  TANDEM_CONFIG_VALUE_TANDEM_TERMINAL_BACKEND="$TANDEM_TERMINAL_BACKEND" \
+  TANDEM_CONFIG_VALUE_TANDEM_HERDR_BIN="${TANDEM_HERDR_BIN:-}" \
+  TANDEM_CONFIG_VALUE_TANDEM_HERDR_SESSION="${TANDEM_HERDR_SESSION:-}" \
+  TANDEM_CONFIG_VALUE_TANDEM_HERDR_WORKSPACE_PATH="${TANDEM_HERDR_WORKSPACE_PATH:-}" \
   TANDEM_CONFIG_VALUE_TANDEM_FLEET_TOKEN="$fleet_token" \
   TANDEM_CONFIG_VALUE_TANDEM_FLEET_HOST="$FLEET_HOST" \
   TANDEM_CONFIG_VALUE_TANDEM_FLEET_PORT="$FLEET_PORT" \
