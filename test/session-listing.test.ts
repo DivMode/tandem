@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import type { DrivableSession, EngineId } from '../bridge/drivable.ts'
 import { listSessions, registerLive, unregisterLive } from '../bridge/sessions.ts'
+import type { TerminalBackend } from '../bridge/terminal-backend.ts'
 
 const registered: string[] = []
 
@@ -78,5 +79,31 @@ describe('listSessions privacy and admission filters', () => {
       },
     })
     expect(result.sessions.filter((s) => s.id === 'same')).toHaveLength(1)
+  })
+
+  it('uses Herdr ownership inventory without invoking tmux', async () => {
+    const backend: TerminalBackend = {
+      kind: 'herdr',
+      spawn: async () => { throw new Error('not used') },
+      attachExisting: async () => undefined,
+      exists: async () => false,
+      engineTagOf: async () => undefined,
+      listOwned: async () => [{
+        name: 'herdr-survivor',
+        engine: 'claude',
+        cwd: '/allowed/project',
+        updatedAt: 123,
+        attachHint: 'herdr agent attach native-agent',
+      }],
+    }
+    const result = await listSessions({
+      enabledEngines: new Set(['claude']),
+      allowlist: ['/allowed'],
+      backend,
+      listingDependencies: { tmuxFn: async () => { throw new Error('tmux must not be called') } },
+    })
+    expect(result.sessions).toEqual([
+      expect.objectContaining({ id: 'herdr-survivor', engine: 'claude', attachHint: 'herdr agent attach native-agent' }),
+    ])
   })
 })

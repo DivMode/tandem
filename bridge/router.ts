@@ -7,9 +7,8 @@
  * one explicit trust boundary.
  *
  * ENGINE-AWARE (Phase 2): a drivable "session" is either a REAL interactive
- * claude/codex/shell TUI in a tmux session "ccm-<name>" (driven by the shared
- * TerminalSession lifecycle via keystroke injection + pane scraping), or an
- * attached Hermes writable-agent id (a loopback HTTP gateway, not tmux). We
+ * Claude/Codex TUI managed by the selected native terminal backend (tmux or
+ * Herdr), a tmux shell, or an attached Hermes writable-agent id. We
  * NEVER run `claude -p` / headless and NEVER set ANTHROPIC_API_KEY, so Claude
  * usage stays on the user's interactive subscription. The autonomous capability
  * is the zero-API two-session relay, which stays Claude-only and unaffected by
@@ -42,8 +41,9 @@
  */
 
 import { homedir } from 'node:os'
-import { validateModel, validateEffort, TerminalSession } from './terminal-session.ts'
+import { validateModel, validateEffort } from './terminal-session.ts'
 import type { EngineId } from './drivable.ts'
+import type { TerminalSessionLike } from './engines/terminal-adapter.ts'
 import {
   resolveEngine,
   UnknownEngineError,
@@ -66,6 +66,7 @@ import {
 import * as relay from './relay.ts'
 import { emitCompletion, summarize } from './events.ts'
 import { audit } from './audit.ts'
+import { terminalBackend, type TerminalEngineId } from './terminal-backend.ts'
 
 // ---- config ---------------------------------------------------------------
 
@@ -171,6 +172,9 @@ export async function route(req: RpcRequest): Promise<RpcResult> {
 
   // POST /relay/start
   if (m === 'POST' && parts.length === 2 && parts[0] === 'relay' && parts[1] === 'start') {
+    if (terminalBackend.kind === 'herdr') {
+      return err(409, 'the Claude-only relay is unavailable with the Herdr terminal backend')
+    }
     return handleRelayStart(req)
   }
 
@@ -240,7 +244,7 @@ async function handleOpen(req: RpcRequest): Promise<RpcResult> {
   if (engine === 'hermes') {
     return handleOpenHermes(name, req)
   }
-  return handleOpenTmux(engine, name, req)
+  return handleOpenTerminalBackend(engine, name, req)
 }
 
 /** open_session for the `hermes` engine: attach to an existing, explicitly
@@ -261,8 +265,8 @@ async function handleOpenHermes(name: string, req: RpcRequest): Promise<RpcResul
   // re-adopted into the in-memory registry. Never let a Hermes attachment claim
   // that live session's name and hide/misroute it. Any ccm-<name> collision is a
   // conflict, including an untagged one.
-  if (await TerminalSession.exists(name)) {
-    const existingEngine = await TerminalSession.engineTagOf(name)
+  if (await terminalBackend.exists(name)) {
+    const existingEngine = await terminalBackend.engineTagOf(name)
     audit({
       route: 'POST /sessions/open',
       name,
@@ -300,9 +304,16 @@ async function handleOpenHermes(name: string, req: RpcRequest): Promise<RpcResul
   }
 }
 
-/** open_session for claude/codex/shell: the shared tmux lifecycle, generalized
- *  from Phase 1's Claude-only path. model/effort remain Claude-only. */
-async function handleOpenTmux(engine: 'claude' | 'codex' | 'shell', name: string, req: RpcRequest): Promise<RpcResult> {
+function wrapTerminal(engine: TerminalEngineId, terminal: TerminalSessionLike) {
+  return engine === 'claude'
+    ? new ClaudeSession(terminal)
+    : engine === 'codex'
+      ? new CodexSession(terminal)
+      : new ShellSession(terminal)
+}
+
+/** open_session for claude/codex/shell through the selected terminal backend. */
+async function handleOpenTerminalBackend(engine: TerminalEngineId, name: string, req: RpcRequest): Promise<RpcResult> {
   // Per-session model/effort (optional, Claude only — binding Phase 2 correction
   // C: no silent option loss for codex/shell). Validated up front so a bad value
   // fails as a clean 400 rather than a generic 500 from spawn.
@@ -341,7 +352,7 @@ async function handleOpenTmux(engine: 'claude' | 'codex' | 'shell', name: string
   // A same-named ccm-* tmux session tagged with a DIFFERENT engine is a 409
   // conflict, distinct from a provenance/cwd adoption failure (403) — checked
   // before attempting adoption so the caller gets the precise reason.
-  const existingTag = await TerminalSession.engineTagOf(name)
+  const existingTag = await terminalBackend.engineTagOf(name)
   if (existingTag !== undefined && existingTag !== engine) {
     audit({ route: 'POST /sessions/open', name, engine, denied: 'engine-mismatch', existingEngine: existingTag })
     return err(409, `session "${name}" already exists with engine "${existingTag}"`)
@@ -349,23 +360,14 @@ async function handleOpenTmux(engine: 'claude' | 'codex' | 'shell', name: string
 
   // Re-adopt a ccm-* session that survived a bridge restart (re-validates
   // provenance tags + cwd).
-  const adopted =
-    engine === 'claude'
-      ? await ClaudeSession.attachExisting(name, ALLOWLIST)
-      : engine === 'codex'
-        ? await CodexSession.attachExisting(name, ALLOWLIST)
-        : await ShellSession.attachExisting(name, ALLOWLIST)
+  const adoptedTerminal = await terminalBackend.attachExisting(name, engine, ALLOWLIST)
+  const adopted = adoptedTerminal ? wrapTerminal(engine, adoptedTerminal) : undefined
   if (adopted) {
     registerLive(adopted)
     audit({ route: 'POST /sessions/open', name, engine, cwd: adopted.cwd, adopted: true })
     return ok({ name: adopted.id, engine, cwd: adopted.cwd, attachHint: adopted.attachHint(), reused: true })
   }
-  const stillExists =
-    engine === 'claude'
-      ? await ClaudeSession.exists(name)
-      : engine === 'codex'
-        ? await CodexSession.exists(name)
-        : await ShellSession.exists(name)
+  const stillExists = await terminalBackend.exists(name)
   if (stillExists) {
     audit({ route: 'POST /sessions/open', name, engine, denied: 'adopt-provenance-or-cwd' })
     return err(
@@ -375,12 +377,8 @@ async function handleOpenTmux(engine: 'claude' | 'codex' | 'shell', name: string
   }
 
   try {
-    const session =
-      engine === 'claude'
-        ? await ClaudeSession.spawn({ name, cwd, allowlist: ALLOWLIST, model, effort })
-        : engine === 'codex'
-          ? await CodexSession.spawn({ name, cwd, allowlist: ALLOWLIST })
-          : await ShellSession.spawn({ name, cwd, allowlist: ALLOWLIST })
+    const terminal = await terminalBackend.spawn({ name, engine, cwd, allowlist: ALLOWLIST, model, effort })
+    const session = wrapTerminal(engine, terminal)
     registerLive(session)
     audit({ route: 'POST /sessions/open', name: session.id, engine, cwd, model, effort, ready: session.ready })
     // Surface readiness: when the TUI did NOT reach its prompt (the classic
