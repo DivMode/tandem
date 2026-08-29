@@ -488,10 +488,30 @@ async function handleInterrupt(name: string): Promise<RpcResult> {
 }
 
 async function handleClose(name: string): Promise<RpcResult> {
-  const session = getLive(name)
+  let session = getLive(name)
   if (!session) {
-    // Already gone is success (idempotent).
-    return ok({ ok: true, name, alreadyClosed: true })
+    // Not in this process's registry does NOT mean gone. A session that
+    // survived a bridge restart is exactly what open_session re-adopts through
+    // the backend, and closing it has to take the same path — otherwise the
+    // caller is told `alreadyClosed` while the terminal keeps running, which
+    // under Herdr leaves a visible workspace nobody can address any more.
+    //
+    // Measured 2026-08-29: six such workspaces had accumulated from earlier
+    // proof runs, each reported closed and each still live.
+    //
+    // Re-adoption re-validates the ownership tags and the cwd allowlist, so
+    // this can only ever close a session this installation owns.
+    const engine = await terminalBackend.engineTagOf(name)
+    if (!engine) {
+      // Nothing this installation owns answers to that name. Idempotent.
+      return ok({ ok: true, name, alreadyClosed: true })
+    }
+    const adopted = await terminalBackend.attachExisting(name, engine, ALLOWLIST)
+    if (!adopted) {
+      // Owned, but its cwd is no longer admissible, so it is not ours to drive.
+      return ok({ ok: true, name, alreadyClosed: true })
+    }
+    session = wrapTerminal(engine, adopted)
   }
   audit({ route: 'POST /sessions/:name/close', name, engine: session.engine, cwd: session.cwd })
   await session.close()
