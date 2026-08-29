@@ -25,6 +25,9 @@
  * tests. codex/shell/hermes have no such Phase 1 baseline to preserve.
  */
 import { execFile } from 'node:child_process'
+import { constants as fsConstants } from 'node:fs'
+import { access } from 'node:fs/promises'
+import { delimiter as pathDelimiter, isAbsolute, join } from 'node:path'
 import { CLAUDE_DESCRIPTOR, CODEX_DESCRIPTOR, SHELL_DESCRIPTOR, type EngineDescriptor, type EngineId } from './drivable.ts'
 
 export const KNOWN_ENGINE_IDS: readonly EngineId[] = ['claude', 'codex', 'shell', 'hermes']
@@ -73,12 +76,45 @@ export function buildEnabledEngines(envValue = process.env.TANDEM_ENABLED_ENGINE
  *  automated tests may not launch a real engine executable). */
 export type ExecutableDetector = (executable: string) => Promise<boolean>
 
-/** Default detector: `which <bin>` succeeds iff the binary resolves on PATH.
+/** Directories a Tandem-owned Herdr workspace will search, if any.
+ *
+ *  Availability has to be judged in the environment the agent will ACTUALLY
+ *  run in. Under the Herdr backend that is the configured workspace PATH, not
+ *  this process's PATH — Tandem itself never sees it. Judging by `which` alone
+ *  made TANDEM_HERDR_WORKSPACE_PATH unreachable: the engine was reported
+ *  unavailable and refused before any workspace could be created, so the one
+ *  mechanism that exists to make an agent visible could never make it visible.
+ *
+ *  Measured 2026-08-29: with the ChatGPT desktop app's bundled Codex named in
+ *  TANDEM_HERDR_WORKSPACE_PATH and codex enabled, list_devices still reported
+ *  engines ["claude"] and open_session answered "no online device (including
+ *  local) supports engine codex".
+ *
+ *  Gated on the backend by name rather than by importing the backend module,
+ *  which keeps this file free of a dependency on the thing it is describing. */
+function herdrWorkspaceSearchPath(env: NodeJS.ProcessEnv = process.env): string[] {
+  if ((env.TANDEM_TERMINAL_BACKEND ?? '').trim().toLowerCase() !== 'herdr') return []
+  const configured = env.TANDEM_HERDR_WORKSPACE_PATH?.trim()
+  if (!configured) return []
+  return configured.split(pathDelimiter).filter((entry) => entry !== '' && isAbsolute(entry))
+}
+
+/** Default detector: an executable in the Herdr workspace PATH when one is
+ *  configured, otherwise `which <bin>` on this process's PATH.
  *  macOS/Linux only, matching the rest of this repo's setup assumptions. */
-export const detectExecutableOnPath: ExecutableDetector = (executable) =>
-  new Promise((resolve) => {
+export const detectExecutableOnPath: ExecutableDetector = async (executable) => {
+  for (const directory of herdrWorkspaceSearchPath()) {
+    try {
+      await access(join(directory, executable), fsConstants.X_OK)
+      return true
+    } catch {
+      // Not in this directory; keep looking, then fall back to PATH.
+    }
+  }
+  return new Promise((resolve) => {
     execFile('which', [executable], (error) => resolve(!error))
   })
+}
 
 export interface ResolveEngineOptions {
   enabledEngines?: Set<EngineId>
