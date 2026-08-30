@@ -78,6 +78,15 @@ describe("fleet-protocol: request frames — exact operation-specific payload sc
     expect(parseFrame(encodeRequestFrame(generateRequestId(), "interrupt", { sessionId: "x" }))).toMatchObject({ op: "interrupt" });
     expect(parseFrame(encodeRequestFrame(generateRequestId(), "close", { sessionId: "x" }))).toMatchObject({ op: "close" });
     expect(parseFrame(encodeRequestFrame(generateRequestId(), "list_sessions", { limit: 10 }))).toMatchObject({ op: "list_sessions" });
+    expect(
+      parseFrame(encodeRequestFrame(generateRequestId(), "foreman_events", { since: "fe2_abc-_0", limit: 10 })),
+    ).toMatchObject({ op: "foreman_events" });
+    // Strict payload: an unknown field, an oversized or malformed checkpoint,
+    // and an out-of-range limit are all refused at the wire boundary.
+    expect(() => encodeRequestFrame(generateRequestId(), "foreman_events", { nope: 1 })).toThrow();
+    expect(() => encodeRequestFrame(generateRequestId(), "foreman_events", { since: "not-a-checkpoint" })).toThrow();
+    expect(() => encodeRequestFrame(generateRequestId(), "foreman_events", { since: "fe1_" + "a".repeat(9000) })).toThrow();
+    expect(() => encodeRequestFrame(generateRequestId(), "foreman_events", { limit: 0 })).toThrow();
   });
 
   it("rejects an unknown operation entirely (fails closed)", () => {

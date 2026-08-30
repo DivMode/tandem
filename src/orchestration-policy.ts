@@ -28,7 +28,7 @@ import {
 } from "../bridge/model-policy.ts";
 
 /** Bump on any change to the policy text or rules below. */
-export const ORCHESTRATION_POLICY_VERSION = "1.0.0";
+export const ORCHESTRATION_POLICY_VERSION = "1.1.0";
 
 export interface OrchestrationPolicy {
   readonly version: string;
@@ -36,6 +36,7 @@ export interface OrchestrationPolicy {
   readonly sessionDiscipline: readonly string[];
   readonly interruptionModel: readonly string[];
   readonly pollingProtocol: readonly string[];
+  readonly reconciliation: readonly string[];
   readonly modelRouting: {
     readonly defaultModel: string;
     readonly rules: readonly string[];
@@ -86,6 +87,15 @@ export const ORCHESTRATION_POLICY: OrchestrationPolicy = {
     "NEVER resend the instruction to a running session. A resend queues a second instruction into a live turn and corrupts the worker's state.",
     "Keep polling with the newest returned cursor until the result reports idle/done. Polling is cheap; a duplicated instruction is not.",
   ],
+  reconciliation: [
+    "Tandem work finishes whether or not a foreman is connected. Every real lifecycle transition — a turn completed, a worker blocked or asking a question, a turn interrupted, a session closed, a send that errored — is written to a durable local feed on the host.",
+    "At the START of substantial engineering work, and again after ANY interruption, reconnect, new conversation, or context loss: call list_sessions AND get_foreman_events, before opening anything.",
+    "get_foreman_events is HISTORY: it says what happened. list_sessions is LIVENESS: it says what is running right now. A `completed` event does NOT mean the worker exited, and the absence of an event does NOT mean nothing happened. Never decide whether to open a session from the event feed alone.",
+    "Carry the `checkpoint` the tool returns and pass it back as `since` on your next call, so you see each transition once. Tandem does not track what you have read: the transport is stateless and has no per-conversation identity, so the checkpoint lives with you, not on the server.",
+    "`more: true` is pagination — unread events remain, so call again with the returned checkpoint. `truncated: true` is loss — events you never saw were dropped by retention, or your checkpoint predates the current store — so reconcile against list_sessions rather than assuming a full record.",
+    "Each device keeps its own events, recorded where the work ran. Omit `device` for the hub; to cover a fleet, call list_devices and then get_foreman_events once per device. One call never reads more than one device, and an offline device is reported explicitly rather than looking like silence.",
+    "This feed is the reconciliation mechanism BECAUSE no MCP server can wake a dormant conversation. Nothing Tandem does will make a chat client resume on its own; you must ask on your next turn.",
+  ],
   modelRouting: {
     defaultModel: DEFAULT_CLAUDE_MODEL,
     rules: [
@@ -132,6 +142,14 @@ export const ORCHESTRATION_INSTRUCTIONS = [
   "POLLING — running + cursor means poll, never resend",
   bullets(ORCHESTRATION_POLICY.pollingProtocol),
   "",
+  "RECONCILE — events are history, list_sessions is liveness",
+  bullets([
+    "Starting substantial engineering work, or resuming after any interruption, reconnect, or context loss: call list_sessions AND get_foreman_events (passing your last checkpoint as `since`) BEFORE opening anything.",
+    "get_foreman_events reports what happened while you were away; list_sessions is the only truth about what is still running. Never treat an event as proof a worker is or is not alive.",
+    "Keep the returned `checkpoint` and pass it back next time — the server does not remember what you have read.",
+    "No MCP server can wake a dormant conversation, so this reconciliation on your next turn is the mechanism, not a fallback.",
+  ]),
+  "",
   "MODEL ROUTING",
   bullets(ORCHESTRATION_POLICY.modelRouting.rules),
   bullets(ORCHESTRATION_POLICY.modelRouting.fable.rules),
@@ -153,6 +171,8 @@ export const TOOL_GUIDANCE = {
     'ORCHESTRATION: status "running" with a cursor means the turn is STILL EXECUTING — poll the same session with empty text and that cursor. NEVER resend the instruction to a running session; a resend queues a second instruction into a live turn. Interrupting the client does not stop this turn.',
   fableParam:
     `Set true ONLY when the user's current instruction explicitly requested Fable. Never infer it — not from earlier turns, a stored preference, the task's shape, or your own judgement. Required for the "${FABLE_ALIAS}" alias or a "${FABLE_FULL_MODEL_ID}" id; without it the call is rejected (400) and no model is substituted.`,
+  foremanEvents:
+    "ORCHESTRATION: call this together with list_sessions when you start substantial engineering work and after any interruption, reconnect, or context loss — before opening a session, so you do not duplicate a worker whose result is already here. This is HISTORY, not liveness: list_sessions says what is running now. Pass the previous call's `checkpoint` as `since` to see each transition once; the server does not track what you have read.",
   policyTool:
     `Read-only. Returns the full versioned Tandem orchestration policy (v${ORCHESTRATION_POLICY_VERSION}): roles (client = foreman, GitHub = durable truth, Tandem = execution/session bus), session reuse discipline, the interruption model, the running/cursor polling protocol, and model routing including the explicit-user-only Fable rule. Opens nothing, changes nothing, and touches no session. The same policy is offered as the MCP initialize instructions; call this when those were not surfaced or when you need the full text.`,
 } as const;

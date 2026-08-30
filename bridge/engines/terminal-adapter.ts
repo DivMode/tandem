@@ -36,6 +36,8 @@ export interface TerminalSessionLike {
   applyControls(controls: { model?: string; effort?: string }): Promise<string[]>
   interrupt(): Promise<void>
   close(): Promise<void>
+  /** Optional per-incarnation identity; see DrivableSession.agentIdentity. */
+  agentIdentity?(): Promise<string | undefined>
 }
 
 /**
@@ -109,5 +111,10 @@ export class TerminalAdapterSession implements DrivableSession {
 
   close(): Promise<void> {
     return this.terminal.close()
+  }
+
+  /** Passes the backend's per-incarnation identity through unchanged. */
+  agentIdentity(): Promise<string | undefined> {
+    return this.terminal.agentIdentity?.() ?? Promise.resolve(undefined)
   }
 }

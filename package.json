@@ -30,6 +30,7 @@
   "files": [
     ".env.example",
     "bridge",
+    "docs",
     "src",
     "skills",
     "assets/tandem-logo.png",

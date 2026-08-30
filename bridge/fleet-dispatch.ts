@@ -26,6 +26,13 @@ import { executeLocalOp, type DispatchResult } from './fleet-op-table.ts'
 import { DeviceOfflineError, InFlightLimitError, BackpressureError, RpcTimeoutError, RpcRejectedError } from './fleet-broker.ts'
 import { OPEN_SESSION_TIMEOUT_MS, type FleetOp } from './fleet-protocol.ts'
 import type { FleetRuntime } from './fleet-runtime.ts'
+import {
+  decodeForemanCheckpoint,
+  encodeForemanCheckpoint,
+  InvalidCheckpointError,
+  LOCAL_DEVICE_KEY,
+  withDeviceCursor,
+} from './foreman-checkpoint.ts'
 
 export class DeviceConflictError extends Error {}
 export class DeviceNotFoundError extends Error {}
@@ -275,6 +282,120 @@ export async function dispatchListSessions(
     return brokerErrorToResult(e)
   }
   return rewriteListSessionsResponse(result, explicitDevice)
+}
+
+/* ---- foreman event feed ---------------------------------------------------
+ *
+ * Each device keeps its OWN inbox: events are recorded where the work ran and
+ * that device's store is their only truth. This is the hub-side read path.
+ *
+ * NO FAN-OUT, AND NO RECURSION. Exactly one device answers each call — the one
+ * the caller selected, or the local hub when none was. bridge/router.ts's
+ * `/foreman/events` handler stays a pure local inbox read that knows nothing
+ * about a FleetRuntime, so a device executing an incoming `foreman_events`
+ * request cannot route back out into the fleet. Aggregation across devices is
+ * deliberately NOT implemented here: a foreman enumerates devices with
+ * list_devices and asks each explicitly, which needs no cross-device merge and
+ * no partial-failure semantics. The checkpoint format is already the map shape
+ * aggregation would need, so adding it later breaks no stored token.
+ *
+ * IDENTITY IS THE HUB'S. A device reports its events under whatever
+ * TANDEM_DEVICE_ID it was configured with, which the hub has no reason to
+ * trust and no way to verify. Every returned event is rewritten to the id the
+ * hub actually routed to, so `device` and `session` always match the name the
+ * caller must use to address that worker.
+ */
+
+/** Rewrite a remote page onto the hub's routing identity and re-issue the
+ *  caller's map token with only this device's entry advanced. */
+function rewriteForemanPage(
+  result: DispatchResult,
+  deviceId: string,
+  incoming: Map<string, string>,
+): DispatchResult {
+  if (result.status < 200 || result.status >= 300) return result
+  const body = result.body as Record<string, unknown> | undefined
+  if (!body || !Array.isArray(body.events)) return result
+
+  const events = (body.events as Array<Record<string, unknown>>).map((event) => {
+    const localName = typeof event.localName === 'string' ? event.localName : ''
+    return { ...event, device: deviceId, session: `${deviceId}:${localName}` }
+  })
+
+  // The device's own single-store cursor becomes this device's entry in the
+  // caller's map. Every other device's entry is preserved untouched.
+  const deviceCursor = typeof body.checkpoint === 'string' ? body.checkpoint : undefined
+  const nextMap = deviceCursor ? withDeviceCursor(incoming, deviceId, deviceCursor) : incoming
+
+  return {
+    status: result.status,
+    body: { ...body, events, device: deviceId, checkpoint: encodeForemanCheckpoint(nextMap) },
+  }
+}
+
+/**
+ * Read one device's foreman event inbox. `device` omitted (or "local") keeps
+ * the exact pre-fleet local behavior.
+ */
+export async function dispatchForemanEvents(
+  runtime: FleetRuntime,
+  payload: { device?: string; since?: string; limit?: number },
+): Promise<DispatchResult> {
+  let incoming: Map<string, string>
+  try {
+    incoming = decodeForemanCheckpoint(payload.since)
+  } catch (e) {
+    if (e instanceof InvalidCheckpointError) {
+      return { status: 400, body: { error: `${e.message}; omit "since" to start a fresh checkpoint` } }
+    }
+    throw e
+  }
+
+  const requested = payload.device
+  const isLocal = requested === undefined || requested === LOCAL_DEVICE_KEY
+  const deviceId = isLocal ? LOCAL_DEVICE_KEY : requested
+  // Each device's cursor is the single-store token that device itself issued;
+  // the hub never interprets it, it only files it under the right key.
+  const deviceCursor = incoming.get(deviceId)
+
+  if (isLocal) {
+    const result = await executeLocalOp('foreman_events', { since: deviceCursor, limit: payload.limit })
+    return rewriteForemanPage(result, LOCAL_DEVICE_KEY, incoming)
+  }
+
+  if (!runtime.registry.isOnline(deviceId)) {
+    // Explicit about WHICH device could not answer, and nothing else: no host,
+    // no address, no path, no tailnet identity.
+    return { status: 404, body: { error: `device "${deviceId}" is not online`, device: deviceId } }
+  }
+
+  let result: DispatchResult
+  try {
+    result = await runtime.broker.sendRequest(deviceId, 'foreman_events', {
+      since: deviceCursor,
+      limit: payload.limit,
+    })
+  } catch (e) {
+    const mapped = brokerErrorToResult(e)
+    // Coarse and sanitized: the caller learns the device and the class of
+    // failure, never a transport detail from the far end.
+    return { status: mapped.status, body: { error: foremanRoutingError(mapped.status, deviceId), device: deviceId } }
+  }
+  return rewriteForemanPage(result, deviceId, incoming)
+}
+
+/** One short, non-revealing sentence per failure class. */
+function foremanRoutingError(status: number, deviceId: string): string {
+  switch (status) {
+    case 404:
+      return `device "${deviceId}" is not online`
+    case 429:
+      return `device "${deviceId}" is busy; retry shortly`
+    case 504:
+      return `device "${deviceId}" did not answer in time`
+    default:
+      return `device "${deviceId}" could not return its foreman events`
+  }
 }
 
 /** Pure local read of the registry's public list — never a wire round trip;
