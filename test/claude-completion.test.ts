@@ -165,7 +165,7 @@ describe('claudeTurnEndAfter', () => {
   it('degrades to "no answer" when the store is unreadable rather than failing the poll', () => {
     const directory = dir('tandem-lifecycle-')
     // A store that is not demonstrably ours degrades to empty by design...
-    writeFileSync(join(directory, 'events.json'), 'not json at all\n', { mode: 0o600 })
+    writeFileSync(join(directory, 'events.db'), 'not a store at all\n', { mode: 0o600 })
     const corrupt = new ClaudeLifecycleStore(directory)
     expect(claudeTurnEndAfter({ session: WORKER, seq: 0, storeEpoch: '0' }, corrupt)).toBeUndefined()
 

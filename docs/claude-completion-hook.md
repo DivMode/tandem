@@ -210,9 +210,43 @@ The outcomes, and what each means:
 | `unwritable` | The store refused the write. |
 
 **The store itself**, at `$TANDEM_STATE_DIR/claude-lifecycle/` (default
-`~/.tandem/claude-lifecycle/`), a 0700 directory holding a 0600 file. A store
-that is not demonstrably ours — wrong owner, group-readable, oversized, corrupt,
-wrong version — degrades to empty rather than to an error.
+`~/.tandem/claude-lifecycle/`), a 0700 directory holding a 0600 SQLite database
+(`events.db`). A store that is not demonstrably ours — a symlink, wrong owner,
+group- or other-accessible, oversized, not a SQLite file, stamped with another
+version — degrades to empty on the read path and is replaced on the write path,
+never to an error.
+
+**Why SQLite, and why Tandem holds no lock of its own.** Every hook invocation
+is a separate OS process writing into this one shared store, and they overlap:
+a fan-out of workers all finishing at once is the normal case, not the edge
+case. An earlier design kept the records in a JSON file replaced by atomic
+rename; rename prevents a torn file but not a lost update, and under 150
+concurrent hook processes roughly 32 of the 150 records survived. Serialising
+short cross-process transactions is what SQLite is for, so that is what runs
+here: `BEGIN IMMEDIATE` takes the write lock up front, a bounded
+`PRAGMA busy_timeout` (5s, the same patience the hook already allows stdin)
+waits for it, and
+retention runs inside the same transaction as the insert. `seq` is
+`INTEGER PRIMARY KEY AUTOINCREMENT`, whose high-water mark survives retention
+deletes, so a sequence number is never handed out twice for the life of a
+database file.
+
+There is deliberately **no filesystem lock around the database**. The interim
+design used one, with an mtime staleness threshold to recover a lock left by a
+crashed process — and that threshold is a guess: a writer that is merely slow
+is indistinguishable from a dead one, and clearing its lock puts two writers
+back inside the same critical section. SQLite needs no such guess. A process
+killed mid-transaction leaves a hot rollback journal, and the next process to
+open the database rolls it back deterministically. The default rollback journal
+is used rather than WAL: it passes the contention proof with wide margin and
+adds no `-wal`/`-shm` sidecars to keep permissions right for. The one sidecar
+it does create, `events.db-journal`, exists only while a transaction is open
+and inherits the database's 0600 mode.
+
+**This is why Tandem needs Node 22.13 or newer** (and, on the 23 line, 23.4 or
+newer): `node:sqlite` required `--experimental-sqlite` before those releases,
+and a hook command registered in a settings file cannot pass an interpreter
+flag. CI runs the declared floor and the current line to keep that honest.
 
 ## What is stored, and what is pointedly not
 

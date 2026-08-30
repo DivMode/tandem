@@ -513,7 +513,7 @@ describe('a store that cannot be trusted degrades to the terminal path', () => {
     // by design, so there is no boundary to find.
     const directory = tandemStatePath('claude-lifecycle')
     mkdirSync(directory, { recursive: true, mode: 0o700 })
-    writeFileSync(join(directory, 'events.json'), 'this is not the store you are looking for\n', { mode: 0o600 })
+    writeFileSync(join(directory, 'events.db'), 'this is not the store you are looking for\n', { mode: 0o600 })
 
     const working = await poll(name)
     expect(working.status).toBe(200)

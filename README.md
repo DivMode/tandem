@@ -8,7 +8,7 @@
   <a href="https://github.com/Maxmedawar/tandem/actions/workflows/ci.yml"><img src="https://github.com/Maxmedawar/tandem/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/Maxmedawar/tandem/releases"><img src="https://img.shields.io/github/v/release/Maxmedawar/tandem?color=E8643C" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-E8643C.svg" alt="MIT License"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D22.6-339933" alt="Node >=22.6">
+  <img src="https://img.shields.io/badge/node-%3E%3D22.13-339933" alt="Node >=22.13">
   <a href="https://github.com/Maxmedawar/tandem/stargazers"><img src="https://img.shields.io/github/stars/Maxmedawar/tandem?color=E8643C" alt="Stars"></a>
   <img src="https://img.shields.io/badge/PRs-welcome-E8643C.svg" alt="PRs welcome">
 </p>
@@ -90,7 +90,7 @@ Safety rules:
 - Stop if a verification fails. Do not report partial setup as success.
 
 Steps:
-1. Check for Node.js 22.6+, tmux, Tailscale, and at least one supported coding
+1. Check for Node.js 22.13+, tmux, Tailscale, and at least one supported coding
    agent. Install missing prerequisites with the normal package manager when safe.
    If an install needs administrator approval, ask me first.
 2. Check whether Tailscale is running and connected. If I must sign in or enable
@@ -137,7 +137,7 @@ Shell access is powerful. It gives an approved caller command execution as the T
 
 You need:
 
-- Node.js 22.6 or newer
+- Node.js 22.13 or newer (Node 23.0-23.3 excluded)
 - tmux
 - Tailscale, connected with `tailscale up`
 - at least one supported agent installed

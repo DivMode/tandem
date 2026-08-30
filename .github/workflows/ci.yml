@@ -7,6 +7,15 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The exact floor package.json `engines` declares, and the line this is
+        # deployed on. The floor is 22.13 because that is where `node:sqlite`
+        # stopped needing `--experimental-sqlite`, and bridge/claude-lifecycle-
+        # store.ts depends on it, so the floor is worth proving rather than
+        # assuming from a floating `22`.
+        node-version: ['22.13.0', '24']
     steps:
       - uses: actions/checkout@v4
 
@@ -15,7 +24,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
 
       - name: Install dependencies
         run: npm ci

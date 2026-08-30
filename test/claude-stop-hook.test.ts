@@ -219,14 +219,14 @@ describe("a store it cannot use", () => {
   it("starts a clean store rather than failing when the existing one is corrupt", () => {
     const { store, dir } = freshStore();
     handleClaudeStopHook(stopPayload(), { store, env: ENV });
-    writeFileSync(join(dir, "events.json"), "  garbage", { mode: 0o600 });
+    writeFileSync(join(dir, "events.db"), "  garbage", { mode: 0o600 });
     expect(handleClaudeStopHook(stopPayload(), { store, env: ENV }).outcome).toBe("recorded");
   });
 
   it("starts a clean store rather than trusting one with loose permissions", () => {
     const { store, dir } = freshStore();
     handleClaudeStopHook(stopPayload(), { store, env: ENV });
-    chmodSync(join(dir, "events.json"), 0o666);
+    chmodSync(join(dir, "events.db"), 0o666);
     const result = handleClaudeStopHook(stopPayload(), { store, env: ENV });
     expect(result.outcome).toBe("recorded");
     // The untrusted history is discarded, not merged into.
@@ -241,7 +241,8 @@ describe("what the hook never leaks", () => {
       store,
       env: ENV,
     });
-    const raw = readFileSync(join(dir, "events.json"), "utf8");
+    // The raw bytes on disk, whatever the backing format, must not carry it.
+    const raw = readFileSync(join(dir, "events.db"), "latin1");
     expect(raw).not.toContain("/Users/peter/Developer/tooling/tandem");
     expect(raw).not.toContain(".jsonl");
     expect(raw).not.toContain("transcript");
@@ -259,13 +260,20 @@ describe("what the hook never leaks", () => {
 });
 
 describe("the command entrypoint", () => {
+  /** Exactly the flags bin/tandem-claude-stop-hook.mjs passes when it re-execs
+   *  this entrypoint. `--no-warnings` is part of that command, not a convenience
+   *  for the assertions: on a Node whose type stripping is still experimental,
+   *  the interpreter would otherwise write its own notice to the stderr these
+   *  tests are asserting about, and production would never see it. */
+  const HOOK_NODE_ARGS = ["--experimental-strip-types", "--no-warnings"];
+
   const entrypoint = fileURLToPath(new URL("../src/claude-stop-hook.ts", import.meta.url));
 
   /** Run the real hook process the way Claude would: payload on stdin. */
   function runHook(stdin: string, env: NodeJS.ProcessEnv): string {
     // execFileSync THROWS on a non-zero exit, so every call site that reaches
     // its assertion has already asserted "exit code 0".
-    return execFileSync(process.execPath, ["--experimental-strip-types", entrypoint], {
+    return execFileSync(process.execPath, [...HOOK_NODE_ARGS, entrypoint], {
       input: stdin,
       encoding: "utf8",
       timeout: 30000,
@@ -300,7 +308,7 @@ describe("the command entrypoint", () => {
 
   it("prints the outcome word, and nothing sensitive, when debugging is turned on", () => {
     const dir = freshStateRoot();
-    const run = spawnSync(process.execPath, ["--experimental-strip-types", entrypoint], {
+    const run = spawnSync(process.execPath, [...HOOK_NODE_ARGS, entrypoint], {
       input: stopPayload(),
       encoding: "utf8",
       timeout: 30000,
@@ -324,7 +332,7 @@ describe("the command entrypoint", () => {
 
   it("stays silent on stderr when debugging is off", () => {
     const dir = freshStateRoot();
-    const run = spawnSync(process.execPath, ["--experimental-strip-types", entrypoint], {
+    const run = spawnSync(process.execPath, [...HOOK_NODE_ARGS, entrypoint], {
       input: stopPayload(),
       encoding: "utf8",
       timeout: 30000,

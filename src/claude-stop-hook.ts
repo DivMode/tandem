@@ -45,6 +45,19 @@ import {
   MAX_HOOK_INPUT_BYTES,
 } from "../bridge/claude-stop-hook.ts";
 
+/**
+ * Node prints its own ExperimentalWarnings to stderr — `node:sqlite` still
+ * carries one on the Node 22 line, and the lifecycle store loads it. Today
+ * nothing appears, but only because `process.emitWarning` defers printing to
+ * the next tick and `finish()` calls `process.exit(0)` before that tick runs.
+ * That is a race, not a promise, and a hook that whispers interpreter notes
+ * into a user's session mid-turn is exactly what "silent by design" above
+ * rules out. Dropping Node's default warning listener makes the silence
+ * deliberate; it suppresses nothing this file itself chooses to write, and it
+ * is scoped to this hook process alone — the bridge still surfaces its own.
+ */
+process.removeAllListeners("warning");
+
 /** Claude is blocked on this process; give stdin a hard ceiling. */
 const STDIN_TIMEOUT_MS = 5000;
 

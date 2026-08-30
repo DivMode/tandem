@@ -26,5 +26,14 @@ export default defineConfig({
     // Vitest ever calls, which is how earlier runs leaked a directory per file.
     globalSetup: ["./test/global-state-dir.ts"],
     env: { TANDEM_TEST_STATE_ROOT: stateRoot },
+    // Vitest's 5s default assumes no test file is saturating the machine.
+    // test/claude-lifecycle-store-concurrency.test.ts deliberately spawns 150
+    // real hook processes at once, and Vitest runs test FILES in parallel
+    // workers, so its siblings can be starved of CPU for seconds at a time
+    // through no fault of their own. Measured: with that file in the same run,
+    // unrelated tests time out at 5s on the slower supported Node line while
+    // passing in 236ms alone. None of them assert anything about duration, so
+    // the fix is to stop the default from being the assertion.
+    testTimeout: 30_000,
   },
 });

@@ -43,51 +43,103 @@
  * email addresses, tailnet identity and absolute paths are redacted before
  * anything reaches disk. See SECURITY.md.
  *
- * TRUST MODEL: mirrors bridge/foreman-inbox.ts and bridge/herdr-cursor-store.ts
- * — one owner-only file (0600) in a 0700 private directory, replaced atomically
- * via rename, and REJECTED rather than trusted when anything is off (not a
- * regular file, wrong owner, group/other-readable, oversized, unparseable,
- * wrong version). Rejection always degrades to "no prior state", never to an
- * error, because the alternative is a hook that fails and a Claude worker that
- * notices.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY SQLITE, AND WHY THERE IS NO LOCK OF OUR OWN
  *
- * CROSS-PROCESS SAFETY. `record()` is a load -> compute-next-seq -> persist
- * transaction, and every Tandem-spawned Claude worker's hook is a SEPARATE OS
- * process writing into this ONE shared file. Atomic rename in `persist()`
- * only prevents a TORN write; it does nothing about two processes both
- * `load()`-ing the same on-disk state and each computing their own "next
- * event" against it — whichever `renameSync` lands last silently discards the
- * other's record. Measured: 150 concurrent hook processes writing one record
- * each -> roughly 32 survived. `record()` therefore holds a same-state-root
- * lock (see `acquireLock`/`releaseLock` below) around exactly that
- * load-compute-persist span, so the whole transaction is serialized across
- * processes. It uses `mkdirSync` for atomic acquisition (POSIX directory
- * creation is atomic, and `EEXIST` on contention needs no native addon, no
- * `flock`/shell dependency, and no third-party lock package), synchronous
- * jittered retry via `Atomics.wait` (this method must stay synchronous — it is
- * called from a hook process blocking Claude's own turn boundary), and
- * mtime-based stale-lock recovery so a process that crashed mid-write can
- * never wedge every future writer. Acquisition failure degrades exactly like
- * every other failure mode here: `record()` returns `undefined`, never
- * throws, and never writes anything.
+ * `record()` is a compute-next-seq -> persist transaction, and every
+ * Tandem-spawned Claude worker's hook is a SEPARATE OS process writing into
+ * this ONE shared store. The first cut of this module was a single JSON file
+ * replaced by atomic rename. Atomic rename only prevents a TORN write; it does
+ * nothing about two processes both reading the same on-disk state and each
+ * computing their own "next event" against it — whichever rename lands last
+ * silently discards the other's record. Measured: 150 concurrent hook
+ * processes writing one record each -> roughly 32 survived.
+ *
+ * That was then patched with a hand-rolled `mkdirSync` lock plus mtime-based
+ * stale-lock recovery. It worked, but it is a probabilistic correctness
+ * argument resting on a wall-clock heuristic: "a lock older than N ms must
+ * belong to a crashed process". A writer that is merely slow — a loaded host,
+ * a stopped process, a filesystem stall — is indistinguishable from a dead
+ * one, and clearing its lock puts two writers back inside the same critical
+ * section, which is exactly the lost update the lock existed to prevent.
+ *
+ * Node ships SQLite (`node:sqlite`). Multi-process serialisation of this
+ * shape of transaction is what SQLite is for, and it does it with a real lock
+ * protocol in the file rather than a timeout guess: `BEGIN IMMEDIATE` takes
+ * the write lock up front, a bounded `busy_timeout` waits for it, and a
+ * crashed writer leaves a hot journal that the NEXT opener rolls back
+ * deterministically — no staleness heuristic anywhere. So there is no custom
+ * lock here, and there must never be one again: a filesystem lock wrapped
+ * around SQLite would reintroduce the guess it was brought in to remove.
+ *
+ * ROLLBACK JOURNAL, NOT WAL. Measured on this workload (a burst of
+ * short-lived, one-transaction processes) through the real hook entrypoint:
+ * 150 concurrent hook processes -> 150/150 recorded, seqs 1..150 with no gaps,
+ * on every supported Node line. Slowest single transaction 644ms at 300-way
+ * concurrency on the slowest supported Node, against the budget below. The
+ * default rollback journal passes with wide margin, so it is what we use. WAL
+ * would add a `-wal` and a `-shm` file whose lifecycle and permissions we
+ * would then have to be right about, and buys nothing a workload this small
+ * can measure.
+ *
+ * SEQUENCE IS DURABLE AND NEVER REUSED. `seq INTEGER PRIMARY KEY AUTOINCREMENT`
+ * keeps its high-water mark in `sqlite_sequence`, which retention deletes do
+ * not touch, so a seq issued once is never issued again for the life of the
+ * database file. Retention runs inside the same transaction as the insert.
+ *
+ * TRUST MODEL: mirrors bridge/foreman-inbox.ts and bridge/herdr-cursor-store.ts
+ * — one owner-only database (0600) in a 0700 private directory, and REJECTED
+ * rather than trusted when anything is off (not a regular file, a symlink,
+ * wrong owner, group/other-accessible, oversized, not a SQLite file, wrong
+ * `user_version`). Rejection degrades to "no prior state" on the read path and
+ * to "replace it" on the write path, never to an error, because the
+ * alternative is a hook that fails and a Claude worker that notices.
+ *
+ * NEVER THROWS, NEVER HANGS. Every public method is total. The only unbounded
+ * thing SQLite could do here is wait for a lock, and `busy_timeout` bounds
+ * that; a write that cannot get in returns `undefined` exactly like every
+ * other failure.
+ *
+ * NO MIGRATION FROM THE JSON STORE, DELIBERATELY. The JSON implementation only
+ * ever existed on this unmerged branch, so there is no released version whose
+ * `events.json` anyone could be upgrading from — a reader would be code that
+ * can never run against real data. Retention would drop everything it imported
+ * within seven days regardless. A stale `events.json` left in the state
+ * directory by a developer who ran the earlier commit is inert: nothing reads
+ * that name any more.
  */
-import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, readSync, rmSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
+import { createRequire } from 'node:module'
 import { join } from 'node:path'
+import type { DatabaseSync } from 'node:sqlite'
 import { tandemStatePath } from './state-dir.ts'
 import { sanitizeEventText } from './foreman-inbox.ts'
 
-/** Bumped whenever the on-disk shape below changes; older state is discarded. */
+/**
+ * Bumped whenever the on-disk shape below changes; older state is discarded.
+ * Held as SQLite's own `PRAGMA user_version`, which lives in the database
+ * header rather than in a table — so a store written by a version whose SCHEMA
+ * differs can still be recognised and replaced without first having to query a
+ * table that may not have the columns this version expects.
+ */
 export const CLAUDE_LIFECYCLE_VERSION = 1
 
 const DIRECTORY = 'claude-lifecycle'
-const FILENAME = 'events.json'
+const FILENAME = 'events.db'
 
-/** Retention bounds, enforced on every write so the file cannot grow without
- *  limit on a long-lived host. */
+/** Retention bounds, enforced in the same transaction as every write so the
+ *  database cannot grow without limit on a long-lived host. */
 export const MAX_RETAINED_EVENTS = 200
 const MAX_EVENT_AGE_MS = 7 * 24 * 60 * 60 * 1000
-const MAX_STORE_BYTES = 1024 * 1024
+
+/**
+ * A sanity bound on the file, not a retention mechanism — retention is the two
+ * bounds above, and every row is bounded by construction (clamped message,
+ * bounded identities), so 200 rows cannot approach this. A file past it is not
+ * one this code produced, and is treated as foreign.
+ */
+const MAX_STORE_BYTES = 8 * 1024 * 1024
 
 /** The hard clamp on the one free-text field this store holds. */
 export const MAX_MESSAGE_CHARS = 2000
@@ -100,24 +152,35 @@ const IDENTITY_RE = /^[\x21-\x7e][\x20-\x7e]{0,127}$/
 const DEFAULT_PAGE_LIMIT = 100
 
 /**
- * `record()`'s cross-process lock (see the module doc comment). Both are
- * overridable per-instance — production code never needs to, but a test
- * exercising stale-lock recovery or a held-lock timeout needs both far
- * smaller than production values to run fast and deterministically.
+ * How long SQLite waits for the write lock before giving up, at which point
+ * `record()` returns `undefined` like any other failure.
+ *
+ * The same 5000ms src/claude-stop-hook.ts already allows stdin, and for the
+ * same reason: that is how long this hook is willing to make Claude wait
+ * before giving up on a turn boundary. Losing the record is the expensive
+ * outcome — it is the very failure this whole path exists to remove — so the
+ * budget is set by what is tolerable to wait, not by what is typically
+ * needed. A transaction here is one small insert plus two bounded deletes,
+ * well under a millisecond of actual work; all of this is contention
+ * headroom. Measured through the real entrypoint on the SLOWEST supported
+ * Node (22.13): 150 concurrent hook processes -> slowest transaction 537ms,
+ * 300 concurrent -> 644ms. Roughly 8x margin on the load this is built for.
+ *
+ * Applied via `PRAGMA busy_timeout` rather than the `DatabaseSync` `timeout`
+ * constructor option deliberately, and this is not a stylistic choice: that
+ * option was added in Node 22.16, and a Node 22.13 that does not know it
+ * ACCEPTS IT AND IGNORES IT. The connection would then have no busy handler
+ * at all while looking correctly configured, and every contended write would
+ * fail instantly instead of waiting. Measured on 22.13 with the constructor
+ * option: 66-116 of 150 concurrent writers survived, failing in 2-12ms with
+ * SQLITE_BUSY. The pragma is plain SQLite and works on every Node that has
+ * `node:sqlite` at all.
  */
-/** Total time `record()` will spend trying to acquire the lock before giving
- *  up and returning `undefined`. Comfortably below the hook's own 5000ms
- *  stdin watchdog (src/claude-stop-hook.ts), with wide margin even under
- *  heavy contention: a hold is one small JSON read+write, on the order of a
- *  few ms, so even ~150 processes queued behind one lock sum to well under a
- *  second of real contention. */
-const DEFAULT_LOCK_RETRY_BUDGET_MS = 3000
-/** A lock older than this is assumed abandoned by a crashed process and is
- *  forcibly cleared rather than trusted — comfortably above any legitimate
- *  hold time, comfortably below the retry budget above. */
-const DEFAULT_LOCK_STALE_AFTER_MS = 800
-/** Base synchronous retry backoff; jittered on top (see `acquireLock`). */
-const LOCK_RETRY_BASE_MS = 4
+const DEFAULT_BUSY_TIMEOUT_MS = 5000
+
+/** Every SQLite database file starts with these 16 bytes. A 0-byte file is
+ *  also a valid, empty SQLite database — SQLite initialises it in place. */
+const SQLITE_MAGIC = Buffer.from('SQLite format 3\0', 'latin1')
 
 /** The environment variable Tandem stamps into a spawned Claude worker. */
 export const SESSION_ID_ENV = 'TANDEM_SESSION_ID'
@@ -155,6 +218,16 @@ export const SESSION_ID_ENV = 'TANDEM_SESSION_ID'
  * `stop_failure` after a `prompt_submit`, never these two.
  */
 export type ClaudeLifecycleKind = 'stop' | 'stop_failure' | 'prompt_submit' | 'interrupt' | 'close'
+
+/** The single source of truth for which kinds exist. The schema's CHECK
+ *  constraint below spells the same five out to SQLite. */
+const KINDS: ReadonlySet<string> = new Set<ClaudeLifecycleKind>([
+  'stop',
+  'stop_failure',
+  'prompt_submit',
+  'interrupt',
+  'close',
+])
 
 /**
  * The `claudeSessionId` Tandem-authored records (`interrupt`, `close`) use in
@@ -221,17 +294,6 @@ export interface ClaudeLifecyclePage extends ClaudeLifecycleCursor {
   truncated: boolean
 }
 
-interface StoreFile {
-  version: number
-  /** Regenerated whenever the store is created fresh, so a seq issued by a
-   *  previous store is detectable instead of silently misinterpreted. */
-  epoch: string
-  nextSeq: number
-  /** Highest seq retention has dropped; anything at or below it is gone. */
-  droppedThrough: number
-  events: ClaudeLifecycleEvent[]
-}
-
 /**
  * The epoch used while nothing has been persisted yet. DETERMINISTIC on
  * purpose: a router that snapshots an empty store and comes back later must not
@@ -251,216 +313,286 @@ export function tandemSessionIdentity(env: NodeJS.ProcessEnv = process.env): str
   return raw && isOpaqueIdentity(raw) ? raw : undefined
 }
 
-function isEvent(value: unknown): value is ClaudeLifecycleEvent {
-  if (!value || typeof value !== 'object') return false
-  const c = value as Record<string, unknown>
-  return (
-    c.v === CLAUDE_LIFECYCLE_VERSION &&
-    typeof c.id === 'string' &&
-    typeof c.seq === 'number' &&
-    Number.isSafeInteger(c.seq) &&
-    c.seq > 0 &&
-    typeof c.ts === 'string' &&
-    (c.kind === 'stop' ||
-      c.kind === 'stop_failure' ||
-      c.kind === 'prompt_submit' ||
-      c.kind === 'interrupt' ||
-      c.kind === 'close') &&
-    isOpaqueIdentity(c.tandemSession) &&
-    isOpaqueIdentity(c.claudeSessionId) &&
-    (c.message === undefined || typeof c.message === 'string')
-  )
+/**
+ * `node:sqlite`, loaded lazily and memoized.
+ *
+ * NOT a static import, on purpose. This module sits in the bridge's import
+ * graph (router.ts -> claude-completion.ts -> here), so a static import would
+ * make a Node without `node:sqlite` fail to start the WHOLE bridge rather than
+ * lose one reporting feature. package.json's `engines` states the versions
+ * that have it; this is what happens to anyone running outside that range.
+ */
+type SqliteModule = { DatabaseSync: new (path: string) => DatabaseSync }
+let sqliteModule: SqliteModule | null | undefined
+function loadSqlite(): SqliteModule | null {
+  if (sqliteModule !== undefined) return sqliteModule
+  sqliteModule = null
+  try {
+    const loaded: unknown = createRequire(import.meta.url)('node:sqlite')
+    if (loaded && typeof loaded === 'object' && typeof (loaded as SqliteModule).DatabaseSync === 'function') {
+      sqliteModule = loaded as SqliteModule
+    }
+  } catch {
+    /* an engine without node:sqlite gets a store that records nothing */
+  }
+  return sqliteModule
 }
 
-function isStoreFile(value: unknown): value is StoreFile {
-  if (!value || typeof value !== 'object') return false
-  const c = value as Record<string, unknown>
-  return (
-    c.version === CLAUDE_LIFECYCLE_VERSION &&
-    typeof c.epoch === 'string' &&
-    c.epoch.length > 0 &&
-    typeof c.nextSeq === 'number' &&
-    Number.isSafeInteger(c.nextSeq) &&
-    c.nextSeq > 0 &&
-    typeof c.droppedThrough === 'number' &&
-    Number.isSafeInteger(c.droppedThrough) &&
-    c.droppedThrough >= 0 &&
-    Array.isArray(c.events)
-  )
+/**
+ * The schema, applied with IF NOT EXISTS inside the same transaction as every
+ * write, so two hook processes racing to create it cannot half-create it.
+ *
+ * `STRICT` so a column cannot silently hold a value of the wrong type.
+ * `AUTOINCREMENT` so `seq` is never reused after a retention delete — that is
+ * the whole reason it is spelled out rather than left as a plain rowid alias.
+ * The CHECKs are what the DATABASE can enforce; `rowToEvent` re-validates every
+ * row on the way out, because a row could still have been written by something
+ * other than this code running as the same user.
+ */
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS meta (
+  id              INTEGER PRIMARY KEY CHECK (id = 1),
+  epoch           TEXT    NOT NULL CHECK (length(epoch) > 0),
+  dropped_through INTEGER NOT NULL DEFAULT 0 CHECK (dropped_through >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS events (
+  seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_ms             INTEGER NOT NULL,
+  kind              TEXT    NOT NULL CHECK (kind IN ('stop','stop_failure','prompt_submit','interrupt','close')),
+  tandem_session    TEXT    NOT NULL CHECK (length(tandem_session) BETWEEN 1 AND ${MAX_IDENTITY_CHARS}),
+  claude_session_id TEXT    NOT NULL CHECK (length(claude_session_id) BETWEEN 1 AND ${MAX_IDENTITY_CHARS}),
+  message           TEXT,
+  message_truncated INTEGER NOT NULL DEFAULT 0 CHECK (message_truncated IN (0, 1))
+) STRICT;
+`
+
+const EVENT_COLUMNS = 'seq, ts_ms, kind, tandem_session, claude_session_id, message, message_truncated'
+
+/** What a read of the store yields, whether or not there is anything there. */
+interface StoreState {
+  epoch: string
+  droppedThrough: number
+  /** Highest seq this database ever ISSUED, including seqs retention has since
+   *  dropped. 0 when nothing was ever written. */
+  highWater: number
 }
 
-/** `record()`'s cross-process lock timing — see the constants above for the
- *  production defaults these override. Test-only in practice. */
-export interface ClaudeLifecycleLockOptions {
-  retryBudgetMs?: number
-  staleAfterMs?: number
+const EMPTY_STATE: StoreState = { epoch: EMPTY_STORE_EPOCH, droppedThrough: 0, highWater: 0 }
+
+/** Thrown internally when the file on disk is a store this version cannot use;
+ *  `record()` catches it, replaces the file, and tries once more. */
+class IncompatibleStoreError extends Error {}
+
+function asInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined
+}
+
+/** `record()`'s bounded lock wait. Overridable per-instance — production code
+ *  never needs to, but a test proving that a genuinely held write lock degrades
+ *  safely needs it far smaller to run fast. */
+export interface ClaudeLifecycleStoreOptions {
+  busyTimeoutMs?: number
 }
 
 /**
  * The durable Claude lifecycle store.
  *
  * `directory` is injectable so tests — and a host running two Tandem instances
- * — never touch real home state. `lockOptions` is likewise a test seam (see
- * `ClaudeLifecycleLockOptions`); production code should never need it.
+ * — never touch real home state. `busyTimeoutMs` is likewise a test seam (see
+ * `ClaudeLifecycleStoreOptions`); production code should never need it.
+ *
+ * INSTANCES HOLD NO STATE AND NO OPEN HANDLE. Every call opens the database,
+ * does its work, and closes it. That is what makes a new instance over the same
+ * directory behave exactly like a restarted bridge or the next hook process —
+ * and it is why deleting the file out from under a live instance (which the
+ * tests do, and which anyone with `rm` can do) yields a genuinely fresh store
+ * with a new epoch rather than writes into an unlinked inode.
  */
 export class ClaudeLifecycleStore {
   private readonly directory: string
-  private readonly lockRetryBudgetMs: number
-  private readonly lockStaleAfterMs: number
+  private readonly busyTimeoutMs: number
 
-  constructor(directory: string = tandemStatePath(DIRECTORY), lockOptions: ClaudeLifecycleLockOptions = {}) {
+  constructor(directory: string = tandemStatePath(DIRECTORY), options: ClaudeLifecycleStoreOptions = {}) {
     this.directory = directory
-    this.lockRetryBudgetMs = lockOptions.retryBudgetMs ?? DEFAULT_LOCK_RETRY_BUDGET_MS
-    this.lockStaleAfterMs = lockOptions.staleAfterMs ?? DEFAULT_LOCK_STALE_AFTER_MS
+    this.busyTimeoutMs = Math.max(0, Math.trunc(options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS))
   }
 
   private get path(): string {
     return join(this.directory, FILENAME)
   }
 
-  private get lockPath(): string {
-    return `${this.path}.lock`
-  }
-
   /**
-   * Synchronous sleep with no busy-spin: `Atomics.wait` blocks the calling
-   * thread without a native dependency. It is NOT worker-only in Node (only
-   * in browsers) — the main thread can call it freely, which is exactly what
-   * `record()` needs since it must stay synchronous end to end.
-   */
-  private static sleepSync(ms: number): void {
-    if (ms <= 0) return
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
-  }
-
-  /**
-   * Acquire the cross-process lock, or give up after `lockRetryBudgetMs` and
-   * return `false`. `mkdirSync` without `recursive` is an atomic
-   * create-or-fail at the OS level: exactly one concurrent caller's call
-   * succeeds, every other sees `EEXIST`. A lock whose mtime is older than
-   * `lockStaleAfterMs` is assumed abandoned by a process that crashed while
-   * holding it and is forcibly removed before retrying — two processes can
-   * both decide it's stale and both attempt this at once, but only one's
-   * `mkdirSync` on the way back in can win, and the other simply loops and
-   * sees a fresh lock it now has to wait out normally.
+   * Is the file at `path` a database this store may use?
    *
-   * Never throws: any unexpected `mkdirSync`/`statSync`/`rmSync` failure other
-   * than the `EEXIST` this function is built around is treated as "could not
-   * acquire" rather than propagated — a failing lock must degrade the same
-   * way a failing write already does.
+   * `lstat`, never `stat`: a symlink at the database path is never followed.
+   * SQLite would happily open the target — which is precisely how a private
+   * state directory turns into a write primitive aimed at someone else's file.
    */
-  private acquireLock(): boolean {
-    const deadline = Date.now() + this.lockRetryBudgetMs
+  private inspect(): 'ok' | 'missing' | 'foreign' {
+    let info
     try {
-      mkdirSync(this.directory, { recursive: true, mode: 0o700 })
+      info = lstatSync(this.path)
     } catch {
-      return false
+      // ENOENT is the normal first-run case; anything else (a parent that is
+      // not a directory, a permission problem) is equally "nothing usable".
+      return 'missing'
     }
-    for (;;) {
-      try {
-        mkdirSync(this.lockPath, { mode: 0o700 })
-        return true
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') return false
-      }
-      // Contended. A stale lock is cleared immediately and retried without
-      // spending any of the sleep budget on it; a live one is waited out.
-      try {
-        const info = lstatSync(this.lockPath)
-        if (Date.now() - info.mtimeMs > this.lockStaleAfterMs) {
-          try {
-            rmSync(this.lockPath, { recursive: true, force: true })
-          } catch {
-            /* another process is already clearing or recreating it */
-          }
-          continue
+    if (info.isSymbolicLink() || !info.isFile()) return 'foreign'
+    if (info.size > MAX_STORE_BYTES) return 'foreign'
+    if ((info.mode & 0o077) !== 0) return 'foreign'
+    if (typeof process.getuid === 'function' && info.uid !== process.getuid()) return 'foreign'
+    // A 0-byte file is a valid empty SQLite database, and is what this store
+    // creates itself to own the permissions before SQLite ever touches it.
+    if (info.size === 0) return 'ok'
+    if (info.size < SQLITE_MAGIC.length) return 'foreign'
+    let fd: number | undefined
+    try {
+      fd = openSync(this.path, 'r')
+      const header = Buffer.alloc(SQLITE_MAGIC.length)
+      const read = readSync(fd, header, 0, header.length, 0)
+      return read === header.length && header.equals(SQLITE_MAGIC) ? 'ok' : 'foreign'
+    } catch {
+      return 'foreign'
+    } finally {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd)
+        } catch {
+          /* nothing useful to do about a failed close of a read handle */
         }
-      } catch {
-        // Vanished between the failed mkdir and this stat (the holder just
-        // released it): loop straight back to the acquire attempt.
-        continue
       }
-      if (Date.now() >= deadline) return false
-      const jitter = Math.floor(Math.random() * LOCK_RETRY_BASE_MS)
-      ClaudeLifecycleStore.sleepSync(Math.max(1, Math.min(LOCK_RETRY_BASE_MS + jitter, deadline - Date.now())))
     }
   }
 
-  /** Release a lock THIS call acquired. Never call this on a path that did
-   *  not itself succeed at `acquireLock()`. */
-  private releaseLock(): void {
-    try {
-      rmSync(this.lockPath, { recursive: true, force: true })
-    } catch {
-      /* best-effort: a lock we can't remove will still self-heal via staleness */
-    }
-  }
-
-  private static fresh(): StoreFile {
-    return {
-      version: CLAUDE_LIFECYCLE_VERSION,
-      epoch: EMPTY_STORE_EPOCH,
-      nextSeq: 1,
-      droppedThrough: 0,
-      events: [],
+  /** Remove a database this store refuses to trust, together with any SQLite
+   *  sidecar belonging to it — an orphaned journal left beside a NEW database
+   *  would be rolled back into it. Only ever called on the write path, and
+   *  `rmSync` on a symlink removes the link, never its target. */
+  private discard(): void {
+    for (const suffix of ['', '-journal', '-wal', '-shm']) {
+      try {
+        rmSync(`${this.path}${suffix}`, { force: true })
+      } catch {
+        /* best effort: whatever survives is refused again on the next attempt */
+      }
     }
   }
 
   /**
-   * Read the store, refusing anything that is not demonstrably ours: a regular
-   * file, owned by this uid, readable by nobody else, within the size bound,
-   * parseable, and of the current version. Every refusal degrades to an empty
-   * store — a hook that threw here would be a hook that broke Claude.
+   * Open the database for writing, creating and replacing as needed.
+   *
+   * The empty file is created HERE, 0600, before SQLite sees the path. SQLite
+   * would otherwise create it itself at 0666 & ~umask — 0644 on a stock host —
+   * and offers no option to say otherwise. Creating it first means the mode is
+   * right from the instant the file exists rather than a chmod afterwards, and
+   * SQLite then inherits it for the `-journal` sidecar too (verified: a journal
+   * beside a 0600 database is itself 0600).
    */
-  private load(): StoreFile {
-    try {
-      const info = lstatSync(this.path)
-      if (!info.isFile()) return ClaudeLifecycleStore.fresh()
-      if (info.size > MAX_STORE_BYTES) return ClaudeLifecycleStore.fresh()
-      if ((info.mode & 0o077) !== 0) return ClaudeLifecycleStore.fresh()
-      if (typeof process.getuid === 'function' && info.uid !== process.getuid()) return ClaudeLifecycleStore.fresh()
-      const parsed: unknown = JSON.parse(readFileSync(this.path, 'utf8'))
-      if (!isStoreFile(parsed)) return ClaudeLifecycleStore.fresh()
-      // Drop individually malformed records rather than the whole store.
-      return { ...parsed, events: parsed.events.filter(isEvent) }
-    } catch {
-      return ClaudeLifecycleStore.fresh()
-    }
-  }
-
-  /** Write via a temp file and rename, so a concurrent reader sees either the
-   *  whole previous store or the whole new one and never a partial write. */
-  private persist(store: StoreFile): void {
+  private openForWrite(): DatabaseSync | undefined {
+    const sqlite = loadSqlite()
+    if (!sqlite) return undefined
     mkdirSync(this.directory, { recursive: true, mode: 0o700 })
-    const temporary = `${this.path}.${randomBytes(6).toString('hex')}.tmp`
-    writeFileSync(temporary, `${JSON.stringify(store)}\n`, { mode: 0o600 })
-    try {
-      renameSync(temporary, this.path)
-    } catch (error) {
+    if (this.inspect() === 'foreign') this.discard()
+    if (this.inspect() === 'missing') {
       try {
-        rmSync(temporary, { force: true })
-      } catch {
-        /* already gone */
+        closeSync(openSync(this.path, 'wx', 0o600))
+      } catch (error) {
+        // EEXIST: another hook process created it in the same instant, which
+        // is fine — it created it in exactly this way.
+        if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error
       }
-      throw error
+      // openSync's mode argument is masked by the umask; this is not.
+      chmodSync(this.path, 0o600)
     }
+    return this.configure(new sqlite.DatabaseSync(this.path))
   }
 
-  /** Enforce the retention bounds, recording how far history was dropped so a
-   *  reader can be told its seq no longer covers everything. */
-  private applyRetention(store: StoreFile, now: number): StoreFile {
-    let events = store.events.filter((e) => {
-      const age = now - Date.parse(e.ts)
-      return !Number.isFinite(age) || age <= MAX_EVENT_AGE_MS
-    })
-    if (events.length > MAX_RETAINED_EVENTS) events = events.slice(events.length - MAX_RETAINED_EVENTS)
-    // Byte bound as a backstop against unexpectedly large records.
-    while (events.length > 1 && Buffer.byteLength(JSON.stringify(events), 'utf8') > MAX_STORE_BYTES) {
-      events.shift()
+  /**
+   * Open the database for reading, or `undefined` when there is nothing
+   * trustworthy to read. Never creates the file — a read must not bring a store
+   * into existence.
+   *
+   * Opened read-write rather than read-only so a hot journal left by a writer
+   * that died mid-commit is rolled back by this open. A read-only handle cannot
+   * do that: it would report the store empty until some other process happened
+   * to write, which on this path means ignoring a completion that is already
+   * durably on disk.
+   */
+  private openForRead(): DatabaseSync | undefined {
+    const sqlite = loadSqlite()
+    if (!sqlite) return undefined
+    if (this.inspect() !== 'ok') return undefined
+    return this.configure(new sqlite.DatabaseSync(this.path))
+  }
+
+  /** The one place the bounded lock wait is set. `busy_timeout` takes a
+   *  literal, and this one comes from a number this class has already
+   *  truncated and floored — never from caller text. */
+  private configure(db: DatabaseSync): DatabaseSync {
+    db.exec(`PRAGMA busy_timeout = ${this.busyTimeoutMs}`)
+    return db
+  }
+
+  /** The store's version stamp, from the database header. 0 on a database that
+   *  has never been initialised, including a 0-byte file. */
+  private static userVersion(db: DatabaseSync): number {
+    return asInteger(db.prepare('PRAGMA user_version').get()?.user_version) ?? 0
+  }
+
+  /** Everything `snapshot` and `readAfter` need about the store as a whole. */
+  private static state(db: DatabaseSync): StoreState {
+    const meta = db.prepare('SELECT epoch, dropped_through FROM meta WHERE id = 1').get()
+    const epoch = typeof meta?.epoch === 'string' && meta.epoch.length > 0 ? meta.epoch : EMPTY_STORE_EPOCH
+    const droppedThrough = Math.max(0, asInteger(meta?.dropped_through) ?? 0)
+    // The AUTOINCREMENT high-water mark survives retention deletes, so it — not
+    // the newest surviving row — is what "highest seq ever issued" means.
+    const issued = db
+      .prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0) AS issued")
+      .get()
+    const newest = db.prepare('SELECT COALESCE(MAX(seq), 0) AS newest FROM events').get()
+    const highWater = Math.max(0, asInteger(issued?.issued) ?? 0, asInteger(newest?.newest) ?? 0)
+    return { epoch, droppedThrough, highWater }
+  }
+
+  /**
+   * One stored row as an event, or `undefined` if the row is not one.
+   *
+   * The database enforces what a CHECK constraint can; this enforces what it
+   * cannot (the identity grammar, a usable timestamp) so a single bad row —
+   * written by hand, or by a future version — costs that row and not the whole
+   * store. `id` is DERIVED rather than stored: it is a pure function of the
+   * epoch, the two identities, the kind and the seq, so the value `record()`
+   * returns and the value a later read returns cannot drift, and there is no id
+   * column for a stray writer to put something arbitrary in.
+   */
+  private static rowToEvent(row: Record<string, unknown>, epoch: string): ClaudeLifecycleEvent | undefined {
+    const seq = asInteger(row.seq)
+    const tsMs = asInteger(row.ts_ms)
+    const kind = row.kind
+    const tandemSession = row.tandem_session
+    const claudeSessionId = row.claude_session_id
+    if (seq === undefined || seq <= 0) return undefined
+    if (tsMs === undefined) return undefined
+    if (typeof kind !== 'string' || !KINDS.has(kind)) return undefined
+    if (!isOpaqueIdentity(tandemSession) || !isOpaqueIdentity(claudeSessionId)) return undefined
+    let ts: string
+    try {
+      ts = new Date(tsMs).toISOString()
+    } catch {
+      return undefined
     }
-    const oldestKept = events.length > 0 ? events[0]!.seq : store.nextSeq
-    const droppedThrough = Math.max(store.droppedThrough, oldestKept - 1)
-    return { ...store, events, droppedThrough }
+    const message = typeof row.message === 'string' && row.message.length > 0 ? row.message : undefined
+    return {
+      v: CLAUDE_LIFECYCLE_VERSION,
+      id: eventId(epoch, tandemSession, claudeSessionId, kind as ClaudeLifecycleKind, seq),
+      seq,
+      ts,
+      kind: kind as ClaudeLifecycleKind,
+      tandemSession,
+      claudeSessionId,
+      ...(message ? { message } : {}),
+      ...(row.message_truncated === 1 ? { messageTruncated: true } : {}),
+    }
   }
 
   /**
@@ -473,74 +605,135 @@ export class ClaudeLifecycleStore {
    */
   record(input: ClaudeLifecycleInput): ClaudeLifecycleEvent | undefined {
     try {
-      if (
-        input.kind !== 'stop' &&
-        input.kind !== 'stop_failure' &&
-        input.kind !== 'prompt_submit' &&
-        input.kind !== 'interrupt' &&
-        input.kind !== 'close'
-      ) {
-        return undefined
-      }
+      if (!KINDS.has(input.kind)) return undefined
       if (!isOpaqueIdentity(input.tandemSession)) return undefined
       if (!isOpaqueIdentity(input.claudeSessionId)) return undefined
-
-      // The whole load -> compute-next-seq -> persist span below is the
-      // transaction that must be serialized across processes (see the module
-      // doc comment "CROSS-PROCESS SAFETY"). Acquisition failure degrades
-      // exactly like an unwritable store: no event, no throw, nothing written.
-      if (!this.acquireLock()) return undefined
       try {
-        const loaded = this.load()
-        // Mint the real store epoch on the first persisted write; until then
-        // the store carries the deterministic empty-store epoch (see above).
-        const store =
-          loaded.epoch === EMPTY_STORE_EPOCH ? { ...loaded, epoch: randomBytes(8).toString('hex') } : loaded
+        return this.insert(input)
+      } catch (error) {
+        // A database written by a version whose schema this one does not know.
+        // Replacing it is the documented behaviour of a version bump ("older
+        // state is discarded"), and one retry is enough because the retry runs
+        // against a file this process just created.
+        if (!(error instanceof IncompatibleStoreError)) throw error
+        this.discard()
+        return this.insert(input)
+      }
+    } catch {
+      return undefined
+    }
+  }
 
-        const seq = store.nextSeq
-        const now = input.now ?? new Date()
-        const id =
-          'cl_' +
-          createHash('sha256')
-            .update([store.epoch, input.tandemSession, input.claudeSessionId, input.kind, String(seq)].join(' '))
-            .digest('hex')
-            .slice(0, 20)
+  /**
+   * The whole write, as ONE SQLite transaction: schema, epoch, insert,
+   * retention and the dropped-through watermark either all land or none do.
+   *
+   * `BEGIN IMMEDIATE`, not a bare `BEGIN`. A deferred transaction takes a read
+   * lock first and only tries to upgrade to a write lock at its first write,
+   * and SQLite refuses to run the busy handler for that upgrade (two upgraders
+   * would deadlock), returning SQLITE_BUSY at once instead of waiting.
+   * `IMMEDIATE` takes the write lock up front, where `busy_timeout` applies —
+   * which is what makes the bounded wait actually bound anything.
+   */
+  private insert(input: ClaudeLifecycleInput): ClaudeLifecycleEvent | undefined {
+    const db = this.openForWrite()
+    if (!db) return undefined
+    try {
+      const version = ClaudeLifecycleStore.userVersion(db)
+      if (version !== 0 && version !== CLAUDE_LIFECYCLE_VERSION) throw new IncompatibleStoreError()
 
-        // Only `stop` ever carries a message. `stop_failure` has none to
-        // carry; `prompt_submit`, `interrupt` and `close` carry NONE,
-        // unconditionally — this is a hard invariant, not merely "usually
-        // omitted": neither the hook (prompt_submit) nor Tandem itself
-        // (interrupt/close) is trusted to have withheld content on the
-        // caller's side. This store enforces it independently, even if a
-        // future caller passed one through by mistake.
-        const raw = input.kind === 'stop' && typeof input.message === 'string' ? input.message : undefined
-        const message = raw ? sanitizeEventText(raw, MAX_MESSAGE_CHARS) : undefined
-        // "Truncated" is about the CLAMP, not about redaction: the sanitiser
-        // also shortens text by replacing secrets, and calling that
-        // truncation would mislead a reader into thinking the tail was lost.
-        const messageTruncated = raw !== undefined && raw.length > MAX_MESSAGE_CHARS
+      const now = input.now ?? new Date()
+      // Throws on an unusable Date, before anything has been written.
+      const ts = now.toISOString()
+      const tsMs = now.getTime()
 
-        const event: ClaudeLifecycleEvent = {
+      // Only `stop` ever carries a message. `stop_failure` has none to carry;
+      // `prompt_submit`, `interrupt` and `close` carry NONE, unconditionally —
+      // this is a hard invariant, not merely "usually omitted": neither the
+      // hook (prompt_submit) nor Tandem itself (interrupt/close) is trusted to
+      // have withheld content on the caller's side. This store enforces it
+      // independently, even if a future caller passed one through by mistake.
+      const raw = input.kind === 'stop' && typeof input.message === 'string' ? input.message : undefined
+      const sanitized = raw ? sanitizeEventText(raw, MAX_MESSAGE_CHARS) : undefined
+      const message = sanitized && sanitized.length > 0 ? sanitized : undefined
+      // "Truncated" is about the CLAMP, not about redaction: the sanitiser also
+      // shortens text by replacing secrets, and calling that truncation would
+      // mislead a reader into thinking the tail was lost.
+      const messageTruncated = raw !== undefined && raw.length > MAX_MESSAGE_CHARS
+
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        db.exec(SCHEMA)
+        // Interpolated because PRAGMA takes no bound parameters; the value is
+        // this module's own integer constant, never anything from a caller.
+        if (version === 0) db.exec(`PRAGMA user_version = ${CLAUDE_LIFECYCLE_VERSION}`)
+        // Mint the real store epoch on the first write that lands. Whichever
+        // writer gets here first wins; every other one's INSERT is ignored and
+        // it reads that same epoch straight back.
+        db.prepare('INSERT OR IGNORE INTO meta (id, epoch, dropped_through) VALUES (1, ?, 0)').run(
+          randomBytes(8).toString('hex'),
+        )
+        const epoch = db.prepare('SELECT epoch FROM meta WHERE id = 1').get()?.epoch
+        if (typeof epoch !== 'string' || epoch.length === 0) throw new Error('lifecycle store has no epoch')
+
+        const inserted = db
+          .prepare(
+            `INSERT INTO events (ts_ms, kind, tandem_session, claude_session_id, message, message_truncated)
+             VALUES (?, ?, ?, ?, ?, ?) RETURNING seq`,
+          )
+          .get(
+            tsMs,
+            input.kind,
+            input.tandemSession,
+            input.claudeSessionId,
+            message ?? null,
+            messageTruncated ? 1 : 0,
+          )
+        const seq = asInteger(inserted?.seq)
+        if (seq === undefined || seq <= 0) throw new Error('lifecycle store issued no sequence')
+
+        // Retention, in the same transaction as the insert. Neither delete
+        // touches `sqlite_sequence`, so dropping a row never frees its seq for
+        // reuse — the next insert always gets a strictly higher one.
+        db.prepare('DELETE FROM events WHERE ts_ms < ?').run(tsMs - MAX_EVENT_AGE_MS)
+        db.prepare('DELETE FROM events WHERE seq NOT IN (SELECT seq FROM events ORDER BY seq DESC LIMIT ?)').run(
+          MAX_RETAINED_EVENTS,
+        )
+
+        // How far history has been dropped, so a reader holding an older seq
+        // can be told its window no longer covers everything.
+        const oldestKept = asInteger(db.prepare('SELECT MIN(seq) AS oldest FROM events').get()?.oldest) ?? seq + 1
+        db.prepare('UPDATE meta SET dropped_through = max(dropped_through, ?) WHERE id = 1').run(
+          Math.max(0, oldestKept - 1),
+        )
+
+        db.exec('COMMIT')
+
+        return {
           v: CLAUDE_LIFECYCLE_VERSION,
-          id,
+          id: eventId(epoch, input.tandemSession, input.claudeSessionId, input.kind, seq),
           seq,
-          ts: now.toISOString(),
+          ts,
           kind: input.kind,
           tandemSession: input.tandemSession,
           claudeSessionId: input.claudeSessionId,
           ...(message ? { message } : {}),
           ...(messageTruncated ? { messageTruncated: true } : {}),
         }
-
-        this.persist(
-          this.applyRetention({ ...store, nextSeq: seq + 1, events: [...store.events, event] }, now.getTime()),
-        )
-        return event
-      } finally {
-        this.releaseLock()
+      } catch (error) {
+        try {
+          db.exec('ROLLBACK')
+        } catch {
+          /* already rolled back, or never begun */
+        }
+        throw error
       }
-    } catch {
-      return undefined
+    } finally {
+      try {
+        db.close()
+      } catch {
+        /* nothing useful to do about a failed close */
+      }
     }
   }
 
@@ -551,9 +744,8 @@ export class ClaudeLifecycleStore {
    * Never throws: an unreadable store reports an empty one.
    */
   snapshot(): ClaudeLifecycleCursor {
-    const store = this.load()
-    const highest = store.events.length > 0 ? store.events[store.events.length - 1]!.seq : store.nextSeq - 1
-    return { seq: Math.max(0, highest), storeEpoch: store.epoch }
+    const state = this.read((db) => ClaudeLifecycleStore.state(db)) ?? EMPTY_STATE
+    return { seq: state.highWater, storeEpoch: state.epoch }
   }
 
   /**
@@ -566,27 +758,89 @@ export class ClaudeLifecycleStore {
    * Never throws.
    */
   readAfter(seq: number, opts: { limit?: number; storeEpoch?: string } = {}): ClaudeLifecyclePage {
-    const store = this.load()
     const after = Number.isSafeInteger(seq) && seq > 0 ? seq : 0
     const limit = Math.max(1, Math.min(opts.limit ?? DEFAULT_PAGE_LIMIT, MAX_RETAINED_EVENTS))
 
+    const read = this.read((db) => ({
+      state: ClaudeLifecycleStore.state(db),
+      // One row past the page, so "is there more" costs no second query.
+      rows: db
+        .prepare(`SELECT ${EVENT_COLUMNS} FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?`)
+        .all(after, limit + 1),
+    }))
+    const state = read?.state ?? EMPTY_STATE
+    const rows = read?.rows ?? []
+
+    const more = rows.length > limit
+    const events: ClaudeLifecycleEvent[] = []
+    let consumedThrough = after
+    for (const row of rows.slice(0, limit)) {
+      const event = ClaudeLifecycleStore.rowToEvent(row, state.epoch)
+      if (event) events.push(event)
+      // Advance past rows that were read but refused, too, so a page made
+      // entirely of unusable rows still moves the cursor forward instead of
+      // handing the caller the same rows for ever.
+      const rawSeq = asInteger(row.seq)
+      if (rawSeq !== undefined && rawSeq > consumedThrough) consumedThrough = rawSeq
+    }
+
     const epochChanged =
-      opts.storeEpoch !== undefined && opts.storeEpoch !== EMPTY_STORE_EPOCH && opts.storeEpoch !== store.epoch
-    const newer = store.events.filter((e) => e.seq > after).sort((a, b) => a.seq - b.seq)
-    const events = newer.slice(0, limit)
-    const highest = events.length > 0 ? events[events.length - 1]!.seq : Math.max(after, store.droppedThrough)
+      opts.storeEpoch !== undefined && opts.storeEpoch !== EMPTY_STORE_EPOCH && opts.storeEpoch !== state.epoch
 
     return {
       version: CLAUDE_LIFECYCLE_VERSION,
       events,
-      seq: highest,
-      storeEpoch: store.epoch,
-      more: newer.length > events.length,
+      seq: Math.max(after, state.droppedThrough, consumedThrough),
+      storeEpoch: state.epoch,
+      more,
       // Only a genuine gap counts: the caller asked for everything after a seq
       // that retention has already dropped past, or the store was replaced.
-      truncated: epochChanged || after < store.droppedThrough,
+      truncated: epochChanged || after < state.droppedThrough,
     }
   }
+
+  /** Run a read against the store, or return `undefined` when there is nothing
+   *  trustworthy to read or the read itself fails. The single place the read
+   *  paths' "degrade to empty, never throw" promise is kept. */
+  private read<T>(fn: (db: DatabaseSync) => T): T | undefined {
+    let db: DatabaseSync | undefined
+    try {
+      db = this.openForRead()
+      if (!db) return undefined
+      if (ClaudeLifecycleStore.userVersion(db) !== CLAUDE_LIFECYCLE_VERSION) return undefined
+      return fn(db)
+    } catch {
+      return undefined
+    } finally {
+      if (db) {
+        try {
+          db.close()
+        } catch {
+          /* nothing useful to do about a failed close */
+        }
+      }
+    }
+  }
+}
+
+/** The record id: a pure function of the store's identity, the two supplied
+ *  identities, the kind and the seq. Derived in exactly one place so the value
+ *  `record()` returns and the value `readAfter()` returns are the same by
+ *  construction rather than by agreement. */
+function eventId(
+  epoch: string,
+  tandemSession: string,
+  claudeSessionId: string,
+  kind: ClaudeLifecycleKind,
+  seq: number,
+): string {
+  return (
+    'cl_' +
+    createHash('sha256')
+      .update([epoch, tandemSession, claudeSessionId, kind, String(seq)].join(' '))
+      .digest('hex')
+      .slice(0, 20)
+  )
 }
 
 /** Process-wide store, memoized per resolved directory so a changed
