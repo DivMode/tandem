@@ -85,13 +85,25 @@ export function isClaudeTurnBaseline(value: unknown): value is ClaudeTurnBaselin
 /**
  * The FIRST turn boundary this worker reported after `baseline`, or undefined.
  *
- * Oldest-first, deliberately: the first record after the baseline is the
- * boundary of the turn that baseline opened. A later one belongs to whatever
- * came next and is not this turn's to consume.
+ * REQUIRES AN ORDERED PAIR, NOT JUST ANY STOP AFTER THE BASELINE. A `stop`/
+ * `stop_failure` only counts once a `prompt_submit` for the SAME session has
+ * already been seen after the baseline — first the prompt lands, then the
+ * turn ends. This is what makes a stray, late-arriving `Stop` from a turn that
+ * was interrupted or superseded (see turn-ledger.ts) harmless: its `seq` can
+ * land after a fresh baseline was taken (the abort races the store write), but
+ * it lands BEFORE the new turn's own `prompt_submit`, so it is skipped rather
+ * than mistaken for the new turn's boundary. A `stop` with no `prompt_submit`
+ * after the baseline yet is exactly "still waiting" — not evidence of anything.
+ *
+ * Both records are searched oldest-first: the first `prompt_submit` after the
+ * baseline is the submit THIS turn's instruction produced, and the first
+ * `stop`/`stop_failure` after THAT is its boundary. A later record of either
+ * kind belongs to whatever came next and is not this turn's to consume.
  *
  * Never throws. Every way of not knowing — no baseline, an unreadable store, a
- * reset store, a record from a different worker — returns undefined, which
- * leaves the caller exactly where it was before this path existed.
+ * reset store, a record from a different worker, a submit with no stop yet —
+ * returns undefined, which leaves the caller exactly where it was before this
+ * path existed.
  */
 export function claudeTurnEndAfter(
   baseline: ClaudeTurnBaseline | undefined,
@@ -106,7 +118,11 @@ export function claudeTurnEndAfter(
     // Retention dropped past the baseline, or the store was replaced: the seqs
     // are not comparable, so nothing here is evidence about this turn.
     if (page.truncated) return undefined
-    const event = page.events.find((e) => e.seq > baseline.seq && e.tandemSession === baseline.session)
+
+    const own = page.events.filter((e) => e.seq > baseline.seq && e.tandemSession === baseline.session)
+    const submit = own.find((e) => e.kind === 'prompt_submit')
+    if (!submit) return undefined
+    const event = own.find((e) => e.seq > submit.seq && (e.kind === 'stop' || e.kind === 'stop_failure'))
     if (!event) return undefined
     return {
       kind: event.kind,
@@ -117,5 +133,43 @@ export function claudeTurnEndAfter(
   } catch {
     // A store that cannot answer must never break the poll it was consulted on.
     return undefined
+  }
+}
+
+/** Whether a Claude session's lifecycle history looks ready for a new
+ *  instruction, or still busy with one nobody told Tandem about. */
+export type ClaudeLifecycleReadiness = 'ready' | 'busy' | 'unknown'
+
+/**
+ * The state implied by the LATEST lifecycle record for `tandemSession`,
+ * independent of any turn ledger baseline.
+ *
+ * WHY THIS EXISTS SEPARATELY FROM `claudeTurnEndAfter`. That function answers
+ * "did the turn I opened finish?" — scoped to a baseline. This answers a
+ * different question with no baseline in scope at all: "is anything running
+ * right now?" A bare `prompt_submit` with nothing after it means something —
+ * a human at the TUI, a race, another tool — submitted a prompt to this exact
+ * Claude process outside Tandem's own send(), and it looks to still be
+ * running. Tandem has no baseline for that turn (it never opened one), so
+ * `claudeTurnEndAfter` has nothing to say about it; this does.
+ *
+ * 'ready'   — the latest record is a `stop`/`stop_failure`: nothing pending.
+ * 'busy'    — the latest record is a `prompt_submit`: something is mid-turn.
+ * 'unknown' — no record at all for this session; no lifecycle signal either way.
+ *
+ * Never throws: an unreadable store answers 'unknown', the same as no history.
+ */
+export function claudeLifecycleReadiness(
+  tandemSession: string,
+  store: ClaudeLifecycleStore = defaultClaudeLifecycleStore(),
+): ClaudeLifecycleReadiness {
+  try {
+    const page = store.readAfter(0, { limit: MAX_RETAINED_EVENTS })
+    const own = page.events.filter((e) => e.tandemSession === tandemSession)
+    if (own.length === 0) return 'unknown'
+    const latest = own.reduce((a, b) => (b.seq > a.seq ? b : a))
+    return latest.kind === 'prompt_submit' ? 'busy' : 'ready'
+  } catch {
+    return 'unknown'
   }
 }

@@ -7,10 +7,18 @@ inference reportable exactly once — without making it true. When the inference
 is wrong the pane keeps reporting `working` after the worker has finished, and
 the turn stays stranded until a foreman gives up on it.
 
-Claude's `Stop` / `StopFailure` lifecycle hook is a different kind of signal.
-Claude runs it in its own process, at its own turn boundary, and hands it
-structured JSON stating that the turn ended and whether it ended cleanly. This
-document is how an operator turns that on.
+Claude's `Stop` / `StopFailure` lifecycle hooks are a different kind of signal.
+Claude runs each in its own process, at its own turn boundary, and hands it
+structured JSON stating that the turn ended and whether it ended cleanly.
+`UserPromptSubmit` is a third hook, registered alongside them: it fires the
+moment a prompt lands, before the turn that answers it. Tandem records that a
+submit happened — never what was submitted — and requires one after a turn's
+baseline before trusting the `Stop`/`StopFailure` that follows it. That closes
+a race a `Stop`-only signal could not: a stray `Stop` from a turn that was just
+interrupted or superseded can still land, with a `seq` after the new turn's
+baseline, before the new turn has even reached Claude — and without a submit to
+order against, it would be mistaken for the new turn's own boundary. This
+document is how an operator turns all of this on.
 
 **It is entirely optional.** Unconfigured is the default and changes nothing:
 no flag, no environment, a spawn byte-identical to the one before this existed,
@@ -60,7 +68,8 @@ writes to stdout.
 
 ## The settings file
 
-Exactly this, with both events registered:
+Exactly this, with all three events registered — the same command handles all
+of them; it dispatches on `hook_event_name` internally:
 
 ```json
 {
@@ -70,10 +79,19 @@ Exactly this, with both events registered:
     ],
     "StopFailure": [
       { "hooks": [{ "type": "command", "command": "tandem-claude-stop-hook" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "tandem-claude-stop-hook" }] }
     ]
   }
 }
 ```
+
+`UserPromptSubmit` is not optional if you want trusted completion to actually
+work: without it, a session's `Stop`/`StopFailure` records have no submit to
+order against, `claudeTurnEndAfter` never resolves, and every turn silently
+falls back to the terminal-pane heuristic — exactly as if no hook were
+configured at all, with no error to say so.
 
 If `tandem-claude-stop-hook` is not on the `PATH` the workers inherit, use its
 absolute path instead — under Nix, `${pkgs.tandem}/bin/tandem-claude-stop-hook`,
@@ -127,6 +145,7 @@ let
     hooks = {
       Stop = [ { hooks = [ { type = "command"; command = stopHook; } ]; } ];
       StopFailure = [ { hooks = [ { type = "command"; command = stopHook; } ]; } ];
+      UserPromptSubmit = [ { hooks = [ { type = "command"; command = stopHook; } ]; } ];
     };
   });
 
@@ -187,7 +206,7 @@ The outcomes, and what each means:
 | `recorded` | The transition is in the store. |
 | `not_tandem` | No `TANDEM_SESSION_ID` — a Claude started by hand, which Tandem has no business recording and no way to attribute. |
 | `ignored` | Not a payload this hook handles: another event name, empty, oversized, or unparseable. |
-| `invalid` | A `Stop`/`StopFailure` whose required fields are missing or unusable. |
+| `invalid` | A `Stop`/`StopFailure`/`UserPromptSubmit` whose required fields are missing or unusable. |
 | `unwritable` | The store refused the write. |
 
 **The store itself**, at `$TANDEM_STATE_DIR/claude-lifecycle/` (default
@@ -203,6 +222,11 @@ is clamped and passed through the same event sanitiser as every other summary
 before it reaches disk. `StopFailure` carries no message and none is guessed at
 from another field.
 
+`UserPromptSubmit` carries a `prompt` field. It is never read. The record it
+produces exists to prove a submit happened, not to carry what was submitted —
+the store enforces this independently of the hook, so a `prompt_submit` record
+can never carry a message even if a future edit to the hook tried to pass one.
+
 Never read and never stored: `cwd` and `transcript_path`.
 
 The Tandem session id is derived, not minted: a hash of the installation's
@@ -214,9 +238,9 @@ directly.
 
 ## What it fixes, and what it does not
 
-With the hook configured, a Claude worker's own `Stop` ends the turn Tandem was
-waiting on, so a finished worker no longer sits in `working` until someone gives
-up on it.
+With the hooks configured, a Claude worker's own `Stop` — preceded by its own
+`UserPromptSubmit` — ends the turn Tandem was waiting on, so a finished worker
+no longer sits in `working` until someone gives up on it.
 
 It does not make Tandem able to wake a dormant chat client — nothing can; see
 [foreman-events.md](foreman-events.md). And `working` still never justifies

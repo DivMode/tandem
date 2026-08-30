@@ -94,6 +94,51 @@ describe("StopFailure", () => {
   });
 });
 
+describe("UserPromptSubmit", () => {
+  it("records the submit boundary, distinctly from Stop/StopFailure", () => {
+    const { store } = freshStore();
+    const result = handleClaudeStopHook(
+      JSON.stringify({
+        session_id: CLAUDE_SESSION,
+        transcript_path: "/Users/peter/.claude/projects/x.jsonl",
+        cwd: "/Users/peter/Developer/tooling/tandem",
+        hook_event_name: "UserPromptSubmit",
+        prompt: "please fix the bug",
+      }),
+      { store, env: ENV },
+    );
+    expect(result).toMatchObject({ exitCode: 0, stdout: "", outcome: "recorded" });
+    expect(result.event).toMatchObject({
+      kind: "prompt_submit",
+      tandemSession: TANDEM_SESSION,
+      claudeSessionId: CLAUDE_SESSION,
+    });
+  });
+
+  it("never reads or stores the prompt field", () => {
+    const { store } = freshStore();
+    const result = handleClaudeStopHook(
+      JSON.stringify({
+        session_id: CLAUDE_SESSION,
+        hook_event_name: "UserPromptSubmit",
+        prompt: "this must never reach disk",
+      }),
+      { store, env: ENV },
+    );
+    expect(result.event!.message).toBeUndefined();
+    expect(JSON.stringify(result.event)).not.toContain("this must never reach disk");
+  });
+
+  it("is not_tandem when there is no TANDEM_SESSION_ID, same as Stop", () => {
+    const { store } = freshStore();
+    const result = handleClaudeStopHook(
+      JSON.stringify({ session_id: CLAUDE_SESSION, hook_event_name: "UserPromptSubmit", prompt: "hi" }),
+      { store, env: {} },
+    );
+    expect(result.outcome).toBe("not_tandem");
+  });
+});
+
 describe("malformed and foreign input", () => {
   const cases: Array<[string, string]> = [
     ["empty stdin", ""],

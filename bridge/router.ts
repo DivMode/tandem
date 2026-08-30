@@ -66,7 +66,12 @@ import {
 } from './sessions.ts'
 import * as relay from './relay.ts'
 import { emitCompletion, emitLifecycle, summarize, type EmitTurn } from './events.ts'
-import { claudeTurnEndAfter, type ClaudeTurnBaseline, type ClaudeTurnEnd } from './claude-completion.ts'
+import {
+  claudeLifecycleReadiness,
+  claudeTurnEndAfter,
+  type ClaudeTurnBaseline,
+  type ClaudeTurnEnd,
+} from './claude-completion.ts'
 import { defaultClaudeLifecycleStore } from './claude-lifecycle-store.ts'
 import { tandemSessionIdFor } from './claude-worker-env.ts'
 import { defaultTurnLedger } from './turn-ledger.ts'
@@ -660,6 +665,81 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
   // because the ledger claims it once and the claim is durable.
   const identity = await agentIdentityOf(session)
   const ledger = defaultTurnLedger()
+
+  // LIFECYCLE-AWARE GUARDS (Claude only — no other engine has a hook writing
+  // into the lifecycle store, so `claudeBaselineFor` is undefined for them and
+  // none of this fires; behaviour there is untouched).
+  //
+  // A second send while a Claude turn is genuinely still pending is REJECTED
+  // rather than superseded: overlapping instructions into a session whose
+  // completion Tandem trusts is a caller bug, not a legitimate interrupt, and
+  // the caller has interrupt_session to say so explicitly. "Genuinely" is the
+  // load-bearing word — a STALE pending turn whose Stop already landed in the
+  // trusted store, with the backend simply not having caught up, must not
+  // block a new send forever (see claude-completion.ts's claudeTurnEndAfter):
+  // that stale turn is resolved here, exactly as a poll would, and the send
+  // proceeds into a clean new turn.
+  //
+  // `claudeBaselineFor` takes a baseline for EVERY Claude session, whether or
+  // not the operator has actually wired up the hook (see its own comment) —
+  // it is cheap and harmless for `claudeTurnEndAfter` to consult and find
+  // nothing. The reject below must not make that harmless-when-unused baseline
+  // load-bearing: on a host with no hook configured, no lifecycle record is
+  // EVER written for this Tandem session, `claudeTurnEndAfter` never resolves,
+  // and rejecting on that basis would block every second send forever — the
+  // opposite of "unconfigured changes nothing" (see claude-worker-env.ts and
+  // docs/claude-completion-hook.md). So the reject only fires once this exact
+  // session has produced AT LEAST ONE lifecycle record, ever — real evidence
+  // the hook is actually wired up and firing for it, not merely that the
+  // engine happens to be Claude.
+  if (session.engine === 'claude') {
+    const tandemSession = tandemSessionIdFor(name)
+    const pendingBaseline = ledger.pendingBaseline(name, identity)
+    if (pendingBaseline) {
+      const ended = claudeTurnEndAfter(pendingBaseline)
+      if (!ended) {
+        if (claudeLifecycleReadiness(tandemSession) === 'unknown') {
+          // No lifecycle evidence has ever been seen for this session: the
+          // hook is not (yet, or ever) wired up. Fall through to the legacy
+          // supersede path below rather than rejecting on a signal that will
+          // never arrive.
+        } else {
+          return err(409, `session "${name}" has a Tandem turn already pending; call interrupt_session first`)
+        }
+      } else if (ended.kind === 'stop') {
+        const ref = ledger.completeTurn(name, identity)
+        if (ref) {
+          emitCompletion({
+            type: 'session',
+            id: name,
+            cursor: 0,
+            summary: summarize(ended.message ?? ''),
+            cwd: session.cwd,
+            turn: turnOf(session, ref),
+          })
+        }
+      } else {
+        const ref = ledger.abortTurn(name, identity)
+        if (ref) {
+          emitLifecycle({
+            type: 'session',
+            id: name,
+            kind: 'error',
+            reason: 'Claude reported StopFailure: the turn ended in failure and needs review',
+            turn: turnOf(session, ref),
+          })
+        }
+      }
+    } else if (claudeLifecycleReadiness(tandemSession) === 'busy') {
+      // No Tandem turn is pending, but the last thing this Claude process
+      // reported is an UNMATCHED prompt_submit — something submitted a prompt
+      // to it outside Tandem's own send() (a human at the TUI, most likely),
+      // and it looks to still be running. Sending now would interleave with
+      // that live external turn.
+      return err(409, `session "${name}" has an unmatched external prompt in progress`)
+    }
+  }
+
   // Snapshot the lifecycle store BEFORE the instruction goes out, and park it
   // with the pending turn. It is what stops the PREVIOUS turn's `Stop` — still
   // retained in the store — from ending this one the moment it is polled, and

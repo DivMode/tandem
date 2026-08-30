@@ -83,12 +83,19 @@ const DEFAULT_PAGE_LIMIT = 100
 export const SESSION_ID_ENV = 'TANDEM_SESSION_ID'
 
 /**
- * The two turn boundaries Claude reports. They are kept distinct rather than
- * flattened to "done": a foreman acts differently on a turn that ended cleanly
- * and one that ended in failure, and collapsing them here would make that
- * distinction unrecoverable downstream.
+ * The turn boundaries Claude reports. `stop`/`stop_failure` are kept distinct
+ * rather than flattened to "done": a foreman acts differently on a turn that
+ * ended cleanly and one that ended in failure, and collapsing them here would
+ * make that distinction unrecoverable downstream.
+ *
+ * `prompt_submit` (Claude's `UserPromptSubmit` hook) is a THIRD, earlier
+ * boundary: the moment a prompt lands, whoever sent it. It carries no message
+ * — see claude-stop-hook.ts — and exists only so a later `stop`/`stop_failure`
+ * can be trusted to belong to the turn Tandem opened rather than to a stray
+ * record still sitting in this append-only, shared-by-every-worker store (see
+ * claude-completion.ts's claudeTurnEndAfter).
  */
-export type ClaudeLifecycleKind = 'stop' | 'stop_failure'
+export type ClaudeLifecycleKind = 'stop' | 'stop_failure' | 'prompt_submit'
 
 export interface ClaudeLifecycleEvent {
   v: number
@@ -105,7 +112,8 @@ export interface ClaudeLifecycleEvent {
   tandemSession: string
   /** Claude's own opaque session id, straight from the hook payload. */
   claudeSessionId: string
-  /** Sanitised, clamped last assistant message (`Stop` only, when present). */
+  /** Sanitised, clamped last assistant message (`Stop` only, when present).
+   *  A `prompt_submit` record NEVER carries one — see `record()`. */
   message?: string
   /** The message was longer than the clamp and was cut. */
   messageTruncated?: boolean
@@ -184,7 +192,7 @@ function isEvent(value: unknown): value is ClaudeLifecycleEvent {
     Number.isSafeInteger(c.seq) &&
     c.seq > 0 &&
     typeof c.ts === 'string' &&
-    (c.kind === 'stop' || c.kind === 'stop_failure') &&
+    (c.kind === 'stop' || c.kind === 'stop_failure' || c.kind === 'prompt_submit') &&
     isOpaqueIdentity(c.tandemSession) &&
     isOpaqueIdentity(c.claudeSessionId) &&
     (c.message === undefined || typeof c.message === 'string')
@@ -302,7 +310,7 @@ export class ClaudeLifecycleStore {
    */
   record(input: ClaudeLifecycleInput): ClaudeLifecycleEvent | undefined {
     try {
-      if (input.kind !== 'stop' && input.kind !== 'stop_failure') return undefined
+      if (input.kind !== 'stop' && input.kind !== 'stop_failure' && input.kind !== 'prompt_submit') return undefined
       if (!isOpaqueIdentity(input.tandemSession)) return undefined
       if (!isOpaqueIdentity(input.claudeSessionId)) return undefined
 
@@ -320,7 +328,11 @@ export class ClaudeLifecycleStore {
           .digest('hex')
           .slice(0, 20)
 
-      const raw = typeof input.message === 'string' ? input.message : undefined
+      // A prompt_submit record carries NO message, unconditionally — this is a
+      // hard invariant, not merely "usually omitted": the hook that deposits it
+      // must never be relied on to have withheld the prompt text; this store
+      // enforces it independently, even if a future hook edit passed one through.
+      const raw = input.kind !== 'prompt_submit' && typeof input.message === 'string' ? input.message : undefined
       const message = raw ? sanitizeEventText(raw, MAX_MESSAGE_CHARS) : undefined
       // "Truncated" is about the CLAMP, not about redaction: the sanitiser also
       // shortens text by replacing secrets, and calling that truncation would

@@ -33,7 +33,12 @@ afterEach(() => {
 })
 
 function root(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'tandem-settings-'))
+  // Under the hermetic per-worker state root test/setup-hermetic-env.ts
+  // provisions (TANDEM_STATE_DIR), not the real OS tmpdir — so these fixtures
+  // live inside the sandboxed, auto-cleaned run root like every other test's
+  // state, rather than leaking real temp directories on the host.
+  const base = process.env.TANDEM_STATE_DIR ?? tmpdir()
+  const dir = mkdtempSync(join(base, 'tandem-settings-'))
   roots.push(dir)
   return dir
 }
@@ -58,6 +63,11 @@ describe('validateClaudeSettingsPath', () => {
 
   it('refuses an empty value rather than treating it as unset', () => {
     expect(() => validateClaudeSettingsPath('   ')).toThrow(/set but empty/)
+  })
+
+  it('accepts a whitespace-padded path, trimmed', () => {
+    const path = settingsFile()
+    expect(validateClaudeSettingsPath(`  ${path}  `)).toBe(path)
   })
 
   it('refuses a path that does not exist', () => {
@@ -127,6 +137,16 @@ describe('claudeWorkerSpawn', () => {
     expect(worker).toEqual({ settingsPath: path, sessionId: tandemSessionIdFor('worker', '/state') })
     expect(claudeWorkerArgv(worker)).toEqual(['--settings', path])
     expect(claudeWorkerEnvironment(worker)).toEqual({ [SESSION_ID_ENV]: tandemSessionIdFor('worker', '/state') })
+  })
+
+  it('trims a whitespace-padded configured path the same way an untrimmed one would fail', () => {
+    const path = settingsFile()
+    const worker = claudeWorkerSpawn('worker', { [CLAUDE_SETTINGS_PATH_ENV]: `  ${path}  ` }, '/state')
+    expect(worker).toEqual({ settingsPath: path, sessionId: tandemSessionIdFor('worker', '/state') })
+  })
+
+  it('treats a whitespace-only value as unset, same as empty', () => {
+    expect(claudeWorkerSpawn('worker', { [CLAUDE_SETTINGS_PATH_ENV]: '   ' }, '/state')).toBeUndefined()
   })
 
   it('throws rather than silently dropping a configured-but-unusable path', () => {

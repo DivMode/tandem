@@ -142,8 +142,14 @@ export function claudeWorkerSpawn(
   stateDir: string = tandemStateDir(env),
 ): ClaudeWorkerSpawn | undefined {
   const configured = env[CLAUDE_SETTINGS_PATH_ENV]
-  if (configured === undefined || configured.trim() === '') return undefined
-  return { settingsPath: validateClaudeSettingsPath(configured), sessionId: tandemSessionIdFor(name, stateDir) }
+  if (configured === undefined) return undefined
+  // Trimmed exactly once, here, and the trimmed value is what flows onward —
+  // `validateClaudeSettingsPath` no longer re-trims its own input, so there is
+  // a single place whitespace is stripped and no path where the two functions
+  // could disagree about a value like "  " or a path with trailing whitespace.
+  const trimmed = configured.trim()
+  if (trimmed === '') return undefined
+  return { settingsPath: validateClaudeSettingsPath(trimmed), sessionId: tandemSessionIdFor(name, stateDir) }
 }
 
 /** The `claude` flags this adds, in a fixed order. Empty when unconfigured. */

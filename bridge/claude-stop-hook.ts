@@ -30,6 +30,8 @@
  * and never stored, so no amount of downstream leakage can expose them from
  * this path. `stop_hook_active` is ignored too: this hook never blocks a stop,
  * so the re-entrancy flag it exists to guard has nothing to guard here.
+ * `UserPromptSubmit`'s `prompt` field is likewise never read: that boundary is
+ * recorded to prove a submit happened, never to carry what was submitted.
  *
  * SILENT BY DESIGN. stdout is always empty. Claude surfaces hook stdout to the
  * user (and, on some events, to the model), and the only things this process
@@ -57,6 +59,7 @@ export const MAX_HOOK_INPUT_BYTES = 1024 * 1024
 const KIND_BY_EVENT: Readonly<Record<string, ClaudeLifecycleKind>> = {
   Stop: 'stop',
   StopFailure: 'stop_failure',
+  UserPromptSubmit: 'prompt_submit',
 }
 
 /**
@@ -143,6 +146,10 @@ export function handleClaudeStopHook(raw: string, opts: ClaudeHookOptions = {}):
 
     // `Stop` carries the last assistant message; `StopFailure` does not, and a
     // failure's text is not something to guess at from another field.
+    // `UserPromptSubmit` carries the prompt itself (`payload.prompt`) — it is
+    // NEVER read here. This hook exists to prove a submit happened, not to
+    // carry what was submitted, and the store enforces the same rule
+    // independently (see claude-lifecycle-store.ts record()).
     const rawMessage = kind === 'stop' ? payload.last_assistant_message : undefined
     const message = typeof rawMessage === 'string' && rawMessage.length > 0 ? rawMessage : undefined
 

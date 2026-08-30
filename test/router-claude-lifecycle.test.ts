@@ -91,6 +91,18 @@ function hookReports(name: string, kind: 'stop' | 'stop_failure', message?: stri
   expect(event, 'the lifecycle store must accept the hook record').toBeDefined()
 }
 
+/** Deposit the record Claude's own UserPromptSubmit hook would have written —
+ *  fires the moment a prompt lands, before the Stop/StopFailure that answers
+ *  it. Never carries a message (see claude-lifecycle-store.ts). */
+function hookSubmits(name: string): void {
+  const event = defaultClaudeLifecycleStore().record({
+    kind: 'prompt_submit',
+    tandemSession: tandemSessionIdFor(name),
+    claudeSessionId: 'claude-session-id',
+  })
+  expect(event, 'the lifecycle store must accept the hook record').toBeDefined()
+}
+
 /** Every foreman transition recorded for one session, oldest first. */
 function transitions(name: string): Array<{ kind: string; summary?: string; reason?: string }> {
   return defaultForemanInbox()
@@ -118,6 +130,7 @@ describe('a Stop after the baseline ends a turn the backend says is still workin
   it('terminates the pending turn and returns Claude own final message', async () => {
     const { name } = newSession('stale')
     await send(name)
+    hookSubmits(name)
     hookReports(name, 'stop', 'I rebased onto main and all 59 tests pass.')
 
     const res = await poll(name)
@@ -137,6 +150,7 @@ describe('a Stop after the baseline ends a turn the backend says is still workin
   it('reports idle even though the backend never stops saying working', async () => {
     const { name, state } = newSession('stale')
     await send(name)
+    hookSubmits(name)
     hookReports(name, 'stop')
 
     expect(state.idle).toBe(false)
@@ -147,6 +161,7 @@ describe('a Stop after the baseline ends a turn the backend says is still workin
     const { name, state } = newSession('stale')
     state.text = 'scraped from the pane'
     await send(name)
+    hookSubmits(name)
     hookReports(name, 'stop')
 
     expect((await poll(name)).body).not.toHaveProperty('finalMessage')
@@ -156,6 +171,7 @@ describe('a Stop after the baseline ends a turn the backend says is still workin
   it('works through send poll-mode (empty text), not only the read route', async () => {
     const { name } = newSession('stale')
     await send(name)
+    hookSubmits(name)
     hookReports(name, 'stop', 'done via poll mode')
 
     const res = await routeForTest('POST', `/sessions/${name}/send`, { text: '' })
@@ -168,6 +184,7 @@ describe('repeated polls report the turn exactly once', () => {
   it('three identical polls of one Stop produce one completion', async () => {
     const { name } = newSession('dup')
     await send(name)
+    hookSubmits(name)
     hookReports(name, 'stop', 'finished')
 
     const first = await poll(name)
@@ -185,6 +202,7 @@ describe('repeated polls report the turn exactly once', () => {
     const { name, state } = newSession('dup')
     await send(name)
     state.idle = true
+    hookSubmits(name)
     hookReports(name, 'stop', 'the hook message, not the pane')
 
     await poll(name)
@@ -216,6 +234,7 @@ describe('a Stop from before the turn began is not this turn boundary', () => {
     await send(name)
     expect((await poll(name)).body).not.toHaveProperty('turnEnded')
 
+    hookSubmits(name)
     hookReports(name, 'stop', 'this turn')
 
     expect((await poll(name)).body).toMatchObject({ turnEnded: 'stop', finalMessage: 'this turn' })
@@ -227,6 +246,7 @@ describe('StopFailure is a terminal failure that needs review, never a completio
   it('ends the turn and records an error rather than a completion', async () => {
     const { name } = newSession('fail')
     await send(name)
+    hookSubmits(name)
     hookReports(name, 'stop_failure')
 
     const res = await poll(name)
@@ -242,6 +262,7 @@ describe('StopFailure is a terminal failure that needs review, never a completio
   it('is claimed exactly once across repeated polls', async () => {
     const { name } = newSession('fail')
     await send(name)
+    hookSubmits(name)
     hookReports(name, 'stop_failure')
 
     await poll(name)
@@ -277,16 +298,98 @@ describe('interrupt, close and supersede stay authoritative', () => {
     expect(transitions(name).map((t) => t.kind)).toEqual(['closed'])
   })
 
-  it('a superseding send takes a fresh baseline, so one Stop ends only the new turn', async () => {
+  // B1 regression: a second send while a Claude turn is GENUINELY pending
+  // (the trusted store has already seen this session's own prompt_submit, so
+  // the hook is demonstrably wired up and active) is now REJECTED rather than
+  // superseded. Overlapping instructions into a session whose completion
+  // Tandem trusts is a caller bug, not a legitimate interrupt — the caller has
+  // interrupt_session for that.
+  it('a second send while a Claude turn is genuinely pending is rejected, not superseded', async () => {
     const { name } = newSession('supersede')
     await send(name, 'first instruction')
-    await send(name, 'second instruction')
-    hookReports(name, 'stop', 'answering the second')
+    hookSubmits(name) // the first turn's own submit lands: hook evidence exists, still no Stop
 
+    const rejected = await send(name, 'second instruction')
+    expect(rejected.status).toBe(409)
+    expect((rejected.body as { error: string }).error).toMatch(/already pending/)
+
+    // The first turn is untouched: no supersede was recorded, and its own
+    // (later) Stop still resolves it cleanly.
+    expect(transitions(name)).toEqual([])
+    hookReports(name, 'stop', 'answering the first')
     const res = await poll(name)
 
-    expect(res.body).toMatchObject({ turnEnded: 'stop', finalMessage: 'answering the second' })
+    expect(res.body).toMatchObject({ turnEnded: 'stop', finalMessage: 'answering the first' })
+    expect(transitions(name).map((t) => t.kind)).toEqual(['completed'])
+  })
+
+  // "Sticky stale-working" half of the same guard: a pending turn whose Stop
+  // already landed (with no submit yet for anything after it) must not block
+  // a new send forever just because nothing has polled it out yet.
+  it('a stale pending turn resolved by its own Stop does not block the next send', async () => {
+    const { name, state } = newSession('stale-send')
+    await send(name, 'first instruction')
+    hookSubmits(name)
+    hookReports(name, 'stop', 'finished the first')
+    // The backend fake still reports working forever — exactly like every
+    // other "stale" fixture in this file — so only the trusted store, not the
+    // pane, can tell this next send the first turn is actually over.
+    expect(state.idle).toBe(false)
+
+    const second = await send(name, 'second instruction')
+    expect(second.status).toBe(200)
+
+    // The stale turn was completed (not silently dropped) before the new one
+    // began, and the new turn is free to resolve on its own boundary.
+    expect(transitions(name).map((t) => t.kind)).toEqual(['completed'])
+    hookSubmits(name)
+    hookReports(name, 'stop', 'finished the second')
+    expect((await poll(name)).body).toMatchObject({ turnEnded: 'stop', finalMessage: 'finished the second' })
+    expect(transitions(name).map((t) => t.kind)).toEqual(['completed', 'completed'])
+  })
+
+  // Interrupt → new send, with the OLD turn's late Stop landing AFTER the new
+  // baseline but BEFORE the new turn's own prompt_submit. Without the ordered
+  // baseline→submit→stop requirement this stray Stop would be mistaken for
+  // the new turn's boundary.
+  it('interrupt then a new send: an old Stop landing before the new submit does not end the new turn', async () => {
+    const { name } = newSession('interrupt-resend')
+    await send(name, 'first instruction')
+    await routeForTest('POST', `/sessions/${name}/interrupt`)
+
+    await send(name, 'second instruction')
+    // The interrupted turn's Stop arrives late, racing in after the new
+    // baseline but before the new turn has even reached Claude.
+    hookReports(name, 'stop', 'partial work from the first turn')
+    expect((await poll(name)).body).not.toHaveProperty('turnEnded')
+    expect(transitions(name).map((t) => t.kind)).toEqual(['interrupted'])
+
+    // Now the new turn's own boundary arrives, correctly ordered.
+    hookSubmits(name)
+    hookReports(name, 'stop', 'answering the second, for real')
+    const res = await poll(name)
+
+    expect(res.body).toMatchObject({ turnEnded: 'stop', finalMessage: 'answering the second, for real' })
     expect(transitions(name).map((t) => t.kind)).toEqual(['interrupted', 'completed'])
+  })
+
+  // External prompt: something (a human at the TUI, most plausibly) submitted
+  // a prompt to this Claude process outside Tandem's own send(). No Tandem
+  // turn is pending, so the ledger has nothing to say, but the trusted store
+  // shows an unmatched prompt_submit and a send must not interleave with it.
+  it('an unmatched external prompt_submit blocks a send until it resolves', async () => {
+    const { name } = newSession('external')
+    hookSubmits(name) // simulates a human typing directly into the Claude TUI
+
+    const blocked = await send(name, 'do something')
+    expect(blocked.status).toBe(409)
+    expect((blocked.body as { error: string }).error).toMatch(/external prompt/)
+
+    // Once that external turn's own Stop lands, the session reads as ready
+    // again and a Tandem send is allowed.
+    hookReports(name, 'stop', 'the human is done')
+    const allowed = await send(name, 'now it is Tandem\'s turn')
+    expect(allowed.status).toBe(200)
   })
 })
 

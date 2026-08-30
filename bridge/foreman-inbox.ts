@@ -308,9 +308,10 @@ export interface ForemanEventPage {
  *
  * THE SAME TWO RULES STILL HOLD. These are HISTORY — `sessions` in the same
  * response is the LIVENESS truth, and a `completed` here is not proof a worker
- * exited. And the `checkpoint` is the store's position AT the newest event
- * shown, so handing it to get_foreman_events as `since` deliberately skips
- * everything at or before it: only do that once these have been acted on.
+ * exited. And the `checkpoint` is the store's position AT THE NEWEST RETAINED
+ * EVENT — which is also the newest event actually shown, whenever anything was
+ * shown at all — so handing it to get_foreman_events as `since` deliberately
+ * skips everything at or before it: only do that once these have been acted on.
  */
 export interface ForemanEventPreview {
   version: number

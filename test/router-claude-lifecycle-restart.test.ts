@@ -78,7 +78,15 @@ describe('a turn sent before a restart is still resolvable after it', () => {
 
     // --- Claude finishes while nothing is listening ------------------------
     // The hook runs in the WORKER's process, which the bridge restart did not
-    // touch; it stamps the identity Tandem gave it at spawn.
+    // touch; it stamps the identity Tandem gave it at spawn. UserPromptSubmit
+    // fires first, when the prompt lands, then Stop when the turn ends.
+    expect(
+      before.store.record({
+        kind: 'prompt_submit',
+        tandemSession: before.sessionIdFor(name),
+        claudeSessionId: 'claude-session-id',
+      }),
+    ).toBeDefined()
     expect(
       before.store.record({
         kind: 'stop',
@@ -114,6 +122,11 @@ describe('a turn sent before a restart is still resolvable after it', () => {
 
     const before = await freshBridge()
     await before.routeForTest('POST', `/sessions/${name}/send`, { text: 'first job' })
+    before.store.record({
+      kind: 'prompt_submit',
+      tandemSession: before.sessionIdFor(name),
+      claudeSessionId: 'claude-session-id',
+    })
     before.store.record({
       kind: 'stop',
       tandemSession: before.sessionIdFor(name),

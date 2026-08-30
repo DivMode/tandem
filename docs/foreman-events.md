@@ -192,9 +192,11 @@ It is a preview, not the feed, and the difference is load-bearing:
 
 - **It carries no checkpoint of yours and cannot be paged.** There is no `since`
   and no `limit`, so it can never tell a caller it has seen everything once.
-- **Its `checkpoint` is the store position AT the newest event shown.** Handing
-  it to `get_foreman_events` as `since` therefore deliberately *skips*
-  everything at or before it. Only do that once those events have been acted on.
+- **Its `checkpoint` is the store position AT the newest retained event** —
+  which is also the newest event actually shown, whenever anything was shown
+  at all. Handing it to `get_foreman_events` as `since` therefore deliberately
+  *skips* everything at or before it. Only do that once those events have been
+  acted on.
 - **The same history-is-not-liveness rule applies**, doubly so: `sessions` in
   the very same response is the liveness truth, and a `completed` in the preview
   is not proof the worker exited.

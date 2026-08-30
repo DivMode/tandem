@@ -14,7 +14,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ClaudeLifecycleStore, MAX_RETAINED_EVENTS } from '../bridge/claude-lifecycle-store.ts'
-import { claudeTurnEndAfter, isClaudeTurnBaseline, type ClaudeTurnBaseline } from '../bridge/claude-completion.ts'
+import {
+  claudeLifecycleReadiness,
+  claudeTurnEndAfter,
+  isClaudeTurnBaseline,
+  type ClaudeTurnBaseline,
+} from '../bridge/claude-completion.ts'
 import { TurnLedger } from '../bridge/turn-ledger.ts'
 
 const roots: string[] = []
@@ -40,6 +45,7 @@ function storeWithBaseline(): { store: ClaudeLifecycleStore; baseline: ClaudeTur
 describe('claudeTurnEndAfter', () => {
   it('finds a Stop this worker reported after the baseline, with its final message', () => {
     const { store, baseline } = storeWithBaseline()
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'c1' })
     store.record({ kind: 'stop', tandemSession: WORKER, claudeSessionId: 'c1', message: 'all four tests pass' })
 
     expect(claudeTurnEndAfter(baseline, store)).toMatchObject({ kind: 'stop', message: 'all four tests pass' })
@@ -47,10 +53,33 @@ describe('claudeTurnEndAfter', () => {
 
   it('reports a StopFailure distinctly rather than flattening it to "done"', () => {
     const { store, baseline } = storeWithBaseline()
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'c1' })
     store.record({ kind: 'stop_failure', tandemSession: WORKER, claudeSessionId: 'c1' })
 
     expect(claudeTurnEndAfter(baseline, store)).toMatchObject({ kind: 'stop_failure' })
     expect(claudeTurnEndAfter(baseline, store)?.message).toBeUndefined()
+  })
+
+  it('reports nothing for a submit with no Stop yet — "still waiting" is not a boundary', () => {
+    const { store, baseline } = storeWithBaseline()
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'c1' })
+
+    expect(claudeTurnEndAfter(baseline, store)).toBeUndefined()
+  })
+
+  it('ignores a Stop that landed BEFORE this turn\'s own submit — the ordered-pair requirement', () => {
+    const { store, baseline } = storeWithBaseline()
+    // A stray Stop from a superseded/interrupted turn, racing in after the new
+    // baseline but before the new turn's own prompt_submit has been seen.
+    store.record({ kind: 'stop', tandemSession: WORKER, claudeSessionId: 'stale', message: 'stray' })
+    expect(claudeTurnEndAfter(baseline, store)).toBeUndefined()
+
+    // Now this turn's own submit lands, followed by its own Stop.
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'c1' })
+    expect(claudeTurnEndAfter(baseline, store)).toBeUndefined()
+    store.record({ kind: 'stop', tandemSession: WORKER, claudeSessionId: 'c1', message: 'the real one' })
+
+    expect(claudeTurnEndAfter(baseline, store)).toMatchObject({ kind: 'stop', message: 'the real one' })
   })
 
   it('ignores a Stop that was already in the store when the turn opened', () => {
@@ -73,6 +102,7 @@ describe('claudeTurnEndAfter', () => {
     for (let i = 0; i < 120; i += 1) {
       store.record({ kind: 'stop', tandemSession: `ts_noise${i}`, claudeSessionId: `c${i}` })
     }
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'mine' })
     store.record({ kind: 'stop', tandemSession: WORKER, claudeSessionId: 'mine', message: 'mine' })
 
     expect(claudeTurnEndAfter(baseline, store)).toMatchObject({ kind: 'stop', message: 'mine' })
@@ -80,6 +110,7 @@ describe('claudeTurnEndAfter', () => {
 
   it('takes the FIRST boundary after the baseline: a later one belongs to a later turn', () => {
     const { store, baseline } = storeWithBaseline()
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'c1' })
     store.record({ kind: 'stop', tandemSession: WORKER, claudeSessionId: 'c1', message: 'first' })
     store.record({ kind: 'stop', tandemSession: WORKER, claudeSessionId: 'c1', message: 'second' })
 
@@ -125,6 +156,45 @@ describe('claudeTurnEndAfter', () => {
       },
     } as unknown as ClaudeLifecycleStore
     expect(claudeTurnEndAfter({ session: WORKER, seq: 0, storeEpoch: 'e' }, throwing)).toBeUndefined()
+  })
+})
+
+describe('claudeLifecycleReadiness', () => {
+  it('is unknown when this session has no lifecycle record at all', () => {
+    const store = new ClaudeLifecycleStore(dir('tandem-lifecycle-'))
+    expect(claudeLifecycleReadiness(WORKER, store)).toBe('unknown')
+  })
+
+  it('is busy when the latest record is an unmatched prompt_submit', () => {
+    const store = new ClaudeLifecycleStore(dir('tandem-lifecycle-'))
+    store.record({ kind: 'stop', tandemSession: WORKER, claudeSessionId: 'c1' })
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'c2' })
+    expect(claudeLifecycleReadiness(WORKER, store)).toBe('busy')
+  })
+
+  it('is ready once a stop/stop_failure follows the latest submit', () => {
+    const store = new ClaudeLifecycleStore(dir('tandem-lifecycle-'))
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'c1' })
+    store.record({ kind: 'stop', tandemSession: WORKER, claudeSessionId: 'c1' })
+    expect(claudeLifecycleReadiness(WORKER, store)).toBe('ready')
+
+    store.record({ kind: 'stop_failure', tandemSession: WORKER, claudeSessionId: 'c1' })
+    expect(claudeLifecycleReadiness(WORKER, store)).toBe('ready')
+  })
+
+  it('ignores other sessions entirely', () => {
+    const store = new ClaudeLifecycleStore(dir('tandem-lifecycle-'))
+    store.record({ kind: 'prompt_submit', tandemSession: OTHER, claudeSessionId: 'c1' })
+    expect(claudeLifecycleReadiness(WORKER, store)).toBe('unknown')
+  })
+
+  it('never throws on a store that cannot answer', () => {
+    const throwing = {
+      readAfter() {
+        throw new Error('state directory is gone')
+      },
+    } as unknown as ClaudeLifecycleStore
+    expect(claudeLifecycleReadiness(WORKER, throwing)).toBe('unknown')
   })
 })
 

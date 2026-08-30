@@ -68,6 +68,21 @@ describe("recording turn boundaries", () => {
     expect(event!.message).toBeUndefined();
   });
 
+  it("records a prompt_submit, which NEVER carries a message even if one is supplied", () => {
+    const store = new ClaudeLifecycleStore(freshDir());
+    const event = store.record({
+      kind: "prompt_submit",
+      tandemSession: TANDEM_SESSION,
+      claudeSessionId: CLAUDE_SESSION,
+      // A future hook edit that accidentally passed the prompt through must
+      // still not reach disk — the store enforces this independently.
+      message: "please do the thing",
+    });
+    expect(event).toMatchObject({ kind: "prompt_submit", seq: 1 });
+    expect(event!.message).toBeUndefined();
+    expect(event!.messageTruncated).toBeUndefined();
+  });
+
   it("keeps two identical consecutive turns apart", () => {
     // Claude hands the hook no turn counter, so a content-derived id would
     // collapse a genuine second turn into the first. Sequence must separate them.
