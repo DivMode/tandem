@@ -162,6 +162,7 @@ describe("client-carried checkpoints", () => {
     const anchor = inbox.read({ limit: 200 });
     expect(anchor.events.map((e) => e.turn)).toEqual([1, 2, 3, 4, 5]);
     expect(anchor.more).toBe(false);
+    expect(anchor.truncated).toBe(false);
     for (let i = 6; i <= 8; i++) inbox.record(ev({ turn: i }));
 
     const first = inbox.read({ since: anchor.checkpoint, limit: 2 });
@@ -176,13 +177,29 @@ describe("client-carried checkpoints", () => {
     expect(inbox.read({ since: second.checkpoint }).events).toEqual([]);
   });
 
-  it("with no checkpoint returns the NEWEST page, so a first-time reader sees current work", () => {
+  it("with no checkpoint starts at the OLDEST retained event and pages forward", () => {
     const dir = freshDir();
     const inbox = new ForemanInbox(dir);
     for (let i = 1; i <= 5; i++) inbox.record(ev({ turn: i }));
+
     const page = inbox.read({ limit: 2 });
-    expect(page.events.map((e) => e.turn)).toEqual([4, 5]);
-    expect(page.truncated).toBe(true); // older history exists but was not returned
+    expect(page.events.map((e) => e.turn)).toEqual([1, 2]);
+    // Cut short by `limit` is pagination, NOT loss.
+    expect(page.more).toBe(true);
+    expect(page.truncated).toBe(false);
+
+    const rest = inbox.read({ since: page.checkpoint, limit: 10 });
+    expect(rest.events.map((e) => e.turn)).toEqual([3, 4, 5]);
+    expect(rest.more).toBe(false);
+    expect(rest.truncated).toBe(false);
+  });
+
+  it("reports an empty store as neither more nor truncated", () => {
+    const page = new ForemanInbox(freshDir()).read();
+    expect(page.events).toEqual([]);
+    expect(page.more).toBe(false);
+    expect(page.truncated).toBe(false);
+    expect(page.counts).toEqual({ returned: 0, retained: 0 });
   });
 
   it("issues a STABLE checkpoint for an empty inbox, and honours it once events arrive", () => {
@@ -241,12 +258,31 @@ describe("bounded retention", () => {
 
     const page = inbox.read({ limit: 200 });
     expect(page.counts.retained).toBe(MAX_RETAINED_EVENTS);
+    // Rotation really did drop events this reader never saw.
     expect(page.truncated).toBe(true);
     // The newest survived; the oldest were dropped.
-    expect(page.events.at(-1)!.summary).toBe(`turn ${overflow}`);
+    expect(page.events.at(0)!.summary).toBe(`turn ${overflow - MAX_RETAINED_EVENTS + 1}`);
 
     const stored = JSON.parse(readFileSync(join(dir, "events.json"), "utf8")) as { events: unknown[] };
     expect(stored.events).toHaveLength(MAX_RETAINED_EVENTS);
+  });
+
+  it("separates pagination from rotation on a stale checkpoint", () => {
+    const dir = freshDir();
+    const inbox = new ForemanInbox(dir);
+    inbox.record(ev({ turn: 1 }));
+    const early = inbox.read();
+    expect(early.truncated).toBe(false);
+
+    // A few more events: the caller is merely behind, nothing is lost.
+    for (let i = 2; i <= 4; i++) inbox.record(ev({ turn: i }));
+    const behind = inbox.read({ since: early.checkpoint, limit: 2 });
+    expect(behind.more).toBe(true);
+    expect(behind.truncated).toBe(false);
+
+    // Now rotate past that position: the same checkpoint becomes lossy.
+    for (let i = 5; i <= MAX_RETAINED_EVENTS + 10; i++) inbox.record(ev({ turn: i }));
+    expect(inbox.read({ since: early.checkpoint }).truncated).toBe(true);
   });
 
   it("tells a caller whose checkpoint fell off the end that history was dropped", () => {

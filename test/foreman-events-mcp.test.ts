@@ -71,12 +71,44 @@ describe("get_foreman_events tool surface", () => {
     }
   });
 
-  it("takes no required input and exposes since + limit", async () => {
+  it("takes no required input and exposes since + limit + device", async () => {
     const { tools } = await (await connectedClient()).listTools();
     const tool = tools.find((t) => t.name === "get_foreman_events")!;
     const schema = tool.inputSchema as { properties?: Record<string, unknown>; required?: string[] };
     expect(schema.required ?? []).toEqual([]);
-    expect(Object.keys(schema.properties ?? {}).sort()).toEqual(["limit", "since"]);
+    expect(Object.keys(schema.properties ?? {}).sort()).toEqual(["device", "limit", "since"]);
+  });
+
+  it("explains one-device-per-call and the more/truncated distinction", async () => {
+    const { tools } = await (await connectedClient()).listTools();
+    const description = tools.find((t) => t.name === "get_foreman_events")!.description ?? "";
+    expect(description).toMatch(/each device keeps its own events/i);
+    expect(description).toMatch(/never reads more than one device/i);
+    expect(description).toMatch(/list_devices/);
+    expect(description).toMatch(/`more: true` means unread events remain/i);
+    expect(description).toMatch(/`truncated: true` is different and worse/i);
+  });
+
+  it("issues an fe2 map checkpoint that records the device it read", async () => {
+    const client = await connectedClient();
+    const result = await client.callTool({ name: "get_foreman_events", arguments: {} });
+    const page = JSON.parse((result.content as Array<{ text: string }>)[0]!.text) as {
+      checkpoint: string;
+      device: string;
+    };
+    expect(page.device).toBe("local");
+    expect(page.checkpoint.startsWith("fe2_")).toBe(true);
+    const decoded = JSON.parse(Buffer.from(page.checkpoint.slice(4), "base64url").toString("utf8"));
+    expect(decoded.v).toBe(2);
+    expect(Object.keys(decoded.d)).toEqual(["local"]);
+  });
+
+  it("names an unknown device explicitly instead of silently returning nothing", async () => {
+    const client = await connectedClient();
+    const result = await client.callTool({ name: "get_foreman_events", arguments: { device: "nosuch" } });
+    const text = (result.content as Array<{ text: string }>)[0]!.text;
+    expect(text).toMatch(/nosuch/);
+    expect(text).toMatch(/not online/i);
   });
 
   it("states that it is history and list_sessions is liveness", async () => {

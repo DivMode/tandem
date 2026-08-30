@@ -41,6 +41,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { routeForTest } from "../bridge/router.ts";
 import {
+  dispatchForemanEvents,
   dispatchListDevices,
   dispatchListSessions,
   dispatchOpenSession,
@@ -288,7 +289,9 @@ Returns { version, events, checkpoint, more, truncated, counts }. Each event car
 
 HISTORY, NOT LIVENESS: an event says a transition happened, never that a worker is or is not alive now — list_sessions is the only liveness truth. Pass the previous call's checkpoint as \`since\` to see each transition once; \`more: true\` means raise \`limit\` or call again, and \`truncated: true\` means older history was dropped or your checkpoint predates this store, so reconcile against list_sessions instead of assuming a complete record.
 
-Events are recorded only for this host. A session driven on a fleet device is recorded on THAT device.
+PAGING: events come oldest-first from your checkpoint, or from the oldest retained event on a first read. \`more: true\` means unread events remain — call again with the returned checkpoint. \`truncated: true\` is different and worse: events you never saw were dropped by retention, or your checkpoint came from a store that no longer exists, so reconcile against list_sessions rather than assuming a complete record.
+
+FLEET: each device keeps its own events, recorded where the work ran. Omit \`device\` for this hub. To cover a fleet, call list_devices and then this tool once per device; there is no cross-device aggregation, and one call never reads more than one device. The returned checkpoint tracks every device you have read, so keep handing back the newest one.
 
 ${TOOL_GUIDANCE.foremanEvents}`,
       inputSchema: {
@@ -296,7 +299,7 @@ ${TOOL_GUIDANCE.foremanEvents}`,
           .string()
           .optional()
           .describe(
-            "Opaque checkpoint from a previous call. Omit on a first read to get the most recent page. Treat it as opaque: it is only meaningful to the host that issued it, and a checkpoint from a different store is reported as truncated rather than silently misread.",
+            "Opaque checkpoint from a previous call. Omit on a first read. Treat it as opaque and store it verbatim: it records your position on every device you have read, and reading one device preserves the positions of the others.",
           ),
         limit: z
           .number()
@@ -304,6 +307,12 @@ ${TOOL_GUIDANCE.foremanEvents}`,
           .positive()
           .optional()
           .describe("Maximum events to return (default 50, capped at 200)."),
+        device: z
+          .string()
+          .optional()
+          .describe(
+            'Fleet device id to read, or "local"/omitted for this hub. Events live on the device that produced them, so this reads exactly one device; an offline device fails explicitly with its id rather than silently returning nothing.',
+          ),
       },
       annotations: {
         title: "Get foreman events",
@@ -313,7 +322,7 @@ ${TOOL_GUIDANCE.foremanEvents}`,
         openWorldHint: false,
       },
     },
-    async ({ since, limit }) => call("GET", "/foreman/events", {}, q({ since, limit }).slice(1)),
+    async ({ since, limit, device }) => wrap(await dispatchForemanEvents(runtime, { since, limit, device })),
   );
 
   /* ---- relay (one tool, five actions) ---- */

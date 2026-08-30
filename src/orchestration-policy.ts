@@ -92,7 +92,8 @@ export const ORCHESTRATION_POLICY: OrchestrationPolicy = {
     "At the START of substantial engineering work, and again after ANY interruption, reconnect, new conversation, or context loss: call list_sessions AND get_foreman_events, before opening anything.",
     "get_foreman_events is HISTORY: it says what happened. list_sessions is LIVENESS: it says what is running right now. A `completed` event does NOT mean the worker exited, and the absence of an event does NOT mean nothing happened. Never decide whether to open a session from the event feed alone.",
     "Carry the `checkpoint` the tool returns and pass it back as `since` on your next call, so you see each transition once. Tandem does not track what you have read: the transport is stateless and has no per-conversation identity, so the checkpoint lives with you, not on the server.",
-    "`truncated: true` means older history was dropped by retention or your checkpoint predates the current store — reconcile against list_sessions rather than assuming you have the full record.",
+    "`more: true` is pagination — unread events remain, so call again with the returned checkpoint. `truncated: true` is loss — events you never saw were dropped by retention, or your checkpoint predates the current store — so reconcile against list_sessions rather than assuming a full record.",
+    "Each device keeps its own events, recorded where the work ran. Omit `device` for the hub; to cover a fleet, call list_devices and then get_foreman_events once per device. One call never reads more than one device, and an offline device is reported explicitly rather than looking like silence.",
     "This feed is the reconciliation mechanism BECAUSE no MCP server can wake a dormant conversation. Nothing Tandem does will make a chat client resume on its own; you must ask on your next turn.",
   ],
   modelRouting: {

@@ -201,7 +201,7 @@ This writes a local MCP connector under `~/.tandem/desktop/connector.json`. The 
 | `send_to_session` | Give the agent more work or read its latest output. |
 | `interrupt_session` | Stop the current turn while keeping the session alive. |
 | `close_session` | End a Tandem-owned session. |
-| `get_foreman_events` | Catch up on what Tandem work did while the AI was disconnected. |
+| `get_foreman_events` | Catch up on what Tandem work did while the AI was disconnected, on this or a named computer. |
 | `relay` | Run Tandem's optional persistent Claude lead-and-worker loop. |
 
 Tandem routes remote sessions using stable names such as `studio:review`, so later requests return to the same agent on the same computer.
@@ -227,10 +227,18 @@ Two things worth knowing:
   finishes, point `TANDEM_NTFY_TOPIC` at your phone — that reaches *you*, and
   you can then go and prompt the AI.
 
-The record holds short, redacted summaries and no paths, prompts, or terminal
-transcripts; it is capped and rotates. See
-[docs/foreman-events.md](docs/foreman-events.md) for the protocol details and
-[SECURITY.md](SECURITY.md) for the exact data boundary.
+The record never holds prompts, terminal transcripts, working directories or
+attach hints. Its two short summary fields are capped at 200 characters and
+redacted: credentials, URLs, email addresses, Tailscale hosts and addresses, and
+absolute paths (`/Users/...`, `~/...`, `C:\...`) are stripped, while a relative
+path like `src/router.ts` is kept because it is what makes a summary readable
+and names nothing about your machine. Set `TANDEM_FOREMAN_EVENT_SUMMARIES=0` to
+keep only the bare transitions. The record is capped and rotates.
+
+Each computer keeps its own record. Ask another one by passing its device id.
+
+See [docs/foreman-events.md](docs/foreman-events.md) for the protocol details
+and [SECURITY.md](SECURITY.md) for the exact data boundary.
 
 ## Security in plain language
 
@@ -244,7 +252,7 @@ Tandem controls real coding agents and terminals, so treat access to it like rem
 - Device traffic stays inside your Tailscale network.
 - A device invitation works once and expires if unused. The enrolled device itself does not expire.
 - Default logs exclude prompts, terminal output, project paths, credentials, hostnames, usernames, IP addresses, and Tailscale identity.
-- The foreman event record returns short redacted summaries only — never paths, prompts, or transcripts — and can be reduced to bare transitions with `TANDEM_FOREMAN_EVENT_SUMMARIES=0`.
+- The foreman event record returns short redacted summaries only — never prompts, transcripts, working directories, or absolute paths — and can be reduced to bare transitions with `TANDEM_FOREMAN_EVENT_SUMMARIES=0`.
 
 The folder allowlist controls where a session starts. It is not an operating-system sandbox. Every agent still has the permissions of the OS account running Tandem.
 

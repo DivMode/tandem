@@ -85,7 +85,7 @@ describe("incarnation identity (close/reopen under one name)", () => {
 
     // Same name, different agent: a reopened session.
     const reopened = "tmux:$9:1756599999";
-    const ref = ledger.beginTurn("review", reopened);
+    const { turn: ref } = ledger.beginTurn("review", reopened);
     expect(ref.epoch).toBe(2);
     // turnSeq is monotonic and never reset, so even a lost epoch could not
     // make a new turn collide with an old one.
@@ -106,9 +106,38 @@ describe("incarnation identity (close/reopen under one name)", () => {
     ledger.beginTurn("review", AGENT);
     ledger.completeTurn("review", AGENT);
     const closed = ledger.sessionRef("review", AGENT);
-    const reopenedFirstTurn = ledger.beginTurn("review", "tmux:$9:1756599999");
+    const { turn: reopenedFirstTurn } = ledger.beginTurn("review", "tmux:$9:1756599999");
     expect(reopenedFirstTurn.turnSeq).toBeGreaterThan(closed.turnSeq);
     expect(reopenedFirstTurn.epoch).toBeGreaterThan(closed.epoch);
+  });
+});
+
+describe("a second send while a turn is in flight", () => {
+  it("reports the superseded turn once, and the new turn is the one that completes", () => {
+    const ledger = new TurnLedger(freshDir());
+    const first = ledger.beginTurn("review", AGENT);
+    expect(first.superseded).toBeUndefined();
+
+    const second = ledger.beginTurn("review", AGENT);
+    expect(second.superseded).toMatchObject({ turnSeq: 1, epoch: 1 });
+    expect(second.turn.turnSeq).toBe(2);
+
+    // Only the live turn can complete, and only once.
+    expect(ledger.completeTurn("review", AGENT)).toMatchObject({ turnSeq: 2 });
+    expect(ledger.completeTurn("review", AGENT)).toBeUndefined();
+  });
+
+  it("does not report a superseded turn when the previous one already finished", () => {
+    const ledger = new TurnLedger(freshDir());
+    ledger.beginTurn("review", AGENT);
+    ledger.completeTurn("review", AGENT);
+    expect(ledger.beginTurn("review", AGENT).superseded).toBeUndefined();
+  });
+
+  it("survives a restart: the pending turn a previous process left is still superseded", () => {
+    const dir = freshDir();
+    new TurnLedger(dir).beginTurn("review", AGENT);
+    expect(new TurnLedger(dir).beginTurn("review", AGENT).superseded).toMatchObject({ turnSeq: 1 });
   });
 });
 
@@ -167,7 +196,7 @@ describe("untrusted or damaged state", () => {
     const ledger = new TurnLedger(join(freshDir(), "does", "not", "exist"));
     expect(ledger.completeTurn("review", AGENT)).toBeUndefined();
     // And can still begin a turn once it is able to create the directory.
-    expect(ledger.beginTurn("review", AGENT)).toMatchObject({ turnSeq: 1 });
+    expect(ledger.beginTurn("review", AGENT).turn).toMatchObject({ turnSeq: 1 });
   });
 
   it("names state files by hash, so a session name never reaches the filesystem", () => {

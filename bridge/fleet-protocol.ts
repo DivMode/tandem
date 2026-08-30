@@ -63,8 +63,23 @@ const cwdSchema = z.string().max(4096)
 const modelSchema = z.string().max(128)
 const effortSchema = z.string().max(32)
 const errorMessageSchema = z.string().max(1024)
+/** An opaque foreman checkpoint. Bounded in length and restricted to the
+ *  base64url charset plus the format prefix, so a hostile token is rejected at
+ *  the wire boundary rather than inside the store. */
+const checkpointSchema = z.string().regex(/^fe[12]_[A-Za-z0-9_-]{1,4088}$/, 'invalid checkpoint')
 
-export const FLEET_OPS = ['open_session', 'send', 'read', 'interrupt', 'close', 'list_sessions'] as const
+export const FLEET_OPS = [
+  'open_session',
+  'send',
+  'read',
+  'interrupt',
+  'close',
+  'list_sessions',
+  // Read-only: fetch the device's OWN foreman event inbox. Events stay stored
+  // on the device that produced them; this is how a hub reads them without
+  // that device's history ever becoming the hub's truth.
+  'foreman_events',
+] as const
 export type FleetOp = (typeof FLEET_OPS)[number]
 
 /** Exact, operation-specific strict payload schemas (binding — Phase 3
@@ -94,6 +109,7 @@ const opPayloadSchemas = {
   interrupt: z.object({ sessionId: localNameSchema }).strict(),
   close: z.object({ sessionId: localNameSchema }).strict(),
   list_sessions: z.object({ limit: limitSchema.optional(), project: projectSchema.optional() }).strict(),
+  foreman_events: z.object({ since: checkpointSchema.optional(), limit: limitSchema.optional() }).strict(),
 } as const satisfies Record<FleetOp, z.ZodTypeAny>
 
 export type OpenSessionPayload = z.infer<typeof opPayloadSchemas.open_session>
@@ -101,6 +117,7 @@ export type SendPayload = z.infer<typeof opPayloadSchemas.send>
 export type ReadPayload = z.infer<typeof opPayloadSchemas.read>
 export type SessionRefPayload = z.infer<typeof opPayloadSchemas.interrupt>
 export type ListSessionsPayload = z.infer<typeof opPayloadSchemas.list_sessions>
+export type ForemanEventsPayload = z.infer<typeof opPayloadSchemas.foreman_events>
 
 export const registerFrameSchema = z
   .object({

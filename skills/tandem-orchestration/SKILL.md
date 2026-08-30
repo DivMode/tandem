@@ -43,7 +43,9 @@ They answer different questions and you need both. `get_foreman_events` is HISTO
 
 Pass the previous call's `checkpoint` back as `since` so each transition is seen once. Tandem does not track what you have read — the transport is stateless and has no per-conversation identity, so the checkpoint lives with you. `truncated: true` means older history was dropped or your checkpoint predates the current store; reconcile against `list_sessions` rather than assuming a complete record.
 
-Events are recorded per host: a session driven on a fleet device is recorded on that device. Every event carries `device` and the composite `device:localName`, so never address a worker by a bare local name you read out of the feed.
+Events are recorded per host: a session driven on a fleet device is recorded on that device. Omit `device` to read this hub; pass a device id to read that machine. One call reads exactly one device — to cover a fleet, call `list_devices` and then `get_foreman_events` once per device. An offline device fails explicitly with its id, so it can never be mistaken for "nothing happened". Every event carries `device` and the composite `device:localName`, so never address a worker by a bare local name you read out of the feed.
+
+`more: true` is pagination — unread events remain; call again with the returned checkpoint. `truncated: true` is loss — events you never saw were rotated away, or your checkpoint predates the current store.
 
 This is the reconciliation mechanism BECAUSE no MCP server can wake a dormant conversation. Do not tell the user that Tandem will notify their chat when work finishes — it cannot. `TANDEM_NTFY_TOPIC` reaches their phone, not their chat.
 
@@ -102,7 +104,7 @@ Report the returned `attachHint` when the user may want to watch locally.
 
 Read-only. Returns `{ version, events, checkpoint, more, truncated, counts }`. Each event carries a stable id, an ordinal, a timestamp, its kind (`completed`, `blocked`, `needs_input`, `interrupted`, `closed`, `error`), the device and composite session name, the engine, an incarnation epoch and turn number, an optional cursor, a short redacted summary or reason, and `needs_foreman_review`.
 
-It opens nothing, changes nothing, and marks nothing as read. `more: true` means raise `limit` or call again with the returned checkpoint.
+It opens nothing, changes nothing, and marks nothing as read. Accepts an optional `device`, an opaque `since` checkpoint, and `limit`. The checkpoint records your position on every device you have read, so reading one device preserves the positions of the others — store it verbatim and hand back the newest one.
 
 ### `list_sessions`
 

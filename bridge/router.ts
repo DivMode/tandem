@@ -601,7 +601,21 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
   // because the ledger claims it once and the claim is durable.
   const identity = await agentIdentityOf(session)
   const ledger = defaultTurnLedger()
-  ledger.beginTurn(name, identity)
+  const { superseded } = ledger.beginTurn(name, identity)
+  if (superseded) {
+    // A second instruction arrived while the previous turn was still running.
+    // That turn can never report its own completion now, so record that it was
+    // cut short rather than letting it disappear from the feed. Reported as
+    // `interrupted` because that is what happened to it — the reason
+    // distinguishes a caller's interrupt_session from this.
+    emitLifecycle({
+      type: 'session',
+      id: name,
+      kind: 'interrupted',
+      reason: 'superseded by a later instruction to the same session',
+      turn: turnOf(session, superseded),
+    })
+  }
 
   try {
     // session.send() is already BOUNDED by the engine's soft cap (TANDEM_WAIT_MS):

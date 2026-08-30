@@ -37,14 +37,20 @@ Measured against the installed SDK, not from memory:
 - `@modelcontextprotocol/sdk` **1.30.0**.
 - `LATEST_PROTOCOL_VERSION` is **`2025-11-25`**; supported versions are
   `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`, `2024-10-07`.
-- The complete set of request/notification methods the SDK defines is:
-  `initialize`, `ping`, `completion/complete`, `elicitation/create`,
-  `prompts/get`, `prompts/list`, `resources/list`, `resources/read`,
-  `resources/templates/list`, `resources/subscribe`, `resources/unsubscribe`,
-  `roots/list`, `tools/call`, `tools/list`, `tasks/get`, `tasks/list`,
-  `tasks/result`, `tasks/cancel`, and the `notifications/*` family
-  (`cancelled`, `initialized`, `message`, `progress`,
-  `elicitation/complete`, `resources/updated`, `tasks/status`).
+- Every method the SDK defines that is **relevant to server-initiated wake-up,
+  subscription, or task semantics** — this is the complete set for that
+  question, not a complete inventory of the protocol, which also carries
+  logging, sampling, completion and `list_changed` methods that have no bearing
+  on it:
+  - tasks: `tasks/get`, `tasks/list`, `tasks/result`, `tasks/cancel`,
+    `notifications/tasks/status`
+  - subscription: `resources/subscribe`, `resources/unsubscribe`,
+    `notifications/resources/updated`
+  - other server-initiated notifications: `notifications/cancelled`,
+    `notifications/message`, `notifications/progress`,
+    `notifications/initialized`, `notifications/elicitation/complete`
+  - client-initiated requests that could carry a long operation:
+    `tools/call`, `elicitation/create`
 
 Three things follow.
 
@@ -81,7 +87,8 @@ without redesign. `bridge/foreman-inbox.ts` exposes:
 
 - `record(input)` — the write side, already fed by every emit path.
 - `read({ since, limit })` — a forward-only, checkpointed read returning
-  `{ version, events, checkpoint, more, truncated, counts }`.
+  `{ version, events, checkpoint, more, truncated, counts }`, and on the routed
+  path an additional `device`.
 
 Each event has a stable content-derived `id`, a monotonic `seq`, and an explicit
 `kind`. That is exactly the shape a task store, a resource-subscription bridge,
@@ -122,12 +129,25 @@ A checkpoint carried by the reader is per-client by construction. It also:
 - is idempotent — reading the same checkpoint twice returns the same events.
 
 The costs are real but small: the foreman must carry an opaque string between
-turns, and a foreman that loses it re-reads the most recent page. Re-reading is
-a far cheaper failure than silently missing a completion.
+turns, and a foreman that loses it starts again from the oldest retained event.
+Re-reading is a far cheaper failure than silently missing a completion.
 
-`truncated: true` covers the honest edge: retention dropped history, or the
-checkpoint came from a store that has since been reset. The foreman is told to
-reconcile against `list_sessions` rather than trust the feed to be complete.
+### What `more` and `truncated` each mean
+
+Reads always move FORWARD, oldest first, from the caller's position — the
+supplied checkpoint, or the start of retained history when there is none. That
+uniformity is what lets the two flags mean exactly one thing each:
+
+- **`more: true`** is pagination and nothing else: retained events the caller
+  has not seen remain after this page. Call again with the returned checkpoint.
+  The checkpoint advances only as far as the page actually reached, so a page
+  cut short by `limit` never skips the remainder.
+- **`truncated: true`** is loss: events the caller never saw are gone, because
+  retention rotated them away, or because the checkpoint was issued by a store
+  that no longer exists. Reconcile against `list_sessions` rather than trusting
+  the feed to be complete.
+
+A page cut short by `limit` is `more`, never `truncated`.
 
 ## History is not liveness
 
@@ -140,9 +160,59 @@ for the second one:
 - the absence of an event does not mean nothing happened — retention is bounded,
   and a turn Tandem did not drive is deliberately not reported;
 - events are recorded **per host**. A session driven on a fleet device is
-  recorded on that device, so a hub's feed is not a fleet-wide record. Every
-  event carries `device` and the composite `device:localName` so a foreman never
-  has to guess which machine a bare name referred to.
+  recorded on that device — its own inbox is the truth for its own work. The
+  hub reads a device by passing `device`, one device per call. Every event
+  carries `device` and the composite `device:localName` so a foreman never has
+  to guess which machine a bare name referred to.
+
+### Reading a fleet
+
+`get_foreman_events` takes an optional `device`. Omitted (or `"local"`) it reads
+this hub, exactly as before. Given a device id it executes the read **on that
+device**, through the same fixed fleet operation table every other routed call
+uses, and returns that device's events.
+
+There is deliberately **no aggregate mode**. A foreman that wants the whole
+fleet calls `list_devices` and then this tool once per device. That avoids a
+cross-device merge with partial-failure semantics, and avoids inventing a
+chronological order across clocks that were never synchronised. An offline
+device fails explicitly, naming that device and nothing else about it, so one
+unreachable machine can never be mistaken for "nothing happened".
+
+Two properties make this safe:
+
+- **The hub's routing id wins.** A device reports events under whatever
+  `TANDEM_DEVICE_ID` it was configured with. The hub does not trust that: every
+  returned event's `device` and `session` are rewritten to the id the hub
+  actually routed to, so the composite name a foreman reads back is always the
+  name that will route to that worker.
+- **Reading a device cannot fan out.** The router's `/foreman/events` handler is
+  a pure local inbox read that knows nothing about a fleet runtime. A device
+  executing an incoming `foreman_events` request therefore cannot route back out
+  into the fleet, so there is no path by which this recurses.
+
+### Checkpoints across devices
+
+Because each device has its own store, its own epoch and its own sequence
+numbers, a single scalar cursor cannot mean anything fleet-wide. The token is a
+**versioned map** from the hub's routing device id to that device's own cursor:
+
+```
+fe2_<base64url({"v":2,"d":{"local":"fe1_…","studio":"fe1_…"}})>
+```
+
+Reading one device advances only that device's entry and preserves every other
+entry **verbatim**. The older `fe1_` single-store token is still accepted and
+read as the local device's entry; it is never re-issued.
+
+The map ships now even though nothing aggregates yet, because the token is the
+part clients persist across turns. Getting its shape right later would mean a
+breaking migration that silently stranded every stored checkpoint. A future
+aggregating reader can consume this exact token unchanged.
+
+The token stays opaque by contract, and there is still no server-side
+acknowledgement: `ts` remains informational, and no global watermark exists for
+one reader to move on another's behalf.
 
 The rule for a foreman is: call both, before opening anything.
 
@@ -154,10 +224,31 @@ The rule for a foreman is: call both, before opening anything.
 - The store is one owner-only file (0600) in a 0700 private directory, replaced
   atomically via rename, and rejected rather than trusted when its owner,
   permissions, size, or contents are wrong.
-- It holds **no** working directory, filesystem path, attach hint, handoff block,
-  git facts, environment, tool arguments, or transcript. `summary` and `reason`
-  are the only free text: redacted for credential- and path-shaped runs and
-  clamped to 200 characters. Set `TANDEM_FOREMAN_EVENT_SUMMARIES=0` to drop them
-  entirely and keep only the structured transition.
+- There is **no** `cwd`, `project`, `attachHint`, `handoff`, git-fact,
+  environment, tool-argument or transcript field. Those are never returned,
+  under any setting.
+- `summary` and `reason` are the only free text. They are clamped to 200
+  characters and redacted. Precisely what that does and does not remove:
+
+  | Redacted | Kept |
+  |---|---|
+  | Absolute POSIX paths (`/etc/hosts`, `/Users/x/a.ts`) | Relative repo paths (`src/router.ts`) |
+  | Home-relative paths (`~/.ssh/id_rsa`, `~/notes.md`) | Ordinary prose, counts, ratios (`2/3`) |
+  | Windows (`C:\...`) and UNC (`\\host\share`) paths | Session, engine and device names |
+  | URLs of any scheme | Test names and error text |
+  | Email addresses | |
+  | Tailnet hosts (`*.ts.net`) and `100.64.0.0/10` addresses | |
+  | API keys, GitHub/Slack tokens, AWS key ids, JWTs, private-key blocks | |
+  | `password=` / `token=` / `api_key=` style assignments | |
+  | Long hex digests and base64 blobs | |
+  | ANSI escapes and control bytes | |
+
+  Relative paths are kept deliberately: they name a file inside the repository
+  the worker was already told to work in, carry no host or account identity,
+  and are most of what makes a summary worth reading. Redaction is a bounded
+  best effort on free text, not a proof — a determined engine could still print
+  something sensitive in a novel shape. `TANDEM_FOREMAN_EVENT_SUMMARIES=0` drops
+  both fields entirely and keeps only the structured transition, which is the
+  setting to use if that residual risk is unacceptable.
 
 See [SECURITY.md](../SECURITY.md) for the full data boundary.

@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerLive, unregisterLive } from "../bridge/sessions.ts";
@@ -206,6 +206,56 @@ describe("non-completion lifecycle transitions", () => {
     expect(event).toMatchObject({ kind: "error" });
     expect(event!.reason).toContain("engine went away");
     expect(event!.needs_foreman_review).toBe(true);
+  });
+});
+
+describe("a second instruction while a turn is still running", () => {
+  it("reports the superseded turn, then the new turn's completion, with no duplicates", async () => {
+    const state = seedSession("w14", { sendStatus: "running", idle: false });
+    await send("w14", "first job");
+    expect(events()).toEqual([]); // turn 1 still in flight
+
+    // A second send lands in the same session. Turn 1 can never complete now.
+    await send("w14", "second job");
+    expect(events().map((e) => e.kind)).toEqual(["interrupted"]);
+    expect(events()[0]).toMatchObject({ turn: 1, kind: "interrupted" });
+    expect(events()[0]!.reason).toMatch(/superseded/i);
+
+    // Only the live turn completes, and only once however often it is polled.
+    state.idle = true;
+    await poll("w14", 0);
+    await poll("w14", 0);
+    await poll("w14", 0);
+    const recorded = events();
+    expect(recorded.map((e) => e.kind)).toEqual(["interrupted", "completed"]);
+    expect(recorded.map((e) => e.turn)).toEqual([1, 2]);
+    expect(new Set(recorded.map((e) => e.id)).size).toBe(2);
+  });
+
+  it("does not report a supersede when the previous turn already finished", async () => {
+    seedSession("w15", { sendStatus: "done", idle: true });
+    await send("w15", "first");
+    await send("w15", "second");
+    expect(events().map((e) => e.kind)).toEqual(["completed", "completed"]);
+  });
+
+  it("still drives the session when the event cannot be persisted", async () => {
+    // Reporting must never break the thing it reports on: point the state root
+    // at a path that cannot hold a directory and drive a full supersede.
+    const previous = process.env.TANDEM_STATE_DIR;
+    process.env.TANDEM_STATE_DIR = join(stateDir, "notes.txt", "nested");
+    writeFileSync(join(stateDir, "notes.txt"), "not a directory");
+    try {
+      const state = seedSession("w16", { sendStatus: "running", idle: false });
+      expect((await send("w16", "first")).status).toBe(200);
+      expect((await send("w16", "second")).status).toBe(200);
+      state.idle = true;
+      const polled = await poll("w16", 0);
+      expect(polled.status).toBe(200);
+    } finally {
+      if (previous === undefined) delete process.env.TANDEM_STATE_DIR;
+      else process.env.TANDEM_STATE_DIR = previous;
+    }
   });
 });
 

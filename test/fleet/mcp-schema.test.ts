@@ -64,14 +64,14 @@ describe("buildMcpServer: list_devices tool (binding — correction 10)", () => 
 });
 
 describe("buildMcpServer: device param on session tools", () => {
-  it("open_session/send_to_session/interrupt_session/close_session/list_sessions all expose an optional 'device' field", async () => {
+  it("every device-routable tool, including get_foreman_events, exposes an optional 'device' field", async () => {
     const { server, client } = await connectedClient(undefined);
     cleanups.push(async () => {
       await client.close();
       await server.close();
     });
     const { tools } = await client.listTools();
-    for (const name of ["open_session", "send_to_session", "interrupt_session", "close_session", "list_sessions"]) {
+    for (const name of ["open_session", "send_to_session", "interrupt_session", "close_session", "list_sessions", "get_foreman_events"]) {
       const tool = tools.find((t) => t.name === name);
       expect(tool, `expected tool ${name} to exist`).toBeDefined();
       const props = (tool!.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};

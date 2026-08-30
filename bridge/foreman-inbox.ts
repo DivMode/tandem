@@ -21,9 +21,14 @@
  * metadata only: no working directory, no filesystem path, no attach hint, no
  * handoff block, no git facts, no environment, no tool arguments, no transcript.
  * The one free-text pair (`summary`, `reason`) is clamped to 200 characters and
- * passed through sanitizeEventText(), which strips control sequences and
- * redacts credential-shaped runs, absolute paths, and URLs. A host that wants
- * none of it sets TANDEM_FOREMAN_EVENT_SUMMARIES=0.
+ * passed through sanitizeEventText(). That strips control sequences and
+ * redacts credentials, URLs, email addresses, tailnet host names and addresses,
+ * and ABSOLUTE filesystem locations (POSIX, home-relative, Windows and UNC).
+ * It deliberately keeps RELATIVE paths such as "src/router.ts": they name a
+ * file inside the repository the worker was already told to work in, carry no
+ * host or account identity, and are most of what makes a summary worth
+ * reading. A host that wants none of it sets
+ * TANDEM_FOREMAN_EVENT_SUMMARIES=0.
  *
  * LIVENESS IS NOT HISTORY. An event says a transition happened; it never says a
  * worker is or is not alive now. list_sessions is the only liveness truth — the
@@ -49,6 +54,9 @@ import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync }
 import { createHash, randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { tandemStatePath } from './state-dir.ts'
+import { InvalidCheckpointError } from './foreman-checkpoint.ts'
+
+export { InvalidCheckpointError } from './foreman-checkpoint.ts'
 
 /** Bumped whenever the on-disk or wire shape below changes. */
 export const FOREMAN_EVENT_VERSION = 1
@@ -144,8 +152,24 @@ const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
   [/\b(password|passwd|secret|token|api[_-]?key|authorization|bearer)\b\s*[:=]\s*\S+/gi, '$1=<redacted>'],
   // URLs before paths: a URL's own "/a/b" must not be rewritten piecemeal.
   [/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<url>'],
-  // Absolute and home-relative filesystem paths (SECURITY.md: no paths leave the host).
-  [/(?:~|\/)(?:[A-Za-z0-9._+-]+\/)+[A-Za-z0-9._+-]*/g, '<path>'],
+  // Email addresses — a person's identity, not a diagnostic.
+  [/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '<email>'],
+  // Tailscale identity: MagicDNS names and the 100.64.0.0/10 CGNAT range the
+  // tailnet uses. Both name a machine on the user's private network.
+  [/\b[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.ts\.net\b/gi, '<tailnet-host>'],
+  [/\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b/g, '<tailnet-ip>'],
+  // ABSOLUTE filesystem locations only: POSIX "/a/b", home-relative "~/a", and
+  // Windows "C:\\a\\b" or a UNC "\\\\host\\share". A RELATIVE path such as
+  // "src/router.ts" is deliberately kept: it names a file inside the repo the
+  // worker was already asked to work on, carries no host or account identity,
+  // and is most of what makes a summary worth reading.
+  [/\b[A-Za-z]:[\\/](?:[^\s\\/:*?"<>|]+[\\/])*[^\s\\/:*?"<>|]*/g, '<path>'],
+  [/\\\\[A-Za-z0-9._-]+\\[^\s]*/g, '<path>'],
+  [/~\/\S*/g, '<path>'],
+  // The lookbehind is what keeps a RELATIVE path intact: the leading slash must
+  // not itself follow a path character, so "/etc/hosts" and "/Users/x/a.ts"
+  // match while "src/router.ts" and "2/3" do not.
+  [/(?<![A-Za-z0-9._+~-])\/[A-Za-z0-9._+-]+(?:\/[A-Za-z0-9._+-]*)*/g, '<path>'],
   // Long opaque runs (hex digests, base64 blobs) that no summary needs.
   [/\b[A-Fa-f0-9]{32,}\b/g, '<redacted>'],
   [/\b[A-Za-z0-9+/]{40,}={0,2}\b/g, '<redacted>'],
@@ -183,8 +207,6 @@ export function currentDeviceId(env: NodeJS.ProcessEnv = process.env): string {
 /* -------------------------------------------------------------------------- */
 /* checkpoints                                                                 */
 /* -------------------------------------------------------------------------- */
-
-export class InvalidCheckpointError extends Error {}
 
 const CHECKPOINT_PREFIX = 'fe1_'
 /**
@@ -244,10 +266,12 @@ export interface ForemanEventPage {
   events: ForemanEvent[]
   /** Hand this back as `since` on the next call. */
   checkpoint: string
-  /** More events exist after this page (raise `limit`, or call again). */
+  /** Retained events the caller has not seen remain AFTER this page. Purely a
+   *  pagination fact: call again with the returned checkpoint to collect them. */
   more: boolean
-  /** Older history was dropped by retention, or the checkpoint predates this
-   *  store, so this page is NOT a complete record since the caller last read. */
+  /** Events the caller never saw are GONE — retention rotated them away before
+   *  this read, or the checkpoint was issued by a store that no longer exists.
+   *  Never set merely because a page was cut short by `limit`; that is `more`. */
   truncated: boolean
   counts: { returned: number; retained: number }
 }
@@ -397,11 +421,18 @@ export class ForemanInbox {
   }
 
   /**
-   * Read forward from a caller-carried checkpoint.
+   * Read FORWARD from the caller's position, oldest first.
    *
-   * With no checkpoint the NEWEST page is returned — a foreman reconciling for
-   * the first time wants the current backlog, not the oldest page of a long
-   * history. With one, everything recorded after it, oldest first.
+   * The position is the supplied checkpoint, or the start of retained history
+   * when there is none. Paging is therefore uniform: every call moves forward,
+   * and the returned checkpoint is exactly how far this page reached — so a
+   * page cut short by `limit` never skips the remainder.
+   *
+   * That uniformity is what lets the two flags mean one thing each. `more` is
+   * pagination: unread events are still retained. `truncated` is loss: events
+   * the caller never saw are gone, because retention rotated them away or the
+   * checkpoint came from a store that no longer exists. A page cut short by
+   * `limit` is `more`, never `truncated`.
    */
   read(opts: { since?: string; limit?: number } = {}): ForemanEventPage {
     const store = this.load()
@@ -410,28 +441,31 @@ export class ForemanInbox {
     const highestSeq = retained > 0 ? store.events[retained - 1]!.seq : store.droppedThrough
 
     let candidates: ForemanEvent[]
-    let truncated = false
+    let truncated: boolean
 
     if (opts.since === undefined) {
-      candidates = store.events.slice(-limit)
-      truncated = retained > candidates.length || store.droppedThrough > 0
+      // No position yet: start at the oldest thing still retained. Anything
+      // rotated away before this first read is genuinely lost to the caller.
+      candidates = store.events
+      truncated = store.droppedThrough > 0
     } else {
       const { storeEpoch, seq } = decodeCheckpoint(opts.since)
       if (storeEpoch === EMPTY_STORE_EPOCH) {
-        // The caller checkpointed an inbox that had never been written to, so
-        // it has genuinely seen nothing. Give it everything still retained —
-        // truncated only if retention has actually dropped something.
+        // A position taken from an inbox that had never been written to. The
+        // caller has seen nothing, so this behaves exactly like a first read.
         candidates = store.events
         truncated = store.droppedThrough > 0
       } else if (storeEpoch !== store.epoch) {
         // A different store issued that checkpoint (reset, restore, or another
-        // host). Its sequence numbers mean nothing here — say so, rather than
-        // silently replaying everything or silently skipping everything.
-        candidates = store.events.slice(-limit)
+        // host). Its sequence numbers mean nothing here, and whatever the
+        // caller had seen is unreachable — say so rather than silently
+        // replaying everything or silently skipping everything.
+        candidates = store.events
         truncated = true
       } else {
         candidates = store.events.filter((e) => e.seq > seq)
-        if (seq < store.droppedThrough) truncated = true
+        // Retention dropped events that fall after the caller's position.
+        truncated = seq < store.droppedThrough
       }
     }
 
@@ -441,8 +475,6 @@ export class ForemanInbox {
     return {
       version: FOREMAN_EVENT_VERSION,
       events,
-      // When a page is cut short by `limit`, the checkpoint must not skip the
-      // remainder: it advances only as far as this page actually reached.
       checkpoint: encodeCheckpoint(store.epoch, more ? lastSeq : Math.max(lastSeq, highestSeq)),
       more,
       truncated,

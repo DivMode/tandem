@@ -33,6 +33,8 @@ export interface LocalOpPayload {
   cursor?: number
   limit?: number
   project?: string
+  /** foreman_events: the device-scoped checkpoint from a previous read. */
+  since?: string
 }
 
 function buildQuery(params: Record<string, string | number | undefined>): string {
@@ -73,5 +75,10 @@ export async function executeLocalOp(op: FleetOp, payload: LocalOpPayload): Prom
       return routeForTest('POST', `/sessions/${encodeURIComponent(payload.sessionId ?? '')}/close`)
     case 'list_sessions':
       return routeForTest('GET', '/sessions', {}, buildQuery({ limit: payload.limit, project: payload.project }))
+    case 'foreman_events':
+      // Read-only, and deliberately the SAME local route the hub's own inbox
+      // read uses. A device answering this never consults a fleet runtime, so
+      // reading a device's inbox can never fan back out into the fleet.
+      return routeForTest('GET', '/foreman/events', {}, buildQuery({ since: payload.since, limit: payload.limit }))
   }
 }

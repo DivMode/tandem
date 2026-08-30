@@ -212,12 +212,24 @@ export class TurnLedger {
 
   /**
    * Open a turn: send() has just delivered an instruction. Returns the
-   * coordinate of the turn now in flight.
+   * coordinate of the turn now in flight, and — when a previous turn was still
+   * outstanding — the coordinate of the turn this one SUPERSEDED.
+   *
+   * A second send while a turn is in flight is a real event a foreman needs to
+   * see. The engine receives the new instruction into the same session, so the
+   * first turn will never report a completion of its own; without this it
+   * simply vanished from the record, and a foreman reading the feed would
+   * still be waiting on it.
    */
-  beginTurn(name: string, identity: string): TurnRef {
+  beginTurn(name: string, identity: string): { turn: TurnRef; superseded?: TurnRef } {
     const state = this.reconcile(name, identity)
+    const superseded =
+      state.pendingTurn === null
+        ? undefined
+        : { identity: state.identity, epoch: state.epoch, turnSeq: state.pendingTurn }
     const turnSeq = state.turnSeq + 1
-    return this.save(name, { ...state, turnSeq, pendingTurn: turnSeq })
+    const turn = this.save(name, { ...state, turnSeq, pendingTurn: turnSeq })
+    return superseded ? { turn, superseded } : { turn }
   }
 
   /**

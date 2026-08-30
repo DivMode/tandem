@@ -19,7 +19,8 @@ const EXPECTED_TOOLS = [
   // test/orchestration-policy.test.ts for its annotations and content).
   "get_orchestration_policy",
   // Foreman reconciliation: read-only durable event feed (see
-  // test/foreman-events.test.ts for its annotations, surface, and redaction).
+  // test/foreman-events-mcp.test.ts for its annotations and surface, and
+  // test/foreman-inbox.test.ts for retention and redaction).
   "get_foreman_events",
 ];
 
