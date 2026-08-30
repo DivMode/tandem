@@ -31,6 +31,28 @@ The general session tools are engine-neutral. The built-in `relay` is intentiona
 7. Never resend a prompt just because a turn is still running. Poll with an empty `text` and the returned cursor.
 8. Interrupting the caller does not stop an in-flight Tandem turn. After any interruption, disconnect, or new conversation, call `list_sessions` AND `get_foreman_events` first, then resume the same worker instead of starting a second one.
 9. Ask before destructive, irreversible, or materially broader actions. Tandem does not grant authority beyond the user's request.
+10. Implementation workers do not self-approve. A worker's account of its own work is not an independent review; the caller acting as foreman is the reviewer of record and the merge authority, and reviews the diff against the original requirement.
+11. Never open a session solely to watch another one. Routine progress comes from `list_sessions`, cursor polling of the session that owns the work, and `get_foreman_events`. A short read-only health probe is exceptional — only when the semantic state itself looks inconsistent or stuck — and is closed immediately afterwards.
+
+## Review authority
+
+The caller driving Tandem is the **reviewer of record and the merge authority** for orchestrated engineering work. Implementation workers supply code, tests, and evidence; they do not approve their own work and they do not merge it.
+
+A separate Claude reviewer session is **optional, not mandatory**. Open one when risk, complexity, or local execution earns a genuinely independent read — security, protocol and MCP behaviour, Nix and system state, migrations, concurrency and shared state, large refactors. Its verdict is **evidence for the foreman, not a substitute for the foreman's review and merge decision**. For small, low-risk, plainly correct work, skip it and say that you skipped it.
+
+Give a reviewer the diff and the original requirement, never the implementer's summary of itself.
+
+## Watching a worker without opening one
+
+**Never open a session solely to watch another one.** A monitoring worker costs a model, learns nothing the cursor does not already carry, and creates exactly the duplicate ownership rule 6 exists to prevent.
+
+Routine progress is:
+
+1. `list_sessions` — what is running now.
+2. `send_to_session` with an empty `text` and the returned `cursor` — the semantic state of the session that owns the work.
+3. `get_foreman_events` — what finished, blocked, or failed while you were away.
+
+A short read-only health probe is the exception, justified only when the semantic state itself looks inconsistent or stuck — not merely because a turn is taking a while — and the session it opens is **closed immediately afterwards**.
 
 ## Reconcile before you open anything
 
@@ -158,7 +180,7 @@ Keep the machine awake, use bounded turns, preserve cursors, and checkpoint impo
 
 ## Completion standard
 
-Do not declare success because a session said it was done. Inspect the relevant files or artifacts, run proportionate tests, check security boundaries, and report limitations plainly. A remote session is a worker, not an authority.
+Do not declare success because a session said it was done. Inspect the relevant files or artifacts, run proportionate tests, check security boundaries, and report limitations plainly. A remote session is a worker, not an authority, and it never approves its own work.
 
 Tandem is complete for a task only when:
 
