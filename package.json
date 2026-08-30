@@ -47,6 +47,7 @@
     "start": "node --experimental-strip-types src/server.ts",
     "start:stdio": "node --experimental-strip-types src/stdio-server.ts",
     "start:device": "node --experimental-strip-types src/device-server.ts",
+    "hook:claude-stop": "node --experimental-strip-types src/claude-stop-hook.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
