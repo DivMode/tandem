@@ -62,6 +62,7 @@
 import { lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
 import { join } from 'node:path'
+import { isClaudeTurnBaseline, type ClaudeTurnBaseline } from './claude-completion.ts'
 import { tandemStatePath } from './state-dir.ts'
 
 /** Bumped whenever the on-disk shape below changes; older state is discarded. */
@@ -88,6 +89,20 @@ interface TurnState extends TurnRef {
   version: number
   /** The turn opened by send() and not yet reported, if any. */
   pendingTurn: number | null
+  /**
+   * Where the Claude lifecycle store stood when `pendingTurn` was opened, for
+   * engines that report their own turn boundary (see claude-completion.ts).
+   * Parked HERE rather than in the bridge process because the whole point is
+   * that it survives a restart and a cold re-adoption: without it, a foreman
+   * coming back to a session cannot tell this turn's `Stop` from the previous
+   * turn's, and the previous turn's is still sitting in the store.
+   *
+   * Cleared wherever `pendingTurn` is: a baseline outliving its turn would let
+   * a boundary Claude reported for a turn that was interrupted, superseded, or
+   * already reported end a turn it has nothing to do with. Absent on entries
+   * written before this field existed, and on every non-Claude engine.
+   */
+  lifecycle?: ClaudeTurnBaseline | null
   /** Highest turn already reported as completed. */
   lastEmittedTurn: number
   updatedAt: number
@@ -104,6 +119,9 @@ function isTurnState(value: unknown): value is TurnState {
   if (c.pendingTurn !== null && (typeof c.pendingTurn !== 'number' || !Number.isSafeInteger(c.pendingTurn))) return false
   if (typeof c.updatedAt !== 'number' || !Number.isFinite(c.updatedAt)) return false
   if (Date.now() - c.updatedAt > MAX_AGE_MS) return false
+  // Absent is legitimate (an older entry, or a non-Claude engine); present but
+  // malformed is not, and a half-read baseline must never be treated as one.
+  if (c.lifecycle !== undefined && c.lifecycle !== null && !isClaudeTurnBaseline(c.lifecycle)) return false
   return true
 }
 
@@ -196,10 +214,10 @@ export class TurnLedger {
     this.sweep()
     const existing = this.read(name)
     if (!existing) {
-      return { version: TURN_STATE_VERSION, identity, epoch: 1, turnSeq: 0, pendingTurn: null, lastEmittedTurn: 0, updatedAt: Date.now() }
+      return { version: TURN_STATE_VERSION, identity, epoch: 1, turnSeq: 0, pendingTurn: null, lifecycle: null, lastEmittedTurn: 0, updatedAt: Date.now() }
     }
     if (existing.identity !== identity) {
-      return { ...existing, identity, epoch: existing.epoch + 1, pendingTurn: null, updatedAt: Date.now() }
+      return { ...existing, identity, epoch: existing.epoch + 1, pendingTurn: null, lifecycle: null, updatedAt: Date.now() }
     }
     return existing
   }
@@ -221,15 +239,38 @@ export class TurnLedger {
    * simply vanished from the record, and a foreman reading the feed would
    * still be waiting on it.
    */
-  beginTurn(name: string, identity: string): { turn: TurnRef; superseded?: TurnRef } {
+  beginTurn(
+    name: string,
+    identity: string,
+    lifecycle?: ClaudeTurnBaseline,
+  ): { turn: TurnRef; superseded?: TurnRef } {
     const state = this.reconcile(name, identity)
     const superseded =
       state.pendingTurn === null
         ? undefined
         : { identity: state.identity, epoch: state.epoch, turnSeq: state.pendingTurn }
     const turnSeq = state.turnSeq + 1
-    const turn = this.save(name, { ...state, turnSeq, pendingTurn: turnSeq })
+    // A superseding send REPLACES the baseline rather than inheriting it: the
+    // turn it belonged to has just been reported as interrupted, and letting
+    // its baseline stand would offer the new turn a boundary the old one owned.
+    const turn = this.save(name, { ...state, turnSeq, pendingTurn: turnSeq, lifecycle: lifecycle ?? null })
     return superseded ? { turn, superseded } : { turn }
+  }
+
+  /**
+   * The lifecycle baseline of the turn currently in flight, or undefined when
+   * there is no such turn, the entry belongs to a different incarnation, or the
+   * turn was opened without one.
+   *
+   * READ-ONLY on purpose: a poll asking "did Claude report a boundary?" must
+   * not itself advance any state. The claim that follows is made through
+   * completeTurn/abortTurn, which is where exactly-once lives.
+   */
+  pendingBaseline(name: string, identity: string): ClaudeTurnBaseline | undefined {
+    const state = this.read(name)
+    if (!state || state.identity !== identity) return undefined
+    if (state.pendingTurn === null) return undefined
+    return state.lifecycle ?? undefined
   }
 
   /**
@@ -250,7 +291,13 @@ export class TurnLedger {
       if (this.read(name)?.epoch !== state.epoch) this.save(name, state)
       return undefined
     }
-    return this.save(name, { ...state, turnSeq: Math.max(state.turnSeq, pending), pendingTurn: null, lastEmittedTurn: pending })
+    return this.save(name, {
+      ...state,
+      turnSeq: Math.max(state.turnSeq, pending),
+      pendingTurn: null,
+      lifecycle: null,
+      lastEmittedTurn: pending,
+    })
   }
 
   /**
@@ -262,7 +309,7 @@ export class TurnLedger {
     const state = this.reconcile(name, identity)
     const pending = state.pendingTurn
     if (pending === null) return undefined
-    return this.save(name, { ...state, pendingTurn: null })
+    return this.save(name, { ...state, pendingTurn: null, lifecycle: null })
   }
 
   /**
@@ -273,13 +320,24 @@ export class TurnLedger {
    */
   sessionRef(name: string, identity: string): TurnRef {
     const state = this.reconcile(name, identity)
-    return this.save(name, { ...state, turnSeq: state.turnSeq + 1, pendingTurn: null })
+    return this.save(name, { ...state, turnSeq: state.turnSeq + 1, pendingTurn: null, lifecycle: null })
   }
 
   /** Current state without changing anything (tests and diagnostics). */
-  inspect(name: string): TurnRef & { pendingTurn: number | null; lastEmittedTurn: number } | undefined {
+  inspect(
+    name: string,
+  ): (TurnRef & { pendingTurn: number | null; lastEmittedTurn: number; lifecycle?: ClaudeTurnBaseline }) | undefined {
     const s = this.read(name)
-    return s && { identity: s.identity, epoch: s.epoch, turnSeq: s.turnSeq, pendingTurn: s.pendingTurn, lastEmittedTurn: s.lastEmittedTurn }
+    return (
+      s && {
+        identity: s.identity,
+        epoch: s.epoch,
+        turnSeq: s.turnSeq,
+        pendingTurn: s.pendingTurn,
+        lastEmittedTurn: s.lastEmittedTurn,
+        ...(s.lifecycle ? { lifecycle: s.lifecycle } : {}),
+      }
+    )
   }
 
   /** Once per process: drop entries nothing will ever consult again. */

@@ -66,6 +66,9 @@ import {
 } from './sessions.ts'
 import * as relay from './relay.ts'
 import { emitCompletion, emitLifecycle, summarize, type EmitTurn } from './events.ts'
+import { claudeTurnEndAfter, type ClaudeTurnBaseline, type ClaudeTurnEnd } from './claude-completion.ts'
+import { defaultClaudeLifecycleStore } from './claude-lifecycle-store.ts'
+import { tandemSessionIdFor } from './claude-worker-env.ts'
 import { defaultTurnLedger } from './turn-ledger.ts'
 import { currentDeviceId, defaultForemanInbox, InvalidCheckpointError } from './foreman-inbox.ts'
 import { audit } from './audit.ts'
@@ -274,6 +277,24 @@ async function agentIdentityOf(session: DrivableSession): Promise<string> {
 /** The EmitTurn carried into events.ts for a session-sourced event. */
 function turnOf(session: DrivableSession, ref: { epoch: number; turnSeq: number }): EmitTurn {
   return { epoch: ref.epoch, turn: ref.turnSeq, engine: session.engine, device: currentDeviceId() }
+}
+
+/**
+ * Where the Claude lifecycle store stands right now, taken BEFORE a turn is
+ * delivered so a boundary Claude reports afterwards is attributable to it.
+ *
+ * Claude only: no other engine has a hook that writes into that store. Never
+ * throws — a baseline that cannot be taken simply means this turn will be
+ * decided the way every turn was before this path existed, by the backend.
+ */
+function claudeBaselineFor(session: DrivableSession, name: string): ClaudeTurnBaseline | undefined {
+  if (session.engine !== 'claude') return undefined
+  try {
+    const cursor = defaultClaudeLifecycleStore().snapshot()
+    return { session: tandemSessionIdFor(name), seq: cursor.seq, storeEpoch: cursor.storeEpoch }
+  } catch {
+    return undefined
+  }
 }
 
 // ---- session handlers -----------------------------------------------------
@@ -601,7 +622,12 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
   // because the ledger claims it once and the claim is durable.
   const identity = await agentIdentityOf(session)
   const ledger = defaultTurnLedger()
-  const { superseded } = ledger.beginTurn(name, identity)
+  // Snapshot the lifecycle store BEFORE the instruction goes out, and park it
+  // with the pending turn. It is what stops the PREVIOUS turn's `Stop` — still
+  // retained in the store — from ending this one the moment it is polled, and
+  // it is durable, so a bridge restart and a cold re-adoption keep the
+  // distinction instead of losing it (see claude-completion.ts).
+  const { superseded } = ledger.beginTurn(name, identity, claudeBaselineFor(session, name))
   if (superseded) {
     // A second instruction arrived while the previous turn was still running.
     // That turn can never report its own completion now, so record that it was
@@ -674,6 +700,20 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
  * and has not yet reported? It says yes exactly once, durably. A session that
  * is merely idle because a human typed into the TUI is not a turn Tandem drove
  * and is deliberately not reported as one.
+ *
+ * TWO SIGNALS NOW, IN A FIXED ORDER. `page.idle` is still an INFERENCE about a
+ * terminal, and its expensive failure is the silent one: a backend that reports
+ * `working` forever leaves a finished turn unreported until the foreman gives
+ * up. When Claude ran Tandem's lifecycle hook it left a statement about its own
+ * turn boundary in the private store, and that statement is consulted FIRST —
+ * it is not a guess about a pane, and when it carries the final assistant
+ * message that message is better than a summary of scraped screen text.
+ *
+ * Everything that ENDS a turn some other way — interrupt_session, close, a
+ * superseding send — clears the pending turn AND its baseline before this can
+ * run, so none of them can be re-read as a `Stop`. And with no lifecycle
+ * record to find (no settings file, no hook, an unreadable store), this
+ * collapses back to exactly the `page.idle` path that was here before.
  */
 async function readSession(name: string, cursor: number): Promise<RpcResult> {
   const session = await getLiveOrAdopt(name)
@@ -683,9 +723,65 @@ async function readSession(name: string, cursor: number): Promise<RpcResult> {
   }
   try {
     const page = await session.read({ cursor })
-    if (page.idle) {
-      const identity = await agentIdentityOf(session)
-      const ref = defaultTurnLedger().completeTurn(name, identity)
+    const ledger = defaultTurnLedger()
+    // Only ask the backend for an identity when something is going to use one.
+    const identity = page.idle || session.engine === 'claude' ? await agentIdentityOf(session) : undefined
+    const ended: ClaudeTurnEnd | undefined =
+      identity !== undefined && session.engine === 'claude'
+        ? claudeTurnEndAfter(ledger.pendingBaseline(name, identity))
+        : undefined
+
+    if (ended && identity !== undefined) {
+      // Claude stated the turn is over. Take the ledger's claim so this is
+      // reported exactly once however many polls observe the same record, and
+      // report `idle: true` regardless of what the pane still says — the whole
+      // point is that a stale `working` no longer keeps a poll loop running.
+      const base = {
+        ...page,
+        idle: true,
+        live: true,
+        engine: session.engine,
+        attachHint: session.attachHint(),
+        turnEnded: ended.kind,
+      }
+      if (ended.kind === 'stop') {
+        const ref = ledger.completeTurn(name, identity)
+        if (ref) {
+          emitCompletion({
+            type: 'session',
+            id: name,
+            cursor: page.cursor,
+            // Claude's own last message beats a summary of scraped pane text.
+            summary: summarize(ended.message ?? page.text),
+            cwd: session.cwd,
+            turn: turnOf(session, ref),
+          })
+        }
+        return ok({
+          ...base,
+          ...(ended.message ? { finalMessage: ended.message } : {}),
+          ...(ended.messageTruncated ? { finalMessageTruncated: true } : {}),
+        })
+      }
+      // StopFailure is TERMINAL and needs review: the turn is over and it did
+      // not succeed. It is not a completion, so it never reports one — the turn
+      // is closed out with abortTurn (once) and recorded as an error, which is
+      // a transition the foreman inbox surfaces for attention.
+      const ref = ledger.abortTurn(name, identity)
+      if (ref) {
+        emitLifecycle({
+          type: 'session',
+          id: name,
+          kind: 'error',
+          reason: 'Claude reported StopFailure: the turn ended in failure and needs review',
+          turn: turnOf(session, ref),
+        })
+      }
+      return ok(base)
+    }
+
+    if (page.idle && identity !== undefined) {
+      const ref = ledger.completeTurn(name, identity)
       if (ref) {
         emitCompletion({
           type: 'session',
