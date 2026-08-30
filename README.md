@@ -196,7 +196,7 @@ This writes a local MCP connector under `~/.tandem/desktop/connector.json`. The 
 | Tool | What it lets the AI do |
 |---|---|
 | `list_devices` | See your connected computers and their available engines. |
-| `list_sessions` | See live Tandem sessions on a computer. |
+| `list_sessions` | See live Tandem sessions on a computer, plus a short preview of the most recent finished work. |
 | `open_session` | Start or reattach to an agent session. |
 | `send_to_session` | Give the agent more work or read its latest output. |
 | `interrupt_session` | Stop the current turn while keeping the session alive. |
@@ -221,6 +221,11 @@ Two things worth knowing:
 
 - **Events are history; `list_sessions` is what is running now.** A "completed"
   event does not mean the worker shut down.
+- **`list_sessions` also returns a short `recent_events` preview** — at most
+  five recent transitions, newest first. It is there so a chat that was already
+  open before Tandem gained `get_foreman_events` can still notice that work
+  finished, because a client caches the tool list for the life of a
+  conversation. It is history too, and no substitute for the checkpointed feed.
 - **Nothing can make a chat resume on its own.** No MCP server can wake a
   dormant conversation in any client today, Tandem included. The record is read
   on the AI's next turn. If you want to be told at the moment something
@@ -239,6 +244,16 @@ Each computer keeps its own record. Ask another one by passing its device id.
 
 See [docs/foreman-events.md](docs/foreman-events.md) for the protocol details
 and [SECURITY.md](SECURITY.md) for the exact data boundary.
+
+### Letting Claude report its own completion
+
+By default Tandem *infers* that a turn ended by watching the terminal, and a
+wrong inference leaves a finished worker reporting `working`. Claude can instead
+report its own turn boundary through its `Stop` lifecycle hook. It is optional,
+off unless you configure it, and your personal `~/.claude/settings.json` is never
+read or changed. See
+[docs/claude-completion-hook.md](docs/claude-completion-hook.md) for the exact
+settings file, the `TANDEM_CLAUDE_SETTINGS_PATH` wiring, and a Nix example.
 
 ## Security in plain language
 

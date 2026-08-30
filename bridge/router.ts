@@ -70,7 +70,12 @@ import { claudeTurnEndAfter, type ClaudeTurnBaseline, type ClaudeTurnEnd } from 
 import { defaultClaudeLifecycleStore } from './claude-lifecycle-store.ts'
 import { tandemSessionIdFor } from './claude-worker-env.ts'
 import { defaultTurnLedger } from './turn-ledger.ts'
-import { currentDeviceId, defaultForemanInbox, InvalidCheckpointError } from './foreman-inbox.ts'
+import {
+  currentDeviceId,
+  defaultForemanInbox,
+  InvalidCheckpointError,
+  type ForemanEventPreview,
+} from './foreman-inbox.ts'
 import { audit } from './audit.ts'
 import { terminalBackend, type TerminalEngineId } from './terminal-backend.ts'
 
@@ -153,7 +158,9 @@ export async function route(req: RpcRequest): Promise<RpcResult> {
   if (m === 'GET' && parts.length === 1 && parts[0] === 'sessions') {
     const limit = req.query.get('limit') ? Number(req.query.get('limit')) : undefined
     const project = req.query.get('project') ?? undefined
-    return ok(await listSessions({ limit, project }))
+    // `sessions` is exactly what it has always been. `recent_events` is
+    // ADDITIVE and bounded — see recentEventsPreview below.
+    return ok({ ...(await listSessions({ limit, project })), recent_events: recentEventsPreview() })
   }
 
   // POST /sessions/open
@@ -213,6 +220,37 @@ export async function route(req: RpcRequest): Promise<RpcResult> {
   }
 
   return err(404, `no route for ${m} ${req.path}`)
+}
+
+// ---- session listing -------------------------------------------------------
+
+/**
+ * The bounded recent-transition preview carried alongside `sessions`.
+ *
+ * WHY IT HANGS OFF list_sessions. An MCP client caches a server's tool list for
+ * the life of a conversation; nothing in the protocol re-reads the schema, and
+ * no server can wake a client to make it. A chat that was open before this
+ * server gained `get_foreman_events` therefore cannot call it, however
+ * correctly the policy tells it to — but it still calls `list_sessions`, which
+ * was in the schema it cached. This field is the only route a completion has
+ * back to that conversation.
+ *
+ * ADDITIVE AND FAIL-SOFT, IN THAT ORDER. `sessions` is byte-identical to what
+ * it was; a client that ignores unknown fields sees no change at all. And a
+ * preview that cannot be produced is omitted rather than raised: listing live
+ * sessions is the load-bearing half of this route and must not start failing
+ * because a summary could not be read.
+ *
+ * It is NOT the history surface. It carries no caller checkpoint and cannot be
+ * paged, so `get_foreman_events` remains preferred for anything that must be
+ * seen exactly once. See bridge/foreman-inbox.ts's ForemanEventPreview.
+ */
+function recentEventsPreview(): ForemanEventPreview | undefined {
+  try {
+    return defaultForemanInbox().preview()
+  } catch {
+    return undefined
+  }
 }
 
 // ---- foreman reconciliation ----------------------------------------------

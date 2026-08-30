@@ -252,16 +252,27 @@ describe("the previously agreed rules survive this change", () => {
 
 describe("versioning and concision", () => {
   it("bumped past the version that lacked these rules", () => {
-    expect(ORCHESTRATION_POLICY_VERSION).toBe("1.2.0");
+    // The reviewer-of-record and no-monitoring rules landed in 1.2.0; asserting
+    // ">= 1.2.0" keeps that intent without re-breaking on every later bump.
+    const [major, minor] = ORCHESTRATION_POLICY_VERSION.split(".").map(Number);
+    expect(major).toBeGreaterThanOrEqual(1);
+    expect(major > 1 || (minor ?? 0) >= 2).toBe(true);
     expect(ORCHESTRATION_INSTRUCTIONS).toContain(`v${ORCHESTRATION_POLICY_VERSION}`);
   });
 
   it("keeps the always-loaded instructions compact, deferring detail to the tool", () => {
     // These are pasted into a system prompt on every connect, so growth here is
     // a real cost. The full text lives behind get_orchestration_policy.
+    //
+    // The character budget moved 7000 → 8000 for the completion barrier and the
+    // ambiguous-delivery rule. Both had to go in the ALWAYS-LOADED hint rather
+    // than only the served policy: they govern when a foreman may end its turn
+    // and when it may resend, and a client that never calls
+    // get_orchestration_policy would otherwise never see either. The line
+    // budget was NOT relaxed.
     const lines = ORCHESTRATION_INSTRUCTIONS.split("\n");
     expect(lines.length).toBeLessThan(60);
-    expect(ORCHESTRATION_INSTRUCTIONS.length).toBeLessThan(7000);
+    expect(ORCHESTRATION_INSTRUCTIONS.length).toBeLessThan(8000);
     // The served policy is genuinely larger than the hint it summarises.
     expect(JSON.stringify(ORCHESTRATION_POLICY).length).toBeGreaterThan(ORCHESTRATION_INSTRUCTIONS.length);
     expect(ORCHESTRATION_INSTRUCTIONS).toMatch(/Call get_orchestration_policy for the full versioned policy/);

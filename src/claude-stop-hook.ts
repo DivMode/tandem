@@ -1,19 +1,28 @@
 /**
  * claude-stop-hook.ts — the command entrypoint for Claude's Stop/StopFailure hook.
  *
- * Register it in a Claude settings file (`~/.claude/settings.json`, or a
- * project's `.claude/settings.json`) as a command hook on both events:
+ * DO NOT REGISTER IT BY THIS PATH, AND NOT IN THE PERSONAL SETTINGS FILE.
+ * Register the packaged `tandem-claude-stop-hook` command (see
+ * bin/tandem-claude-stop-hook.mjs) in a Tandem-owned settings file, and point
+ * `TANDEM_CLAUDE_SETTINGS_PATH` at that file so Tandem layers it onto the
+ * workers it spawns with `--settings`:
  *
  *   {
  *     "hooks": {
- *       "Stop":        [{ "hooks": [{ "type": "command", "command": "node --experimental-strip-types /path/to/tandem/src/claude-stop-hook.ts" }] }],
- *       "StopFailure": [{ "hooks": [{ "type": "command", "command": "node --experimental-strip-types /path/to/tandem/src/claude-stop-hook.ts" }] }]
+ *       "Stop":        [{ "hooks": [{ "type": "command", "command": "tandem-claude-stop-hook" }] }],
+ *       "StopFailure": [{ "hooks": [{ "type": "command", "command": "tandem-claude-stop-hook" }] }]
  *     }
  *   }
  *
- * Invoke node directly rather than through `npm run`: npm writes its own banner
- * to stdout, and promise 3 below is that this hook writes nothing there. The
- * `hook:claude-stop` package script exists for running it by hand.
+ * `~/.claude/settings.json` is the user's own file, shared by every Claude they
+ * start by hand; Tandem never reads or writes it. And this module's path is a
+ * package-private one — under Nix it lives in an immutable store output whose
+ * hash changes on every rebuild — which is why the `bin` entry exists at all.
+ * See docs/claude-completion-hook.md for the exact operator wiring.
+ *
+ * Invoke the command directly rather than through `npm run`: npm writes its own
+ * banner to stdout, and promise 3 below is that this hook writes nothing there.
+ * The `hook:claude-stop` package script exists for running it by hand.
  *
  * Claude writes the payload to this process's stdin and waits for it to exit.
  * Everything that matters lives in bridge/claude-stop-hook.ts; this file is the

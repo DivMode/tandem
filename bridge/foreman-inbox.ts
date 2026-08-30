@@ -72,6 +72,17 @@ const MAX_STORE_BYTES = 2 * 1024 * 1024
 export const MAX_TEXT_CHARS = 200
 const DEFAULT_PAGE_LIMIT = 50
 const MAX_PAGE_LIMIT = 200
+/** How many recent transitions the list_sessions preview may carry, and the
+ *  hard ceiling a caller-supplied preview size is clamped to. Deliberately
+ *  tiny: the preview is a nudge to reconcile, never the history surface. */
+export const DEFAULT_PREVIEW_EVENTS = 5
+export const MAX_PREVIEW_EVENTS = 5
+/** Total serialized budget for the preview array. A backstop against a store
+ *  written by a future version, or by hand, whose records are larger than the
+ *  clamps below would suggest. */
+const MAX_PREVIEW_BYTES = 8 * 1024
+/** The preview's own text clamp, applied on the READ path (see previewEvent). */
+export const MAX_PREVIEW_TEXT_CHARS = 160
 
 /**
  * The real lifecycle transitions. Each is a boundary a foreman would act on
@@ -276,6 +287,88 @@ export interface ForemanEventPage {
   counts: { returned: number; retained: number }
 }
 
+/**
+ * The bounded recent-transition summary carried ADDITIVELY on a list_sessions
+ * response (see bridge/router.ts's GET /sessions).
+ *
+ * WHY IT EXISTS AT ALL, given get_foreman_events already answers this better.
+ * An MCP client caches a server's tool list for the life of a conversation. A
+ * chat that was already open when this server gained `get_foreman_events` — or
+ * gains any later tool — never sees it, because nothing in the protocol makes a
+ * connected client re-read the schema, and no server can wake one to ask. That
+ * client still calls `list_sessions`, because it is one of the tools it cached.
+ * So the one place a completion can still reach a stale conversation is a field
+ * on a tool it already knows about.
+ *
+ * IT IS A PREVIEW, NOT A FEED. It carries no cursor of the caller's, cannot be
+ * paged, is capped at DEFAULT_PREVIEW_EVENTS, and is ordered NEWEST FIRST so it
+ * reads as a summary rather than as a page of history. `get_foreman_events`
+ * stays the preferred surface for anything checkpointed: it is the only one
+ * that can tell a caller it has seen everything exactly once.
+ *
+ * THE SAME TWO RULES STILL HOLD. These are HISTORY — `sessions` in the same
+ * response is the LIVENESS truth, and a `completed` here is not proof a worker
+ * exited. And the `checkpoint` is the store's position AT the newest event
+ * shown, so handing it to get_foreman_events as `since` deliberately skips
+ * everything at or before it: only do that once these have been acted on.
+ */
+export interface ForemanEventPreview {
+  version: number
+  /** Newest first, at most DEFAULT_PREVIEW_EVENTS. */
+  events: ForemanEvent[]
+  /** Opaque store position at the newest event shown (see above). */
+  checkpoint: string
+  /** Retained transitions exist that this preview did not show. */
+  older: boolean
+  counts: { shown: number; retained: number }
+  /** One line stating what this is and is not; carried in the response so a
+   *  client with a cached tool schema reads it even though the tool
+   *  description it has is older than this field. */
+  note: string
+}
+
+export const FOREMAN_PREVIEW_NOTE =
+  'Recent transitions, newest first, preview only. HISTORY, not liveness: `sessions` above is what is running now. Use get_foreman_events with your own checkpoint for complete, once-only history.'
+
+/**
+ * Re-clamp one stored event for the preview surface.
+ *
+ * Every field here was already sanitized when it was recorded, so this is
+ * defence in depth rather than the primary control — but the primary control
+ * ran in a possibly older version of this process, against a file on disk that
+ * a later version, a restore, or a hand edit could have changed. The preview
+ * rides on `list_sessions`, the one tool every stale client still calls, so it
+ * re-applies the redaction and clamps the text harder rather than trusting
+ * what it loaded.
+ */
+function previewEvent(event: ForemanEvent): ForemanEvent {
+  const clamp = (value: unknown): string | undefined => {
+    if (typeof value !== 'string' || value === '') return undefined
+    const text = sanitizeEventText(value, MAX_PREVIEW_TEXT_CHARS)
+    return text === '' ? undefined : text
+  }
+  const summary = clamp(event.summary)
+  const reason = clamp(event.reason)
+  return {
+    v: event.v,
+    id: event.id,
+    seq: event.seq,
+    ts: event.ts,
+    kind: event.kind,
+    source: event.source,
+    device: event.device,
+    localName: event.localName,
+    session: event.session,
+    ...(event.engine ? { engine: event.engine } : {}),
+    epoch: event.epoch,
+    turn: event.turn,
+    ...(event.cursor !== undefined ? { cursor: event.cursor } : {}),
+    ...(summary ? { summary } : {}),
+    ...(reason ? { reason } : {}),
+    needs_foreman_review: event.needs_foreman_review === true,
+  }
+}
+
 function isStoreFile(value: unknown): value is StoreFile {
   if (!value || typeof value !== 'object') return false
   const c = value as Record<string, unknown>
@@ -434,6 +527,52 @@ export class ForemanInbox {
    * checkpoint came from a store that no longer exists. A page cut short by
    * `limit` is `more`, never `truncated`.
    */
+  /**
+   * The newest retained transitions, newest first, for the additive
+   * list_sessions summary (see ForemanEventPreview above).
+   *
+   * READ-ONLY AND NEVER THROWING. It rides on list_sessions, which must keep
+   * working exactly as it did before this field existed; an inbox that cannot
+   * be read degrades to an empty preview, never to a failed listing.
+   */
+  preview(limit: number = DEFAULT_PREVIEW_EVENTS): ForemanEventPreview {
+    const empty = (): ForemanEventPreview => ({
+      version: FOREMAN_EVENT_VERSION,
+      events: [],
+      checkpoint: encodeCheckpoint(EMPTY_STORE_EPOCH, 0),
+      older: false,
+      counts: { shown: 0, retained: 0 },
+      note: FOREMAN_PREVIEW_NOTE,
+    })
+    try {
+      const store = this.load()
+      const retained = store.events.length
+      const highestSeq = retained > 0 ? store.events[retained - 1]!.seq : store.droppedThrough
+      const want = Math.min(Math.max(1, Math.trunc(Number.isFinite(limit) ? limit : DEFAULT_PREVIEW_EVENTS)), MAX_PREVIEW_EVENTS)
+
+      // Newest first: take from the tail, then reverse.
+      let events = store.events.slice(Math.max(0, retained - want)).reverse().map(previewEvent)
+      // Byte backstop — shed the OLDEST of the preview until it fits.
+      while (events.length > 1 && Buffer.byteLength(JSON.stringify(events), 'utf8') > MAX_PREVIEW_BYTES) {
+        events.pop()
+      }
+      if (events.length === 1 && Buffer.byteLength(JSON.stringify(events), 'utf8') > MAX_PREVIEW_BYTES) events = []
+
+      return {
+        version: FOREMAN_EVENT_VERSION,
+        events,
+        // The position AT the newest RETAINED event, which is also the newest
+        // event shown whenever anything was shown at all.
+        checkpoint: encodeCheckpoint(store.epoch, highestSeq),
+        older: retained > events.length || store.droppedThrough > 0,
+        counts: { shown: events.length, retained },
+        note: FOREMAN_PREVIEW_NOTE,
+      }
+    } catch {
+      return empty()
+    }
+  }
+
   read(opts: { since?: string; limit?: number } = {}): ForemanEventPage {
     const store = this.load()
     const limit = Math.min(Math.max(1, Math.trunc(opts.limit ?? DEFAULT_PAGE_LIMIT)), MAX_PAGE_LIMIT)

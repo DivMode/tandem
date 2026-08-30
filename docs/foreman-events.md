@@ -165,6 +165,61 @@ for the second one:
   carries `device` and the composite `device:localName` so a foreman never has
   to guess which machine a bare name referred to.
 
+### The `recent_events` preview on `list_sessions`
+
+`get_foreman_events` answers this better in every respect. It exists anyway
+because of one gap the protocol leaves open:
+
+**An MCP client caches a server's tool list for the life of a conversation.** A
+chat that was already open when this server gained `get_foreman_events` can
+never call it — nothing in the protocol makes a connected client re-read a
+schema, and, per everything above, no server can wake one to ask. That
+conversation *does* still call `list_sessions`, because it was in the schema it
+cached. So a field on that response is the only route a completion has back to
+it.
+
+`list_sessions` therefore returns `{ sessions, recent_events }`. `sessions` is
+byte-identical to what it always was; a client that ignores unknown fields sees
+no change at all. `recent_events` is:
+
+```
+{ version, events, checkpoint, older, counts: { shown, retained }, note }
+```
+
+with the same event shape the feed returns, **newest first**, capped at five.
+
+It is a preview, not the feed, and the difference is load-bearing:
+
+- **It carries no checkpoint of yours and cannot be paged.** There is no `since`
+  and no `limit`, so it can never tell a caller it has seen everything once.
+- **Its `checkpoint` is the store position AT the newest event shown.** Handing
+  it to `get_foreman_events` as `since` therefore deliberately *skips*
+  everything at or before it. Only do that once those events have been acted on.
+- **The same history-is-not-liveness rule applies**, doubly so: `sessions` in
+  the very same response is the liveness truth, and a `completed` in the preview
+  is not proof the worker exited.
+- **It is fail-soft.** A preview that cannot be produced is omitted, never
+  raised. Listing live sessions is the load-bearing half of that route and must
+  not start failing because a summary could not be read — an unreadable or
+  corrupt inbox yields an empty preview and an unchanged listing.
+
+Two boundaries are re-applied at this layer rather than trusted from the write
+path, because the preview rides on the one tool every stale conversation still
+calls: the redaction runs again on `summary` and `reason`, and the text is
+clamped harder (160 characters, against the feed's 200). Both were already
+applied when the event was recorded — but that ran in a possibly older version
+of the process, against a file on disk that a later version, a restore, or a
+hand edit could have changed since.
+
+The preview is put on the **hub's** routing identity for exactly the reason the
+feed is: a device reports under whatever `TANDEM_DEVICE_ID` it was configured
+with, which the hub has no way to verify. This holds on the local path too — a
+bare local `list_sessions` keeps bare session ids in `sessions`, while the
+preview names `local:<name>`, matching the feed rather than contradicting it.
+
+Use `get_foreman_events` with your own checkpoint for anything that must be seen
+exactly once. The preview is a nudge to go and reconcile.
+
 ### Reading a fleet
 
 `get_foreman_events` takes an optional `device`. Omitted (or `"local"`) it reads
