@@ -2,6 +2,8 @@
 import type { EngineId } from './drivable.ts'
 import { CLAUDE_DESCRIPTOR, CODEX_DESCRIPTOR, SHELL_DESCRIPTOR } from './drivable.ts'
 import type { TerminalSessionLike } from './engines/terminal-adapter.ts'
+import { FileHerdrCursorStore, type HerdrCursorStore } from './herdr-cursor-store.ts'
+import { herdrAttachPrefix } from './herdr-session.ts'
 import {
   HerdrTerminalSession,
   SocketHerdrApiClient,
@@ -83,13 +85,18 @@ export class HerdrTerminalBackend implements TerminalBackend {
   readonly kind = 'herdr' as const
   private readonly client: HerdrApiClient
   private readonly ownerIdProvider: OwnerIdProvider
+  /** One store for the process: durable read cursors survive a bridge restart
+   *  so a cold re-adoption resumes where the previous process left off. */
+  private readonly cursorStore: HerdrCursorStore
 
   constructor(
     client: HerdrApiClient = new SocketHerdrApiClient(),
     ownerIdProvider: OwnerIdProvider = makeOwnerIdProvider(),
+    cursorStore: HerdrCursorStore = new FileHerdrCursorStore(),
   ) {
     this.client = client
     this.ownerIdProvider = ownerIdProvider
+    this.cursorStore = cursorStore
   }
 
   spawn(opts: TerminalBackendSpawnOptions): Promise<TerminalSessionLike> {
@@ -98,7 +105,7 @@ export class HerdrTerminalBackend implements TerminalBackend {
       ...opts,
       engine: opts.engine,
       ownerIdProvider: this.ownerIdProvider,
-    }, this.client)
+    }, this.client, this.cursorStore)
   }
 
   attachExisting(
@@ -113,6 +120,7 @@ export class HerdrTerminalBackend implements TerminalBackend {
       allowlist,
       this.client,
       this.ownerIdProvider,
+      this.cursorStore,
     )
   }
 
@@ -144,9 +152,7 @@ class HerdrTerminalSessionFactoryHint {
   }
 
   toString(): string {
-    const binary = process.env.TANDEM_HERDR_BIN?.trim() || 'herdr'
-    const session = process.env.TANDEM_HERDR_SESSION?.trim() || 'default'
-    return `${session === 'default' ? binary : `${binary} --session ${session}`} agent attach ${this.target}`
+    return `${herdrAttachPrefix()} agent attach ${this.target}`
   }
 }
 

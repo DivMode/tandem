@@ -42,7 +42,7 @@
 
 import { homedir } from 'node:os'
 import { validateModel, validateEffort } from './terminal-session.ts'
-import type { EngineId } from './drivable.ts'
+import type { DrivableSession, EngineId } from './drivable.ts'
 import type { TerminalSessionLike } from './engines/terminal-adapter.ts'
 import {
   resolveEngine,
@@ -312,6 +312,61 @@ function wrapTerminal(engine: TerminalEngineId, terminal: TerminalSessionLike) {
       : new ShellSession(terminal)
 }
 
+/**
+ * Re-adopt a terminal-backend session that survived a bridge restart without
+ * yet being re-registered in-memory (re-validates ownership tags + cwd
+ * allowlist, same as handleOpenTerminalBackend's adoption path). Registers
+ * the adopted session so subsequent calls hit the fast already-live path.
+ * Returns undefined when nothing this installation owns answers to that
+ * name, or its cwd is no longer admissible — never for a Hermes session,
+ * which has no tmux/Herdr-backend inventory to re-adopt from.
+ */
+async function adoptLiveTerminalSession(name: string): Promise<DrivableSession | undefined> {
+  const engine = await terminalBackend.engineTagOf(name)
+  if (!engine) return undefined
+  const adoptedTerminal = await terminalBackend.attachExisting(name, engine, ALLOWLIST)
+  if (!adoptedTerminal) return undefined
+  const session = wrapTerminal(engine, adoptedTerminal)
+  registerLive(session)
+  return session
+}
+
+/**
+ * In-flight re-adoptions, keyed by session name. Two concurrent callers for
+ * the same not-yet-registered name (e.g. a racing send + read right after a
+ * bridge restart) must converge on the SAME adopted DrivableSession, not each
+ * build their own TerminalSessionLike wrapper around independently-called
+ * `attachExisting` results — two wrappers around the same underlying Herdr
+ * agent would track cursor/read state independently (see
+ * HerdrTerminalSession's emitted-output cursor), and whichever `registerLive`
+ * call landed last would silently orphan the other caller's wrapper, which
+ * then keeps driving the session through state the registry no longer
+ * references.
+ */
+const inFlightAdoptions = new Map<string, Promise<DrivableSession | undefined>>()
+
+/**
+ * getLive(), falling back to re-adoption. This is what makes a session
+ * `list_sessions` advertises as live after a bridge restart transparently
+ * drivable by send/read/interrupt too, not just open_session/close — the
+ * bridge's in-memory registry losing a session across a restart must never
+ * be visible to a caller that only ever saw it as live.
+ */
+async function getLiveOrAdopt(name: string): Promise<DrivableSession | undefined> {
+  const existing = getLive(name)
+  if (existing) return existing
+  const inFlight = inFlightAdoptions.get(name)
+  if (inFlight) return inFlight
+  const adoption = adoptLiveTerminalSession(name).finally(() => {
+    // Only clear this name's own in-flight entry — a later call may have
+    // already started a fresh adoption attempt under the same key (e.g. this
+    // one failed and a subsequent open_session re-admitted the cwd).
+    if (inFlightAdoptions.get(name) === adoption) inFlightAdoptions.delete(name)
+  })
+  inFlightAdoptions.set(name, adoption)
+  return adoption
+}
+
 /** open_session for claude/codex/shell through the selected terminal backend. */
 async function handleOpenTerminalBackend(engine: TerminalEngineId, name: string, req: RpcRequest): Promise<RpcResult> {
   // Per-session model/effort (optional, Claude only — binding Phase 2 correction
@@ -398,7 +453,7 @@ async function handleOpenTerminalBackend(engine: TerminalEngineId, name: string,
 }
 
 async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
-  const session = getLive(name)
+  const session = await getLiveOrAdopt(name)
   if (!session) return err(409, `session "${name}" is not live; call open_session first`)
   const text = String(req.body['text'] ?? '')
 
@@ -458,7 +513,7 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
  *  completion event when a previously-running turn is observed to have finished
  *  (now idle AND produced fresh output since the cursor). */
 async function readSession(name: string, cursor: number): Promise<RpcResult> {
-  const session = getLive(name)
+  const session = await getLiveOrAdopt(name)
   if (!session) {
     // Not live: nothing to stream. idle:true so a poll loop terminates cleanly.
     return ok({ text: '', cursor, idle: true, live: false })
@@ -480,7 +535,7 @@ async function handleRead(name: string, req: RpcRequest): Promise<RpcResult> {
 }
 
 async function handleInterrupt(name: string): Promise<RpcResult> {
-  const session = getLive(name)
+  const session = await getLiveOrAdopt(name)
   if (!session) return err(409, `session "${name}" is not live`)
   audit({ route: 'POST /sessions/:name/interrupt', name, engine: session.engine, cwd: session.cwd })
   await session.interrupt()
@@ -488,30 +543,25 @@ async function handleInterrupt(name: string): Promise<RpcResult> {
 }
 
 async function handleClose(name: string): Promise<RpcResult> {
-  let session = getLive(name)
+  // Not in this process's registry does NOT mean gone. A session that
+  // survived a bridge restart is exactly what open_session re-adopts through
+  // the backend, and closing it has to take the same path — otherwise the
+  // caller is told `alreadyClosed` while the terminal keeps running, which
+  // under Herdr leaves a visible workspace nobody can address any more.
+  //
+  // Measured 2026-08-29: six such workspaces had accumulated from earlier
+  // proof runs, each reported closed and each still live.
+  //
+  // getLiveOrAdopt re-validates ownership tags and the cwd allowlist on
+  // adoption, so this can only ever close a session this installation owns,
+  // and shares its result with any concurrent send/read/interrupt racing to
+  // adopt the same not-yet-registered name.
+  const session = await getLiveOrAdopt(name)
   if (!session) {
-    // Not in this process's registry does NOT mean gone. A session that
-    // survived a bridge restart is exactly what open_session re-adopts through
-    // the backend, and closing it has to take the same path — otherwise the
-    // caller is told `alreadyClosed` while the terminal keeps running, which
-    // under Herdr leaves a visible workspace nobody can address any more.
-    //
-    // Measured 2026-08-29: six such workspaces had accumulated from earlier
-    // proof runs, each reported closed and each still live.
-    //
-    // Re-adoption re-validates the ownership tags and the cwd allowlist, so
-    // this can only ever close a session this installation owns.
-    const engine = await terminalBackend.engineTagOf(name)
-    if (!engine) {
-      // Nothing this installation owns answers to that name. Idempotent.
-      return ok({ ok: true, name, alreadyClosed: true })
-    }
-    const adopted = await terminalBackend.attachExisting(name, engine, ALLOWLIST)
-    if (!adopted) {
-      // Owned, but its cwd is no longer admissible, so it is not ours to drive.
-      return ok({ ok: true, name, alreadyClosed: true })
-    }
-    session = wrapTerminal(engine, adopted)
+    // Nothing this installation owns answers to that name, or it's owned
+    // but its cwd is no longer admissible so it is not ours to drive.
+    // Idempotent either way.
+    return ok({ ok: true, name, alreadyClosed: true })
   }
   audit({ route: 'POST /sessions/:name/close', name, engine: session.engine, cwd: session.cwd })
   await session.close()

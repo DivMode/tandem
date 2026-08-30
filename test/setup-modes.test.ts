@@ -329,25 +329,85 @@ describe("device and desktop setup", () => {
     expect(readFileSync(statePath(sb, "desktop", "config.json"), "utf8")).not.toContain("TOKEN");
   });
 
-  it("writes Herdr desktop settings after verifying an existing persistent session", { timeout: 120_000 }, () => {
-    const sb = makeSandbox(null);
+  /** A Herdr whose `session list` only reports a named session once
+   *  `herdr server` has been run for it, and which records how it was run. */
+  function stubHerdr(sb: Sandbox, name: string): void {
     stubBinary(join(sb.dir, "bin"), "herdr", `#!/bin/sh
+started="${join(sb.dir, "herdr-started")}"
 if [ "$1" = "session" ] && [ "$2" = "list" ] && [ "$3" = "--json" ]; then
-  echo '{"sessions":[{"name":"default","running":true,"socket_path":"/tmp/herdr.sock"}]}'
+  if [ -f "$started" ]; then
+    echo '{"sessions":[{"name":"default","running":true,"socket_path":"/tmp/herdr.sock"},{"name":"${name}","running":true,"socket_path":"/tmp/${name}.sock"}]}'
+  else
+    echo '{"sessions":[{"name":"default","running":true,"socket_path":"/tmp/herdr.sock"}]}'
+  fi
+  exit 0
+fi
+if [ "$1" = "server" ]; then
+  printf 'session=%s config=%s sound=%s socket=%s\n' "\${HERDR_SESSION:-}" "\${HERDR_CONFIG_PATH:-}" "\${HERDR_DISABLE_SOUND:-}" "\${HERDR_SOCKET_PATH:-unset}" > "$started"
   exit 0
 fi
 exit 1
 `);
+  }
+
+  it("creates Tandem's own silent Herdr session and writes its desktop settings", { timeout: 120_000 }, () => {
+    const sb = makeSandbox(null);
+    stubHerdr(sb, "tandem");
     const result = runSetup(sb, ["desktop"], {
       TANDEM_TERMINAL_BACKEND: "herdr",
       TANDEM_HERDR_WORKSPACE_PATH: `${join(sb.dir, "bin")}:/usr/bin`,
+      // Tandem running inside somebody's Herdr pane must not hand that
+      // session's socket to the server it starts.
+      HERDR_SOCKET_PATH: "/tmp/somebody-elses.sock",
+    });
+    expect(result.status, result.out).toBe(0);
+    expect(result.out).toContain("Herdr session tandem ready at /tmp/tandem.sock");
+
+    const desktopConfig = JSON.parse(readFileSync(statePath(sb, "desktop", "config.json"), "utf8"));
+    expect(desktopConfig.TANDEM_TERMINAL_BACKEND).toBe("herdr");
+    expect(desktopConfig.TANDEM_HERDR_SESSION).toBe("tandem");
+    expect(desktopConfig.TANDEM_HERDR_BIN).toBe(join(sb.dir, "bin", "herdr"));
+    expect(desktopConfig.TANDEM_HERDR_WORKSPACE_PATH).toBe(`${join(sb.dir, "bin")}:/usr/bin`);
+
+    const started = readFileSync(join(sb.dir, "herdr-started"), "utf8");
+    const herdrConfig = statePath(sb, "herdr", "tandem.toml");
+    expect(started).toContain("session=tandem");
+    expect(started).toContain(`config=${herdrConfig}`);
+    expect(started).toContain("sound=1");
+    expect(started).toContain("socket=unset");
+
+    // The session Tandem started is silent, and the personal Herdr config was
+    // never created or touched.
+    const silent = readFileSync(herdrConfig, "utf8");
+    expect(silent).toContain('delivery = "off"');
+    expect(silent).toContain("enabled = false");
+    expect(existsSync(join(sb.home, ".config", "herdr", "config.toml"))).toBe(false);
+  });
+
+  it("uses the personal default Herdr session as-is, starting and configuring nothing", { timeout: 120_000 }, () => {
+    const sb = makeSandbox(null);
+    stubHerdr(sb, "tandem");
+    const result = runSetup(sb, ["desktop"], {
+      TANDEM_TERMINAL_BACKEND: "herdr",
+      TANDEM_HERDR_SESSION: "default",
     });
     expect(result.status, result.out).toBe(0);
     const desktopConfig = JSON.parse(readFileSync(statePath(sb, "desktop", "config.json"), "utf8"));
-    expect(desktopConfig.TANDEM_TERMINAL_BACKEND).toBe("herdr");
     expect(desktopConfig.TANDEM_HERDR_SESSION).toBe("default");
-    expect(desktopConfig.TANDEM_HERDR_BIN).toBe(join(sb.dir, "bin", "herdr"));
-    expect(desktopConfig.TANDEM_HERDR_WORKSPACE_PATH).toBe(`${join(sb.dir, "bin")}:/usr/bin`);
+    expect(existsSync(join(sb.dir, "herdr-started"))).toBe(false);
+    expect(existsSync(statePath(sb, "herdr"))).toBe(false);
+  });
+
+  it("refuses to start an unmanaged Herdr session that is not running", { timeout: 120_000 }, () => {
+    const sb = makeSandbox(null);
+    stubHerdr(sb, "tandem");
+    const result = runSetup(sb, ["desktop"], {
+      TANDEM_TERMINAL_BACKEND: "herdr",
+      TANDEM_HERDR_MANAGED_SESSION: "0",
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.out).toContain("Could not prepare the Herdr session tandem");
+    expect(existsSync(join(sb.dir, "herdr-started"))).toBe(false);
   });
 });
 
