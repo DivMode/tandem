@@ -149,12 +149,69 @@ describe("default model: a new Claude session opened without a model gets Opus",
     expect(spawnCalls[0]!.model).toBe("haiku");
   });
 
+  // `default` used to reach the CLI as `--model default`, which handed model
+  // choice back to host config: it silently defeated the Opus default, and on a
+  // host configured for Fable it served Fable with no consent flag involved.
+  // The alias stays accepted, but the server now resolves it itself.
+  it('resolves an explicit model "default" to opus rather than passing it to the CLI', async () => {
+    const name = uniqueName("explicit-default");
+    const res = await open({ name, model: "default" });
+    expect(res.status).toBe(200);
+    expect(spawnCalls[0]!.model).toBe("opus");
+  });
+
+  it('resolves "DEFAULT" case-insensitively too', async () => {
+    const name = uniqueName("explicit-default-upper");
+    const res = await open({ name, model: "DEFAULT" });
+    expect(res.status).toBe(200);
+    expect(spawnCalls[0]!.model).toBe("opus");
+  });
+
+  it("never emits the literal string \"default\" to the engine on any open path", async () => {
+    for (const model of [undefined, "default", "DEFAULT"]) {
+      const name = uniqueName("no-literal-default");
+      await open(model === undefined ? { name } : { name, model });
+    }
+    expect(spawnCalls.map((c) => c.model)).toEqual(["opus", "opus", "opus"]);
+  });
+
   it("still rejects an unsupported model instead of falling back to the default", async () => {
     const name = uniqueName("bad-model");
     const res = await open({ name, model: "gpt-4" });
     expect(res.status).toBe(400);
     expect(JSON.stringify(res.body)).toMatch(/unsupported model/);
     expect(spawnCalls).toHaveLength(0);
+  });
+
+  it('applies an explicit per-turn model "default" as opus', async () => {
+    const name = uniqueName("turn-default");
+    const sent: Array<{ model?: string; effort?: string }> = [];
+    seedLiveClaude(name, sent);
+    const res = await routeForTest("POST", `/sessions/${name}/send`, { text: "go", model: "default" });
+    expect(res.status).toBe(200);
+    expect(sent).toEqual([{ model: "opus", effort: undefined }]);
+  });
+
+  it("keeps full explicit model ids passing through untouched", async () => {
+    const name = uniqueName("full-id-passthrough");
+    const sent: Array<{ model?: string; effort?: string }> = [];
+    seedLiveClaude(name, sent);
+    const res = await routeForTest("POST", `/sessions/${name}/send`, { text: "go", model: "claude-opus-4-8[1m]" });
+    expect(res.status).toBe(200);
+    expect(sent).toEqual([{ model: "claude-opus-4-8[1m]", effort: undefined }]);
+  });
+
+  it("leaves sonnet and haiku unchanged on both paths", async () => {
+    for (const model of ["sonnet", "haiku"]) {
+      const openName = uniqueName(`unchanged-open-${model}`);
+      await open({ name: openName, model });
+      const sendName = uniqueName(`unchanged-send-${model}`);
+      const sent: Array<{ model?: string; effort?: string }> = [];
+      seedLiveClaude(sendName, sent);
+      await routeForTest("POST", `/sessions/${sendName}/send`, { text: "go", model });
+      expect(sent).toEqual([{ model, effort: undefined }]);
+    }
+    expect(spawnCalls.map((c) => c.model)).toEqual(["sonnet", "haiku"]);
   });
 
   it("applies NO default to a per-turn override (an omitted per-turn model keeps the session's model)", async () => {
@@ -271,16 +328,29 @@ describe("model-policy unit behavior", () => {
     expect(isFableModel("claude-fablesomething-5")).toBe(false);
   });
 
-  it("resolveOpenModel defaults to opus and gates Fable", () => {
+  it("normalizeDefaultAlias maps only the default alias", async () => {
+    const { normalizeDefaultAlias } = await import("../bridge/model-policy.ts");
+    expect(normalizeDefaultAlias("default")).toBe("opus");
+    expect(normalizeDefaultAlias("DEFAULT")).toBe("opus");
+    expect(normalizeDefaultAlias("sonnet")).toBe("sonnet");
+    expect(normalizeDefaultAlias("claude-opus-5")).toBe("claude-opus-5");
+    expect(normalizeDefaultAlias("fable")).toBe("fable");
+  });
+
+  it("resolveOpenModel defaults to opus, resolves the default alias, and gates Fable", () => {
     expect(resolveOpenModel(undefined, false)).toBe("opus");
+    expect(resolveOpenModel("default", false)).toBe("opus");
     expect(resolveOpenModel("sonnet", false)).toBe("sonnet");
     expect(() => resolveOpenModel("fable", false)).toThrow(FableConsentRequiredError);
     expect(resolveOpenModel("fable", true)).toBe("fable");
   });
 
-  it("resolveTurnModel supplies no default and gates Fable", () => {
+  it("resolveTurnModel supplies no default, distinguishes omitted from explicit default, and gates Fable", () => {
+    // Omitted stays undefined (keep the session's model); explicit `default`
+    // is a real request to switch, and resolves like anywhere else.
     expect(resolveTurnModel(undefined, false)).toBeUndefined();
     expect(resolveTurnModel(undefined, true)).toBeUndefined();
+    expect(resolveTurnModel("default", false)).toBe("opus");
     expect(() => resolveTurnModel(FABLE_FULL_MODEL_ID, false)).toThrow(FableConsentRequiredError);
     expect(resolveTurnModel(FABLE_FULL_MODEL_ID, true)).toBe(FABLE_FULL_MODEL_ID);
   });

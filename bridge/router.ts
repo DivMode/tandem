@@ -42,7 +42,7 @@
 
 import { homedir } from 'node:os'
 import { validateEffort } from './terminal-session.ts'
-import { readFableConsent, resolveOpenModel, resolveTurnModel } from './model-policy.ts'
+import { FABLE_CONSENT_FIELD, readFableConsent, resolveOpenModel, resolveTurnModel } from './model-policy.ts'
 import type { DrivableSession, EngineId } from './drivable.ts'
 import type { TerminalSessionLike } from './engines/terminal-adapter.ts'
 import {
@@ -255,6 +255,9 @@ async function handleOpenHermes(name: string, req: RpcRequest): Promise<RpcResul
   if (req.body['cwd'] !== undefined) return err(400, 'cwd is not supported for engine "hermes"')
   if (req.body['model'] !== undefined) return err(400, 'model is not supported for engine "hermes"')
   if (req.body['effort'] !== undefined) return err(400, 'effort is not supported for engine "hermes"')
+  if (req.body[FABLE_CONSENT_FIELD] !== undefined) {
+    return err(400, `${FABLE_CONSENT_FIELD} is not supported for engine "hermes"`)
+  }
 
   const existing = getLive(name)
   if (existing) {
@@ -381,7 +384,7 @@ async function handleOpenTerminalBackend(engine: TerminalEngineId, name: string,
       // and enforces the explicit-user-only Fable gate — both BEFORE any cwd
       // resolution, backend lookup, or spawn (see bridge/model-policy.ts).
       const rawModel = req.body['model'] !== undefined ? String(req.body['model']) : undefined
-      model = resolveOpenModel(rawModel, readFableConsent(req.body['user_requested_fable']))
+      model = resolveOpenModel(rawModel, readFableConsent(req.body[FABLE_CONSENT_FIELD]))
       if (req.body['effort'] !== undefined) effort = validateEffort(String(req.body['effort']))
     } catch (e) {
       return err(400, e instanceof Error ? e.message : String(e))
@@ -389,6 +392,12 @@ async function handleOpenTerminalBackend(engine: TerminalEngineId, name: string,
   } else {
     if (req.body['model'] !== undefined) return err(400, `model is not supported for engine "${engine}"`)
     if (req.body['effort'] !== undefined) return err(400, `effort is not supported for engine "${engine}"`)
+    // The consent field only ever qualifies a Claude model. Accepting it
+    // silently for an engine that has no model would be exactly the silent
+    // option loss the rest of this handler refuses (Phase 2 correction C).
+    if (req.body[FABLE_CONSENT_FIELD] !== undefined) {
+      return err(400, `${FABLE_CONSENT_FIELD} is not supported for engine "${engine}"`)
+    }
   }
 
   // Idempotent: reuse a session already live under this name (engine already
@@ -460,12 +469,34 @@ async function handleOpenTerminalBackend(engine: TerminalEngineId, name: string,
 async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
   const session = await getLiveOrAdopt(name)
   if (!session) return err(409, `session "${name}" is not live; call open_session first`)
+
+  // The consent field is validated HERE — before poll mode, and independently
+  // of whether model/effort were supplied — so its contract does not depend on
+  // which other fields happen to be present. A caller that sends the STRING
+  // "true" is told plainly rather than having a malformed consent claim quietly
+  // ignored on one shape of call and rejected on another. Like model/effort, it
+  // is Claude-only: it qualifies a Claude model, so an engine that has no model
+  // rejects it instead of silently accepting it.
+  if (req.body[FABLE_CONSENT_FIELD] !== undefined) {
+    if (session.engine !== 'claude') {
+      return err(400, `${FABLE_CONSENT_FIELD} is a Claude-only option; not supported for engine "${session.engine}"`)
+    }
+    try {
+      readFableConsent(req.body[FABLE_CONSENT_FIELD])
+    } catch (e) {
+      return err(400, e instanceof Error ? e.message : String(e))
+    }
+  }
+
   const text = String(req.body['text'] ?? '')
 
   // POLL MODE: empty text means "don't send a new instruction, just fetch new
   // output since the cursor". This folds the former read_session into this one
   // tool so the normal path never needs a separate poll tool. (Per-send
-  // model/effort overrides are ignored here — there is no turn to apply them to.)
+  // model/effort overrides are ignored here — there is no turn to apply them to,
+  // and a well-formed consent flag is likewise inert: no model is selected on a
+  // poll, so there is nothing for it to gate. Its FORM was already checked
+  // above, so a malformed claim never passes silently on this path either.)
   if (!text) {
     const cursor = req.body['cursor'] !== undefined ? Number(req.body['cursor']) : 0
     return readSession(name, cursor)
@@ -485,7 +516,7 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
       // session's own), but the Fable gate applies identically here — otherwise
       // the guard on open_session could simply be stepped around one turn later.
       const rawModel = req.body['model'] !== undefined ? String(req.body['model']) : undefined
-      model = resolveTurnModel(rawModel, readFableConsent(req.body['user_requested_fable']))
+      model = resolveTurnModel(rawModel, readFableConsent(req.body[FABLE_CONSENT_FIELD]))
       if (req.body['effort'] !== undefined) effort = validateEffort(String(req.body['effort']))
     } catch (e) {
       return err(400, e instanceof Error ? e.message : String(e))

@@ -21,7 +21,18 @@
  *      downgraded to another model, because silently substituting a model the
  *      caller did not ask for is its own failure mode.
  *
- * Both checks run BEFORE any spawn, tmux/Herdr lookup, or network side effect
+ *   3. `default` IS NOT A PASS-THROUGH. The `default` alias means "whatever the
+ *      host's `claude` CLI is configured to use" — a value this server cannot
+ *      inspect, so emitting `--model default` would hand model choice back to
+ *      host config and quietly defeat rule 1. Worse, it would be a hole in
+ *      rule 2: a host whose configured default is Fable would serve Fable for
+ *      every `default` request, with no consent flag anywhere in sight. So an
+ *      explicit `default` is normalized to DEFAULT_CLAUDE_MODEL, exactly like
+ *      an omitted one. The alias stays ACCEPTED (existing callers keep working)
+ *      but it now resolves to a model this server chose. Full explicit ids are
+ *      unaffected — they already name a model unambiguously.
+ *
+ * Every check runs BEFORE any spawn, tmux/Herdr lookup, or network side effect
  * (same ordering rule as engine resolution — see engine-registry.ts), so a
  * rejected Fable request costs nothing and leaves no session behind.
  */
@@ -73,6 +84,16 @@ export function readFableConsent(raw: unknown): boolean {
   return raw
 }
 
+/**
+ * Resolves the `default` alias to the server's own default rather than letting
+ * it reach the CLI. Case-insensitive, and a no-op for every other value: an
+ * alias like `sonnet`/`haiku` and any full `claude-*` id already names a model
+ * unambiguously and is passed through untouched.
+ */
+export function normalizeDefaultAlias(model: string): string {
+  return model.trim().toLowerCase() === 'default' ? DEFAULT_CLAUDE_MODEL : model
+}
+
 /** Throws unless a Fable model carries explicit user consent. */
 function assertFableConsent(model: string, userRequestedFable: boolean): void {
   if (!isFableModel(model) || userRequestedFable) return
@@ -90,19 +111,21 @@ function assertFableConsent(model: string, userRequestedFable: boolean): void {
  */
 export function resolveOpenModel(raw: string | undefined, userRequestedFable: boolean): string {
   if (raw === undefined) return DEFAULT_CLAUDE_MODEL
-  const model = validateModel(raw)
+  const model = normalizeDefaultAlias(validateModel(raw))
   assertFableConsent(model, userRequestedFable)
   return model
 }
 
 /**
- * Per-turn override resolution: validate and enforce the same Fable gate, but
- * supply NO default — an omitted per-turn model means "keep the session's own
- * model", not "switch this turn to Opus".
+ * Per-turn override resolution: validate, normalize `default`, and enforce the
+ * same Fable gate, but supply NO default of its own — an OMITTED per-turn model
+ * means "keep the session's own model" and stays undefined, which is a
+ * different thing from an EXPLICIT `default` (a real request to switch this
+ * turn, which resolves to DEFAULT_CLAUDE_MODEL like anywhere else).
  */
 export function resolveTurnModel(raw: string | undefined, userRequestedFable: boolean): string | undefined {
   if (raw === undefined) return undefined
-  const model = validateModel(raw)
+  const model = normalizeDefaultAlias(validateModel(raw))
   assertFableConsent(model, userRequestedFable)
   return model
 }

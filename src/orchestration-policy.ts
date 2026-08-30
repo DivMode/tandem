@@ -90,6 +90,7 @@ export const ORCHESTRATION_POLICY: OrchestrationPolicy = {
     defaultModel: DEFAULT_CLAUDE_MODEL,
     rules: [
       `New Claude sessions default to the "${DEFAULT_CLAUDE_MODEL}" alias (Opus 5). Omit model to get it; the server applies the default, so there is nothing to remember.`,
+      `The "default" alias resolves to "${DEFAULT_CLAUDE_MODEL}" as well. It does NOT mean "whatever the host's CLI is configured for" — this server never emits a model whose meaning it cannot see.`,
       "Choose sonnet deliberately for a narrow, read-only, or mechanical helper — a lookup, a summary of known output, a rote edit under an already-decided plan.",
       "haiku is for trivial or exceptional cases only; it is not a default and not a cost-saving reflex for real engineering work.",
       "When the task is real engineering — design, debugging, multi-file change, review — leave it on the default.",

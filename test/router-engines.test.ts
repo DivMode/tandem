@@ -106,6 +106,21 @@ describe("POST /sessions/open — hermes: rejects cwd/model/effort, requires con
     });
   });
 
+  // The Fable consent flag only ever qualifies a Claude model, so an engine
+  // that has no model must REJECT it rather than accept it and do nothing —
+  // the same no-silent-option-loss rule that covers model/effort above.
+  it("400s when user_requested_fable is supplied for engine=hermes", async () => {
+    await withEnv({ TANDEM_ENABLED_ENGINES: "hermes" }, async () => {
+      const res = await routeForTest("POST", "/sessions/open", {
+        name: "agent-x",
+        engine: "hermes",
+        user_requested_fable: true,
+      });
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(res.body)).toMatch(/user_requested_fable is not supported/);
+    });
+  });
+
   it("503s when hermes is enabled but TANDEM_HERMES_BASE_URL is unset", async () => {
     await withEnv({ TANDEM_ENABLED_ENGINES: "hermes", TANDEM_HERMES_BASE_URL: undefined }, async () => {
       const res = await routeForTest("POST", "/sessions/open", { name: "agent-x", engine: "hermes" });

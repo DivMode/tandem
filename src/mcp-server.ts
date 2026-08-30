@@ -49,7 +49,16 @@ import {
 } from "./orchestration-policy.ts";
 import { FABLE_CONSENT_FIELD } from "../bridge/model-policy.ts";
 
-/** Standing warning prepended to every tool description (real machine, real actions). */
+/** Standing warning prepended to the tool descriptions that DRIVE a real
+ *  session (open/send/interrupt/close/relay): real machine, real actions.
+ *
+ *  It is deliberately absent from the two read-only tools. `list_devices`
+ *  reports fleet membership and `get_orchestration_policy` returns static
+ *  text — neither opens, changes, or touches a session, and prefixing them
+ *  with a blast-radius warning would misdescribe them and dull the warning
+ *  where it actually matters. Their read-only nature is stated in their own
+ *  descriptions, and get_orchestration_policy carries machine-readable
+ *  readOnly/non-destructive annotations. */
 const BLAST_RADIUS =
   "WARNING: this controls a REAL interactive engine session on the host machine. Claude " +
   "Code in tmux is the default. codex/shell/hermes are " +
@@ -129,7 +138,7 @@ ${TOOL_GUIDANCE.openSession}`,
     {
       name: z.string().optional().describe("Short name (A-Z a-z 0-9 . _ -); auto-generated if omitted. For engine=hermes this is the writable agent id (required, must be allowlisted)."),
       cwd: z.string().optional().describe("Working dir; must be on the allowlist (default the configured cwd). Not supported for engine=hermes."),
-      model: z.string().optional().describe("Claude-only session model: alias (default|opus|sonnet|haiku|fable) or a full claude-* id. OMIT for the opus default (Opus 5). fable/claude-fable-* additionally requires user_requested_fable. Rejected (400) for any other engine."),
+      model: z.string().optional().describe("Claude-only session model: alias (default|opus|sonnet|haiku|fable) or a full claude-* id. OMIT for the opus default (Opus 5); \"default\" resolves to that same opus default, not to the host's CLI configuration. fable/claude-fable-* additionally requires user_requested_fable. Rejected (400) for any other engine."),
       effort: z.string().optional().describe("Claude-only thinking effort: low|medium|high|xhigh|max. Rejected (400) for any other engine."),
       engine: z.enum(["claude", "codex", "shell", "hermes"]).optional().describe("Engine to drive this session. Defaults to claude. codex/shell/hermes require TANDEM_ENABLED_ENGINES opt-in."),
       device: z.string().optional().describe(deviceParamDescription),
@@ -169,7 +178,7 @@ ${TOOL_GUIDANCE.sendToSession}`,
       name: z.string().describe("A bare local name (always local), or a fleet-routed \"<deviceId>:<localName>\" name returned by open_session/list_sessions."),
       text: z.string().optional().describe("Instruction OR a slash command (verbatim). Omit/empty = poll mode (read new output only)."),
       cursor: z.number().int().nonnegative().optional().describe("Poll mode: byte cursor from a previous result; returns only newer output."),
-      model: z.string().optional().describe("Claude-only: override model for this turn (default|opus|sonnet|haiku|fable or a full claude-* id). Omitted keeps the session's own model. fable/claude-fable-* additionally requires user_requested_fable. Rejected (400) for any other engine."),
+      model: z.string().optional().describe("Claude-only: override model for this turn (default|opus|sonnet|haiku|fable or a full claude-* id). Omitted keeps the session's own model; an explicit \"default\" switches this turn to the opus default. fable/claude-fable-* additionally requires user_requested_fable. Rejected (400) for any other engine."),
       effort: z.string().optional().describe("Claude-only: override thinking effort for this turn (low|medium|high|xhigh|max). Rejected (400) for any other engine."),
       device: z.string().optional().describe(deviceParamDescription),
       user_requested_fable: z.boolean().optional().describe(TOOL_GUIDANCE.fableParam),
