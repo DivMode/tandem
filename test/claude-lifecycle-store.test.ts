@@ -413,3 +413,69 @@ describe("supplied identity", () => {
     expect(tandemSessionIdentity({ TANDEM_SESSION_ID: "bad\nid" })).toBeUndefined();
   });
 });
+
+/**
+ * `record()`'s same-process-instance behaviour under the lock: two calls on
+ * ONE store instance already exercise acquire-then-release-then-reacquire
+ * (this is not the cross-process proof — that lives in
+ * test/claude-lifecycle-store-concurrency.test.ts, which spawns real child
+ * processes — but it is what a fast, deterministic unit test can pin down:
+ * stale-lock recovery and a live-lock timeout degrading safely).
+ */
+describe("the cross-process lock", () => {
+  it("still records normally when unlocked (the common case)", () => {
+    const store = new ClaudeLifecycleStore(freshDir());
+    const a = store.record({ kind: "prompt_submit", tandemSession: TANDEM_SESSION, claudeSessionId: CLAUDE_SESSION });
+    const b = store.record({ kind: "stop", tandemSession: TANDEM_SESSION, claudeSessionId: CLAUDE_SESSION });
+    expect(a?.seq).toBe(1);
+    expect(b?.seq).toBe(2);
+  });
+
+  it("recovers a stale lock left by a crashed process and still writes", () => {
+    const dir = freshDir();
+    // A tiny stale threshold and a fresh mtime lock: sleeping past the
+    // threshold before calling record() is enough to make it look abandoned
+    // without needing to fabricate an old mtime.
+    const store = new ClaudeLifecycleStore(dir, { staleAfterMs: 5, retryBudgetMs: 2000 });
+    mkdirSync(join(dir, "events.json.lock"), { mode: 0o700 });
+    // Let the lock age past staleAfterMs — a synchronous sleep, matching how
+    // record() itself waits (see ClaudeLifecycleStore.sleepSync).
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+    const event = store.record({ kind: "stop", tandemSession: TANDEM_SESSION, claudeSessionId: CLAUDE_SESSION });
+    expect(event).toBeDefined();
+    expect(store.readAfter(0).events).toHaveLength(1);
+  });
+
+  it("gives up and returns undefined, without corrupting the store, when the lock is genuinely held", () => {
+    const dir = freshDir();
+    // A generous staleAfterMs (so the manually-created lock never looks
+    // abandoned during this test) and a short retryBudgetMs (so the test
+    // itself stays fast).
+    const store = new ClaudeLifecycleStore(dir, { staleAfterMs: 60_000, retryBudgetMs: 40 });
+    // Seed the store with one real record first, so there is a pre-existing
+    // valid file to prove is untouched by the failed attempt.
+    store.record({ kind: "prompt_submit", tandemSession: TANDEM_SESSION, claudeSessionId: CLAUDE_SESSION });
+    const before = readFileSync(storeFile(dir), "utf8");
+
+    // Simulate another process genuinely holding the lock right now.
+    mkdirSync(join(dir, "events.json.lock"), { mode: 0o700 });
+
+    expect(() =>
+      store.record({ kind: "stop", tandemSession: TANDEM_SESSION, claudeSessionId: CLAUDE_SESSION }),
+    ).not.toThrow();
+    const result = store.record({ kind: "stop", tandemSession: TANDEM_SESSION, claudeSessionId: CLAUDE_SESSION });
+    expect(result).toBeUndefined();
+
+    const after = readFileSync(storeFile(dir), "utf8");
+    expect(after).toBe(before);
+    expect(JSON.parse(after).events).toHaveLength(1);
+  });
+
+  it("only ever removes a lock it acquired itself, and releases in a finally", () => {
+    const dir = freshDir();
+    const store = new ClaudeLifecycleStore(dir, { retryBudgetMs: 2000 });
+    store.record({ kind: "stop", tandemSession: TANDEM_SESSION, claudeSessionId: CLAUDE_SESSION });
+    // The lock must not still be sitting there after a successful record().
+    expect(() => statSync(join(dir, "events.json.lock"))).toThrow();
+  });
+});

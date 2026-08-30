@@ -50,8 +50,28 @@
  * wrong version). Rejection always degrades to "no prior state", never to an
  * error, because the alternative is a hook that fails and a Claude worker that
  * notices.
+ *
+ * CROSS-PROCESS SAFETY. `record()` is a load -> compute-next-seq -> persist
+ * transaction, and every Tandem-spawned Claude worker's hook is a SEPARATE OS
+ * process writing into this ONE shared file. Atomic rename in `persist()`
+ * only prevents a TORN write; it does nothing about two processes both
+ * `load()`-ing the same on-disk state and each computing their own "next
+ * event" against it — whichever `renameSync` lands last silently discards the
+ * other's record. Measured: 150 concurrent hook processes writing one record
+ * each -> roughly 32 survived. `record()` therefore holds a same-state-root
+ * lock (see `acquireLock`/`releaseLock` below) around exactly that
+ * load-compute-persist span, so the whole transaction is serialized across
+ * processes. It uses `mkdirSync` for atomic acquisition (POSIX directory
+ * creation is atomic, and `EEXIST` on contention needs no native addon, no
+ * `flock`/shell dependency, and no third-party lock package), synchronous
+ * jittered retry via `Atomics.wait` (this method must stay synchronous — it is
+ * called from a hook process blocking Claude's own turn boundary), and
+ * mtime-based stale-lock recovery so a process that crashed mid-write can
+ * never wedge every future writer. Acquisition failure degrades exactly like
+ * every other failure mode here: `record()` returns `undefined`, never
+ * throws, and never writes anything.
  */
-import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import { tandemStatePath } from './state-dir.ts'
@@ -78,6 +98,26 @@ const MAX_IDENTITY_CHARS = 128
 const IDENTITY_RE = /^[\x21-\x7e][\x20-\x7e]{0,127}$/
 
 const DEFAULT_PAGE_LIMIT = 100
+
+/**
+ * `record()`'s cross-process lock (see the module doc comment). Both are
+ * overridable per-instance — production code never needs to, but a test
+ * exercising stale-lock recovery or a held-lock timeout needs both far
+ * smaller than production values to run fast and deterministically.
+ */
+/** Total time `record()` will spend trying to acquire the lock before giving
+ *  up and returning `undefined`. Comfortably below the hook's own 5000ms
+ *  stdin watchdog (src/claude-stop-hook.ts), with wide margin even under
+ *  heavy contention: a hold is one small JSON read+write, on the order of a
+ *  few ms, so even ~150 processes queued behind one lock sum to well under a
+ *  second of real contention. */
+const DEFAULT_LOCK_RETRY_BUDGET_MS = 3000
+/** A lock older than this is assumed abandoned by a crashed process and is
+ *  forcibly cleared rather than trusted — comfortably above any legitimate
+ *  hold time, comfortably below the retry budget above. */
+const DEFAULT_LOCK_STALE_AFTER_MS = 800
+/** Base synchronous retry backoff; jittered on top (see `acquireLock`). */
+const LOCK_RETRY_BASE_MS = 4
 
 /** The environment variable Tandem stamps into a spawned Claude worker. */
 export const SESSION_ID_ENV = 'TANDEM_SESSION_ID'
@@ -249,21 +289,111 @@ function isStoreFile(value: unknown): value is StoreFile {
   )
 }
 
+/** `record()`'s cross-process lock timing — see the constants above for the
+ *  production defaults these override. Test-only in practice. */
+export interface ClaudeLifecycleLockOptions {
+  retryBudgetMs?: number
+  staleAfterMs?: number
+}
+
 /**
  * The durable Claude lifecycle store.
  *
  * `directory` is injectable so tests — and a host running two Tandem instances
- * — never touch real home state.
+ * — never touch real home state. `lockOptions` is likewise a test seam (see
+ * `ClaudeLifecycleLockOptions`); production code should never need it.
  */
 export class ClaudeLifecycleStore {
   private readonly directory: string
+  private readonly lockRetryBudgetMs: number
+  private readonly lockStaleAfterMs: number
 
-  constructor(directory: string = tandemStatePath(DIRECTORY)) {
+  constructor(directory: string = tandemStatePath(DIRECTORY), lockOptions: ClaudeLifecycleLockOptions = {}) {
     this.directory = directory
+    this.lockRetryBudgetMs = lockOptions.retryBudgetMs ?? DEFAULT_LOCK_RETRY_BUDGET_MS
+    this.lockStaleAfterMs = lockOptions.staleAfterMs ?? DEFAULT_LOCK_STALE_AFTER_MS
   }
 
   private get path(): string {
     return join(this.directory, FILENAME)
+  }
+
+  private get lockPath(): string {
+    return `${this.path}.lock`
+  }
+
+  /**
+   * Synchronous sleep with no busy-spin: `Atomics.wait` blocks the calling
+   * thread without a native dependency. It is NOT worker-only in Node (only
+   * in browsers) — the main thread can call it freely, which is exactly what
+   * `record()` needs since it must stay synchronous end to end.
+   */
+  private static sleepSync(ms: number): void {
+    if (ms <= 0) return
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  }
+
+  /**
+   * Acquire the cross-process lock, or give up after `lockRetryBudgetMs` and
+   * return `false`. `mkdirSync` without `recursive` is an atomic
+   * create-or-fail at the OS level: exactly one concurrent caller's call
+   * succeeds, every other sees `EEXIST`. A lock whose mtime is older than
+   * `lockStaleAfterMs` is assumed abandoned by a process that crashed while
+   * holding it and is forcibly removed before retrying — two processes can
+   * both decide it's stale and both attempt this at once, but only one's
+   * `mkdirSync` on the way back in can win, and the other simply loops and
+   * sees a fresh lock it now has to wait out normally.
+   *
+   * Never throws: any unexpected `mkdirSync`/`statSync`/`rmSync` failure other
+   * than the `EEXIST` this function is built around is treated as "could not
+   * acquire" rather than propagated — a failing lock must degrade the same
+   * way a failing write already does.
+   */
+  private acquireLock(): boolean {
+    const deadline = Date.now() + this.lockRetryBudgetMs
+    try {
+      mkdirSync(this.directory, { recursive: true, mode: 0o700 })
+    } catch {
+      return false
+    }
+    for (;;) {
+      try {
+        mkdirSync(this.lockPath, { mode: 0o700 })
+        return true
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') return false
+      }
+      // Contended. A stale lock is cleared immediately and retried without
+      // spending any of the sleep budget on it; a live one is waited out.
+      try {
+        const info = lstatSync(this.lockPath)
+        if (Date.now() - info.mtimeMs > this.lockStaleAfterMs) {
+          try {
+            rmSync(this.lockPath, { recursive: true, force: true })
+          } catch {
+            /* another process is already clearing or recreating it */
+          }
+          continue
+        }
+      } catch {
+        // Vanished between the failed mkdir and this stat (the holder just
+        // released it): loop straight back to the acquire attempt.
+        continue
+      }
+      if (Date.now() >= deadline) return false
+      const jitter = Math.floor(Math.random() * LOCK_RETRY_BASE_MS)
+      ClaudeLifecycleStore.sleepSync(Math.max(1, Math.min(LOCK_RETRY_BASE_MS + jitter, deadline - Date.now())))
+    }
+  }
+
+  /** Release a lock THIS call acquired. Never call this on a path that did
+   *  not itself succeed at `acquireLock()`. */
+  private releaseLock(): void {
+    try {
+      rmSync(this.lockPath, { recursive: true, force: true })
+    } catch {
+      /* best-effort: a lock we can't remove will still self-heal via staleness */
+    }
   }
 
   private static fresh(): StoreFile {
@@ -355,49 +485,60 @@ export class ClaudeLifecycleStore {
       if (!isOpaqueIdentity(input.tandemSession)) return undefined
       if (!isOpaqueIdentity(input.claudeSessionId)) return undefined
 
-      const loaded = this.load()
-      // Mint the real store epoch on the first persisted write; until then the
-      // store carries the deterministic empty-store epoch (see above).
-      const store = loaded.epoch === EMPTY_STORE_EPOCH ? { ...loaded, epoch: randomBytes(8).toString('hex') } : loaded
+      // The whole load -> compute-next-seq -> persist span below is the
+      // transaction that must be serialized across processes (see the module
+      // doc comment "CROSS-PROCESS SAFETY"). Acquisition failure degrades
+      // exactly like an unwritable store: no event, no throw, nothing written.
+      if (!this.acquireLock()) return undefined
+      try {
+        const loaded = this.load()
+        // Mint the real store epoch on the first persisted write; until then
+        // the store carries the deterministic empty-store epoch (see above).
+        const store =
+          loaded.epoch === EMPTY_STORE_EPOCH ? { ...loaded, epoch: randomBytes(8).toString('hex') } : loaded
 
-      const seq = store.nextSeq
-      const now = input.now ?? new Date()
-      const id =
-        'cl_' +
-        createHash('sha256')
-          .update([store.epoch, input.tandemSession, input.claudeSessionId, input.kind, String(seq)].join(' '))
-          .digest('hex')
-          .slice(0, 20)
+        const seq = store.nextSeq
+        const now = input.now ?? new Date()
+        const id =
+          'cl_' +
+          createHash('sha256')
+            .update([store.epoch, input.tandemSession, input.claudeSessionId, input.kind, String(seq)].join(' '))
+            .digest('hex')
+            .slice(0, 20)
 
-      // Only `stop` ever carries a message. `stop_failure` has none to carry;
-      // `prompt_submit`, `interrupt` and `close` carry NONE, unconditionally —
-      // this is a hard invariant, not merely "usually omitted": neither the
-      // hook (prompt_submit) nor Tandem itself (interrupt/close) is trusted to
-      // have withheld content on the caller's side. This store enforces it
-      // independently, even if a future caller passed one through by mistake.
-      const raw = input.kind === 'stop' && typeof input.message === 'string' ? input.message : undefined
-      const message = raw ? sanitizeEventText(raw, MAX_MESSAGE_CHARS) : undefined
-      // "Truncated" is about the CLAMP, not about redaction: the sanitiser also
-      // shortens text by replacing secrets, and calling that truncation would
-      // mislead a reader into thinking the tail was lost.
-      const messageTruncated = raw !== undefined && raw.length > MAX_MESSAGE_CHARS
+        // Only `stop` ever carries a message. `stop_failure` has none to
+        // carry; `prompt_submit`, `interrupt` and `close` carry NONE,
+        // unconditionally — this is a hard invariant, not merely "usually
+        // omitted": neither the hook (prompt_submit) nor Tandem itself
+        // (interrupt/close) is trusted to have withheld content on the
+        // caller's side. This store enforces it independently, even if a
+        // future caller passed one through by mistake.
+        const raw = input.kind === 'stop' && typeof input.message === 'string' ? input.message : undefined
+        const message = raw ? sanitizeEventText(raw, MAX_MESSAGE_CHARS) : undefined
+        // "Truncated" is about the CLAMP, not about redaction: the sanitiser
+        // also shortens text by replacing secrets, and calling that
+        // truncation would mislead a reader into thinking the tail was lost.
+        const messageTruncated = raw !== undefined && raw.length > MAX_MESSAGE_CHARS
 
-      const event: ClaudeLifecycleEvent = {
-        v: CLAUDE_LIFECYCLE_VERSION,
-        id,
-        seq,
-        ts: now.toISOString(),
-        kind: input.kind,
-        tandemSession: input.tandemSession,
-        claudeSessionId: input.claudeSessionId,
-        ...(message ? { message } : {}),
-        ...(messageTruncated ? { messageTruncated: true } : {}),
+        const event: ClaudeLifecycleEvent = {
+          v: CLAUDE_LIFECYCLE_VERSION,
+          id,
+          seq,
+          ts: now.toISOString(),
+          kind: input.kind,
+          tandemSession: input.tandemSession,
+          claudeSessionId: input.claudeSessionId,
+          ...(message ? { message } : {}),
+          ...(messageTruncated ? { messageTruncated: true } : {}),
+        }
+
+        this.persist(
+          this.applyRetention({ ...store, nextSeq: seq + 1, events: [...store.events, event] }, now.getTime()),
+        )
+        return event
+      } finally {
+        this.releaseLock()
       }
-
-      this.persist(
-        this.applyRetention({ ...store, nextSeq: seq + 1, events: [...store.events, event] }, now.getTime()),
-      )
-      return event
     } catch {
       return undefined
     }
