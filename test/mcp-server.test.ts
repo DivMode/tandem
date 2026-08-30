@@ -15,10 +15,13 @@ const EXPECTED_TOOLS = [
   // Phase 3: list_devices is always registered (returns an empty device list
   // when no fleet runtime is supplied — see test/fleet/mcp-schema.test.ts).
   "list_devices",
+  // Orchestration bootstrap: read-only policy tool (see
+  // test/orchestration-policy.test.ts for its annotations and content).
+  "get_orchestration_policy",
 ];
 
 describe("buildMcpServer (shared tool surface)", () => {
-  it("registers exactly the 7 tools (6 consolidated + Phase 3 list_devices)", async () => {
+  it("registers exactly the 8 tools (6 consolidated + list_devices + get_orchestration_policy)", async () => {
     const server = buildMcpServer();
     const client = new Client({ name: "test", version: "0.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

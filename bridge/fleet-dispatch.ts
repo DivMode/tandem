@@ -161,6 +161,9 @@ export interface OpenSessionRequest {
   cwd?: string
   model?: string
   effort?: string
+  /** Explicit user consent for a Fable model; forwarded unchanged so the
+   *  executing device's router enforces the gate (bridge/model-policy.ts). */
+  user_requested_fable?: boolean
   device?: string
 }
 
@@ -190,13 +193,20 @@ export async function dispatchOpenSession(runtime: FleetRuntime, req: OpenSessio
   const key = `${deviceId ?? 'local'}:${localName ?? '*'}`
   const result = await maybeScheduled(runtime, 'open_session', key, async () => {
     if (deviceId === undefined) {
-      return executeLocalOp('open_session', { name: localName, engine, cwd: req.cwd, model: req.model, effort: req.effort })
+      return executeLocalOp('open_session', {
+        name: localName,
+        engine,
+        cwd: req.cwd,
+        model: req.model,
+        effort: req.effort,
+        user_requested_fable: req.user_requested_fable,
+      })
     }
     try {
       return await runtime.broker.sendRequest(
         deviceId,
         'open_session',
-        { name: localName, engine, cwd: req.cwd, model: req.model, effort: req.effort },
+        { name: localName, engine, cwd: req.cwd, model: req.model, effort: req.effort, user_requested_fable: req.user_requested_fable },
         { timeoutMs: OPEN_SESSION_TIMEOUT_MS },
       )
     } catch (e) {

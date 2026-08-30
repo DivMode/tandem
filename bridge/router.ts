@@ -41,7 +41,8 @@
  */
 
 import { homedir } from 'node:os'
-import { validateModel, validateEffort } from './terminal-session.ts'
+import { validateEffort } from './terminal-session.ts'
+import { readFableConsent, resolveOpenModel, resolveTurnModel } from './model-policy.ts'
 import type { DrivableSession, EngineId } from './drivable.ts'
 import type { TerminalSessionLike } from './engines/terminal-adapter.ts'
 import {
@@ -376,7 +377,11 @@ async function handleOpenTerminalBackend(engine: TerminalEngineId, name: string,
   let effort: string | undefined
   if (engine === 'claude') {
     try {
-      if (req.body['model'] !== undefined) model = validateModel(String(req.body['model']))
+      // resolveOpenModel also supplies the Opus default for an omitted model
+      // and enforces the explicit-user-only Fable gate — both BEFORE any cwd
+      // resolution, backend lookup, or spawn (see bridge/model-policy.ts).
+      const rawModel = req.body['model'] !== undefined ? String(req.body['model']) : undefined
+      model = resolveOpenModel(rawModel, readFableConsent(req.body['user_requested_fable']))
       if (req.body['effort'] !== undefined) effort = validateEffort(String(req.body['effort']))
     } catch (e) {
       return err(400, e instanceof Error ? e.message : String(e))
@@ -476,7 +481,11 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
       return err(400, `model/effort are Claude-only options; not supported for engine "${session.engine}"`)
     }
     try {
-      if (req.body['model'] !== undefined) model = validateModel(String(req.body['model']))
+      // A per-turn override carries NO Opus default (an omitted model keeps the
+      // session's own), but the Fable gate applies identically here — otherwise
+      // the guard on open_session could simply be stepped around one turn later.
+      const rawModel = req.body['model'] !== undefined ? String(req.body['model']) : undefined
+      model = resolveTurnModel(rawModel, readFableConsent(req.body['user_requested_fable']))
       if (req.body['effort'] !== undefined) effort = validateEffort(String(req.body['effort']))
     } catch (e) {
       return err(400, e instanceof Error ? e.message : String(e))

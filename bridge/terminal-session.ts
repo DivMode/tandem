@@ -123,8 +123,13 @@ export function warnLegacySkipPermissionsIfSet(): void {
 export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 export type EffortLevel = (typeof EFFORT_LEVELS)[number]
 
-/** Accepted model ALIASES; a full model id (claude-*) is also accepted as-is. Claude only. */
-export const MODEL_ALIASES = ['default', 'opus', 'sonnet', 'haiku'] as const
+/** Accepted model ALIASES; a full model id (claude-*) is also accepted as-is. Claude only.
+ *  `fable` is accepted here as a VALID alias, but it is additionally GATED:
+ *  bridge/model-policy.ts requires explicit user consent before the router will
+ *  pass it to an engine. Validation and admission are deliberately separate —
+ *  this function answers "is this a model id we understand", not "is this
+ *  caller allowed to ask for it". */
+export const MODEL_ALIASES = ['default', 'opus', 'sonnet', 'haiku', 'fable'] as const
 
 /** Validate/normalize a model value; throws a CLEAR error if unsupported (never
  *  silently ignored). Accepts an alias or a full `claude-*` id (incl. `[1m]`). */

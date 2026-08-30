@@ -15,10 +15,20 @@
  * TANDEM_* env vars to the engine's CCM_* names BEFORE importing this module
  * (both entrypoints use a dynamic `await import(...)` after env setup).
  *
- * The tool surface contains seven tools. read_session is folded into
+ * The tool surface contains eight tools. read_session is folded into
  * send_to_session (empty text = poll mode); the four relay tools are folded into
  * one `relay` tool with an `action`. The underlying routes are unchanged, so the
  * full capability set remains reachable.
+ *
+ * ORCHESTRATION POLICY: the server also advertises how it expects to be driven,
+ * from ONE canonical source (./orchestration-policy.ts) reaching clients three
+ * ways — the MCP `initialize` result's `instructions` (a client-consumption
+ * HINT: a client MAY use it or ignore it), concise per-tool snippets in the
+ * descriptions below, and the full versioned document from the read-only
+ * `get_orchestration_policy` tool. The rules that must actually hold — the
+ * Opus default and the explicit-user-only Fable gate — are enforced in the
+ * router (bridge/model-policy.ts) and fail closed whether or not a client ever
+ * read any of that text.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -31,6 +41,13 @@ import {
 } from "../bridge/fleet-dispatch.ts";
 import { createFleetRuntime, type FleetRuntime } from "../bridge/fleet-runtime.ts";
 import { ICON_MIME, ICON_DATA_URI } from "./icon.ts";
+import {
+  ORCHESTRATION_INSTRUCTIONS,
+  ORCHESTRATION_POLICY,
+  ORCHESTRATION_POLICY_VERSION,
+  TOOL_GUIDANCE,
+} from "./orchestration-policy.ts";
+import { FABLE_CONSENT_FIELD } from "../bridge/model-policy.ts";
 
 /** Standing warning prepended to every tool description (real machine, real actions). */
 const BLAST_RADIUS =
@@ -40,6 +57,12 @@ const BLAST_RADIUS =
   "if enabled, is arbitrary OS-user command execution starting in the allowlisted cwd, " +
   "not a sandbox. May read, edit, or delete files and run shell commands in the chosen " +
   "working directory. Treat every call as a real action.";
+
+/** Compile-time pin: the literal `user_requested_fable` keys in the tool
+ *  schemas below MUST stay identical to the constant the router reads out of
+ *  the request body. If either side is renamed, this stops compiling instead
+ *  of silently turning the Fable gate into an always-denied field. */
+const FABLE_CONSENT_FIELD_NAME: "user_requested_fable" = FABLE_CONSENT_FIELD;
 
 const q = (params: Record<string, string | number | undefined>) => {
   const usp = new URLSearchParams();
@@ -82,11 +105,16 @@ export function buildMcpServer(fleet?: FleetRuntime): McpServer {
   // agent mark next to the connector and its tools. The HTTP transport's
   // /favicon.ico + /icon.png routes cover clients that instead fetch the
   // origin's favicon.
-  const server = new McpServer({
-    name: "tandem",
-    version: "0.1.0",
-    icons: [{ src: ICON_DATA_URI, mimeType: ICON_MIME, sizes: ["640x640"] }],
-  });
+  const server = new McpServer(
+    {
+      name: "tandem",
+      version: "0.1.0",
+      icons: [{ src: ICON_DATA_URI, mimeType: ICON_MIME, sizes: ["640x640"] }],
+    },
+    // Server-level guidance returned in the `initialize` result. This is the
+    // SDK's supported ServerOptions field, not a custom protocol extension.
+    { instructions: ORCHESTRATION_INSTRUCTIONS },
+  );
 
   /* ---- sessions ---- */
 
@@ -95,23 +123,33 @@ export function buildMcpServer(fleet?: FleetRuntime): McpServer {
 
   server.tool(
     "open_session",
-    `${BLAST_RADIUS}\n\nOpen or attach to a visible interactive session. Supported engine ids are claude, codex, shell, and hermes. Claude is enabled by default; every other engine needs host opt-in and must be available. Claude and Codex use the host's configured native terminal backend (tmux or Herdr) and require an admitted start cwd. Shell is tmux-only. Hermes attaches only to an explicitly allowlisted writable agent id through a loopback gateway and does not accept cwd.\n\nClaude permission bypass is off by default. model and effort are also Claude-only. Unknown, disabled, unavailable, or incompatible options fail before spawn or gateway contact. A remote open returns a stable global name in the form "<deviceId>:<localName>". Preserve that exact name for later calls so routing cannot drift.`,
+    `${BLAST_RADIUS}\n\nOpen or attach to a visible interactive session. Supported engine ids are claude, codex, shell, and hermes. Claude is enabled by default; every other engine needs host opt-in and must be available. Claude and Codex use the host's configured native terminal backend (tmux or Herdr) and require an admitted start cwd. Shell is tmux-only. Hermes attaches only to an explicitly allowlisted writable agent id through a loopback gateway and does not accept cwd.\n\nClaude permission bypass is off by default. model and effort are also Claude-only. Unknown, disabled, unavailable, or incompatible options fail before spawn or gateway contact. A remote open returns a stable global name in the form "<deviceId>:<localName>". Preserve that exact name for later calls so routing cannot drift.
+
+${TOOL_GUIDANCE.openSession}`,
     {
       name: z.string().optional().describe("Short name (A-Z a-z 0-9 . _ -); auto-generated if omitted. For engine=hermes this is the writable agent id (required, must be allowlisted)."),
       cwd: z.string().optional().describe("Working dir; must be on the allowlist (default the configured cwd). Not supported for engine=hermes."),
-      model: z.string().optional().describe("Claude-only session model: alias (default|opus|sonnet|haiku) or a full claude-* id. Rejected (400) for any other engine."),
+      model: z.string().optional().describe("Claude-only session model: alias (default|opus|sonnet|haiku|fable) or a full claude-* id. OMIT for the opus default (Opus 5). fable/claude-fable-* additionally requires user_requested_fable. Rejected (400) for any other engine."),
       effort: z.string().optional().describe("Claude-only thinking effort: low|medium|high|xhigh|max. Rejected (400) for any other engine."),
       engine: z.enum(["claude", "codex", "shell", "hermes"]).optional().describe("Engine to drive this session. Defaults to claude. codex/shell/hermes require TANDEM_ENABLED_ENGINES opt-in."),
       device: z.string().optional().describe(deviceParamDescription),
+      // Literal key (not a computed one) so zod keeps the named-field inference
+      // the SDK's tool callback typing depends on. FABLE_CONSENT_FIELD_NAME
+      // below pins the literal to the canonical constant at compile time.
+      user_requested_fable: z.boolean().optional().describe(TOOL_GUIDANCE.fableParam),
     },
-    async ({ name, cwd, model, effort, engine, device }) => {
-      return wrap(await dispatchOpenSession(runtime, { name, cwd, model, effort, engine, device }));
+    async ({ name, cwd, model, effort, engine, device, user_requested_fable }) => {
+      return wrap(
+        await dispatchOpenSession(runtime, { name, cwd, model, effort, engine, device, user_requested_fable }),
+      );
     },
   );
 
   server.tool(
     "list_sessions",
-    `${BLAST_RADIUS}\n\nRead-only. List live sessions Tandem owns and can drive on the local hub or one selected device. Tandem does not scan arbitrary tmux sessions or return history. Remote ids are rewritten as stable "<deviceId>:<localName>" names and include device and localName fields.`,
+    `${BLAST_RADIUS}\n\nRead-only. List live sessions Tandem owns and can drive on the local hub or one selected device. Tandem does not scan arbitrary tmux sessions or return history. Remote ids are rewritten as stable "<deviceId>:<localName>" names and include device and localName fields.
+
+${TOOL_GUIDANCE.listSessions}`,
     {
       limit: z.number().int().positive().optional(),
       project: z.string().optional(),
@@ -124,17 +162,28 @@ export function buildMcpServer(fleet?: FleetRuntime): McpServer {
 
   server.tool(
     "send_to_session",
-    `${BLAST_RADIUS}\n\nSend one instruction to a live session and wait up to TANDEM_WAIT_MS. A bounded timeout returns status "running" and a cursor; poll again with empty text and that cursor instead of resending the instruction. Empty text reads only newer output and returns idle when the turn is done. Completion events are also written as described in README.\n\nSlash commands and shell lines are passed through verbatim and execute in the target session. Optional model and effort controls are Claude-only and are rejected for every other engine.`,
+    `${BLAST_RADIUS}\n\nSend one instruction to a live session and wait up to TANDEM_WAIT_MS. A bounded timeout returns status "running" and a cursor; poll again with empty text and that cursor instead of resending the instruction. Empty text reads only newer output and returns idle when the turn is done. Completion events are also written as described in README.\n\nSlash commands and shell lines are passed through verbatim and execute in the target session. Optional model and effort controls are Claude-only and are rejected for every other engine.
+
+${TOOL_GUIDANCE.sendToSession}`,
     {
       name: z.string().describe("A bare local name (always local), or a fleet-routed \"<deviceId>:<localName>\" name returned by open_session/list_sessions."),
       text: z.string().optional().describe("Instruction OR a slash command (verbatim). Omit/empty = poll mode (read new output only)."),
       cursor: z.number().int().nonnegative().optional().describe("Poll mode: byte cursor from a previous result; returns only newer output."),
-      model: z.string().optional().describe("Claude-only: override model for this turn (default|opus|sonnet|haiku or a full claude-* id). Rejected (400) for any other engine."),
+      model: z.string().optional().describe("Claude-only: override model for this turn (default|opus|sonnet|haiku|fable or a full claude-* id). Omitted keeps the session's own model. fable/claude-fable-* additionally requires user_requested_fable. Rejected (400) for any other engine."),
       effort: z.string().optional().describe("Claude-only: override thinking effort for this turn (low|medium|high|xhigh|max). Rejected (400) for any other engine."),
       device: z.string().optional().describe(deviceParamDescription),
+      user_requested_fable: z.boolean().optional().describe(TOOL_GUIDANCE.fableParam),
     },
-    async ({ name, text, cursor, model, effort, device }) => {
-      return wrap(await dispatchSessionOp(runtime, "send", name, device, { text: text ?? "", cursor, model, effort }));
+    async ({ name, text, cursor, model, effort, device, user_requested_fable }) => {
+      return wrap(
+        await dispatchSessionOp(runtime, "send", name, device, {
+          text: text ?? "",
+          cursor,
+          model,
+          effort,
+          user_requested_fable,
+        }),
+      );
     },
   );
 
@@ -169,6 +218,41 @@ export function buildMcpServer(fleet?: FleetRuntime): McpServer {
     async () => {
       return wrap(dispatchListDevices(runtime));
     },
+  );
+
+  /* ---- orchestration policy (read-only) ---- */
+
+  // registerTool (not the deprecated `tool` overloads) so the read-only
+  // annotations ride along: a client that filters or auto-approves by
+  // annotation can see this tool touches nothing.
+  server.registerTool(
+    "get_orchestration_policy",
+    {
+      title: "Get orchestration policy",
+      description: TOOL_GUIDANCE.policyTool,
+      inputSchema: {},
+      annotations: {
+        title: "Get orchestration policy",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async () => ({
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({
+            version: ORCHESTRATION_POLICY_VERSION,
+            policy: ORCHESTRATION_POLICY,
+            instructions: ORCHESTRATION_INSTRUCTIONS,
+            note:
+              "The same policy is offered as the MCP initialize result's `instructions`, which is a client-consumption hint (a client MAY use it). The session, polling, and model-routing rules are enforced by this server regardless of whether any client read them.",
+          }),
+        },
+      ],
+    }),
   );
 
   /* ---- relay (one tool, five actions) ---- */
