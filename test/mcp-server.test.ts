@@ -18,10 +18,13 @@ const EXPECTED_TOOLS = [
   // Orchestration bootstrap: read-only policy tool (see
   // test/orchestration-policy.test.ts for its annotations and content).
   "get_orchestration_policy",
+  // Foreman reconciliation: read-only durable event feed (see
+  // test/foreman-events.test.ts for its annotations, surface, and redaction).
+  "get_foreman_events",
 ];
 
 describe("buildMcpServer (shared tool surface)", () => {
-  it("registers exactly the 8 tools (6 consolidated + list_devices + get_orchestration_policy)", async () => {
+  it("registers exactly the 9 tools (6 consolidated + list_devices + get_orchestration_policy + get_foreman_events)", async () => {
     const server = buildMcpServer();
     const client = new Client({ name: "test", version: "0.0.0" });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();

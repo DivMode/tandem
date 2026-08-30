@@ -1,7 +1,7 @@
 /**
  * Shared MCP server builder for tandem.
  *
- * Defines the one seven-tool surface used by both transports:
+ * Defines the one nine-tool surface used by both transports:
  *   - src/public-server.ts: OAuth-protected Streamable HTTP (production)
  *   - src/http-mcp.ts: explicit legacy bearer-header migration only
  *   - src/stdio-server.ts: stdio for local desktop apps (no tunnel, no token)
@@ -15,10 +15,17 @@
  * TANDEM_* env vars to the engine's CCM_* names BEFORE importing this module
  * (both entrypoints use a dynamic `await import(...)` after env setup).
  *
- * The tool surface contains eight tools. read_session is folded into
+ * The tool surface contains nine tools. read_session is folded into
  * send_to_session (empty text = poll mode); the four relay tools are folded into
  * one `relay` tool with an `action`. The underlying routes are unchanged, so the
  * full capability set remains reachable.
+ *
+ * RECONCILIATION: `get_foreman_events` is the read-only feed a foreman uses to
+ * find out what happened while it was disconnected. It exists because nothing
+ * in MCP lets this server WAKE a dormant conversation — the installed SDK has
+ * no subscription/listen primitive and this server's HTTP transport is
+ * stateless — so the durable answer is a record the client reconciles against
+ * on its next turn. See docs/foreman-events.md.
  *
  * ORCHESTRATION POLICY: the server also advertises how it expects to be driven,
  * from ONE canonical source (./orchestration-policy.ts) reaching clients three
@@ -262,6 +269,51 @@ ${TOOL_GUIDANCE.sendToSession}`,
         },
       ],
     }),
+  );
+
+  /* ---- foreman event feed (read-only) ---- */
+
+  // registerTool (not the deprecated `tool` overloads) so the read-only
+  // annotations ride along. Deliberately WITHOUT the BLAST_RADIUS prefix: this
+  // tool reads a local record and cannot open, change, or touch a session, and
+  // prefixing it with a blast-radius warning would misdescribe it and dull the
+  // warning where it actually matters.
+  server.registerTool(
+    "get_foreman_events",
+    {
+      title: "Get foreman events",
+      description: `Read-only. Durable local record of what Tandem work actually did while you were away: turns that completed, workers that became blocked or asked a question, turns that were interrupted, sessions that closed, and sends that errored. Opens nothing, changes nothing, touches no session, and writes nothing — including no server-side "read" marker.
+
+Returns { version, events, checkpoint, more, truncated, counts }. Each event carries a stable id, an ordinal, a timestamp, its kind, the device and composite "<device>:<localName>" session name, the engine, the incarnation epoch and turn number, an optional transcript cursor, a short summary/reason, and needs_foreman_review. It never carries a working directory, a filesystem path, an attach hint, an environment, tool arguments, or a transcript; summary and reason are redacted and clamped to 200 characters.
+
+HISTORY, NOT LIVENESS: an event says a transition happened, never that a worker is or is not alive now — list_sessions is the only liveness truth. Pass the previous call's checkpoint as \`since\` to see each transition once; \`more: true\` means raise \`limit\` or call again, and \`truncated: true\` means older history was dropped or your checkpoint predates this store, so reconcile against list_sessions instead of assuming a complete record.
+
+Events are recorded only for this host. A session driven on a fleet device is recorded on THAT device.
+
+${TOOL_GUIDANCE.foremanEvents}`,
+      inputSchema: {
+        since: z
+          .string()
+          .optional()
+          .describe(
+            "Opaque checkpoint from a previous call. Omit on a first read to get the most recent page. Treat it as opaque: it is only meaningful to the host that issued it, and a checkpoint from a different store is reported as truncated rather than silently misread.",
+          ),
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Maximum events to return (default 50, capped at 200)."),
+      },
+      annotations: {
+        title: "Get foreman events",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ since, limit }) => call("GET", "/foreman/events", {}, q({ since, limit }).slice(1)),
   );
 
   /* ---- relay (one tool, five actions) ---- */

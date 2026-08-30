@@ -66,6 +66,19 @@ export interface DrivableSession {
   close(): Promise<void>
   /** Human hint for watching/joining the session live (e.g. a tmux attach command). */
   attachHint(): string
+  /**
+   * OPTIONAL. A stable, opaque identity for THIS incarnation of the session —
+   * not for the name, which is reusable by design. bridge/turn-ledger.ts uses
+   * it to notice that `review` is now a DIFFERENT agent than the `review` it
+   * saw an hour ago, so a reopened name starts a new turn epoch and cannot
+   * reuse the previous incarnation's event ids.
+   *
+   * Optional because not every backend can supply one; a session that omits it
+   * (or returns undefined) falls back to a name-derived identity, which is
+   * still stable across restarts and still de-duplicates repeated polls.
+   * Must never throw, and must never expose a path, token, or host identity.
+   */
+  agentIdentity?(): Promise<string | undefined>
 }
 
 /**

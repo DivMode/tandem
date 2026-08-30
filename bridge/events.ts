@@ -12,18 +12,37 @@
  *      (fire-and-forget; POST to {TANDEM_NTFY_SERVER}/{topic}). This pings a
  *      DEVICE (your phone), not the chat client — see the README ntfy note.
  *
- * The MCP connection itself cannot reliably carry a server-initiated wake-up in
- * the current stateless Streamable-HTTP setup — see the README "Completion
- * events / waking the client" section for what a client would need to do.
+ *   4. Record the same transition in the FOREMAN INBOX
+ *      (./foreman-inbox.ts), the bounded, checkpointed store a returning
+ *      foreman reads through the get_foreman_events MCP tool. Sink 1 stays the
+ *      raw local notification log; sink 4 is the redacted, queryable, bounded
+ *      projection of it. Both are written from here so there is exactly one
+ *      emit path and the two can never disagree about what happened.
+ *
+ * The MCP connection itself cannot carry a server-initiated wake-up: the
+ * installed SDK has no subscription/listen primitive and Tandem's HTTP
+ * transport is stateless, so nothing here can resume a dormant conversation in
+ * any client. See docs/foreman-events.md for the protocol evidence and the
+ * adapter seam a future client-side capability would plug into.
+ *
+ * THIS MODULE DOES NOT DECIDE THAT A TURN FINISHED. Callers pass a turn
+ * coordinate obtained from ./turn-ledger.ts, which claims each turn's
+ * completion exactly once, durably. That is what stops a repeated poll from
+ * manufacturing a second completion for one turn — in every sink at once.
  */
 import { appendFileSync, chmodSync, mkdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { audit } from './audit.ts'
+import { defaultForemanInbox, type ForemanEventKind } from './foreman-inbox.ts'
+import { tandemStateDir } from './state-dir.ts'
 
-const EVENTS_DIR = join(homedir(), '.tandem')
-const EVENTS_LOG = join(EVENTS_DIR, 'events.log')
+/** Resolved per write, not at module load: a test (or a host running two
+ *  instances) can point TANDEM_STATE_DIR somewhere else without having to
+ *  control this module's import order. */
+export function eventsLogPath(): string {
+  return join(tandemStateDir(), 'events.log')
+}
 /** Append a metadata-only bridge record using the central redaction policy. */
 function logBridge(fields: Record<string, unknown>): void {
   audit(fields)
@@ -31,10 +50,54 @@ function logBridge(fields: Record<string, unknown>): void {
 
 /** Append private event content without inheriting a permissive process umask. */
 function appendEventLine(line: string): void {
-  mkdirSync(EVENTS_DIR, { recursive: true, mode: 0o700 })
-  chmodSync(EVENTS_DIR, 0o700)
-  appendFileSync(EVENTS_LOG, line, { encoding: 'utf8', mode: 0o600 })
-  chmodSync(EVENTS_LOG, 0o600)
+  const directory = tandemStateDir()
+  const log = eventsLogPath()
+  mkdirSync(directory, { recursive: true, mode: 0o700 })
+  chmodSync(directory, 0o700)
+  appendFileSync(log, line, { encoding: 'utf8', mode: 0o600 })
+  chmodSync(log, 0o600)
+}
+
+/**
+ * The coordinate of the turn (or session incarnation) this event belongs to,
+ * obtained from ./turn-ledger.ts. It is what makes an event id stable across
+ * repeated polls, a re-adoption, and a bridge restart, and distinct across
+ * close/reopen cycles of the same session name.
+ *
+ * Required, not optional: an event without one could not be de-duplicated, and
+ * silently dropping such events from the foreman inbox would be worse than
+ * refusing to compile.
+ */
+export interface EmitTurn {
+  epoch: number
+  turn: number
+  engine?: string
+  /** Overrides the device id in the recorded event (fleet callers). */
+  device?: string
+}
+
+/**
+ * Record the transition in the foreman inbox. Best-effort and never throwing:
+ * the inbox is a reporting surface, and failing to write it must not break the
+ * session it describes.
+ */
+function recordForeman(
+  kind: ForemanEventKind,
+  ev: { type: 'session' | 'relay'; id: string; cursor?: number; summary?: string; reason?: string },
+  turn: EmitTurn,
+): void {
+  defaultForemanInbox().record({
+    kind,
+    source: ev.type,
+    localName: ev.id,
+    epoch: turn.epoch,
+    turn: turn.turn,
+    engine: turn.engine,
+    device: turn.device,
+    cursor: ev.cursor,
+    summary: ev.summary,
+    reason: ev.reason,
+  })
 }
 
 export interface CompletionEvent {
@@ -223,13 +286,20 @@ function notifyNtfy(event: CompletionEvent, opts?: NtfyPayloadOptions): void {
  * failures go to stderr and the webhook POST is fire-and-forget.
  */
 export function emitCompletion(
-  ev: Omit<CompletionEvent, 'status' | 'ts' | 'handoff'> & { silent?: boolean; cwd?: string },
+  ev: Omit<CompletionEvent, 'status' | 'ts' | 'handoff'> & {
+    silent?: boolean
+    cwd?: string
+    turn: EmitTurn
+    /** `completed` (a turn finished) unless the caller says otherwise; the
+     *  relay's own shutdown reports `closed`. */
+    foremanKind?: Extract<ForemanEventKind, 'completed' | 'closed'>
+  },
 ): void {
   // `silent` suppresses ONLY the phone push (sink 3) — events.log + webhook still
   // fire — so routine per-task completions stay durable without buzzing the phone.
   // `cwd` is used only to compute the git facts in the handoff; it is NOT stored
   // in the event (so no local path leaks into events.log / the webhook).
-  const { silent, cwd, ...rest } = ev
+  const { silent, cwd, turn, foremanKind, ...rest } = ev
   const base = { ts: new Date().toISOString(), status: 'done' as const, ...rest }
   // Chat-ready handoff block, computed once and carried on the event so all three
   // sinks (log line, webhook JSON, ntfy body) share the same text.
@@ -260,6 +330,11 @@ export function emitCompletion(
 
   // 3) Optional phone push via ntfy (env-gated, fire-and-forget) — unless silent.
   if (!silent) notifyNtfy(event)
+
+  // 4) Durable, redacted, bounded projection for a returning foreman. NOTE the
+  //    handoff block and `cwd` are deliberately NOT passed on: they carry git
+  //    facts and a local path, and this store is readable by the MCP client.
+  recordForeman(foremanKind ?? 'completed', rest, turn)
 }
 
 /**
@@ -269,8 +344,9 @@ export function emitCompletion(
  * push is URGENT with a distinct "NEEDS YOUR ANSWER" title carrying the question.
  * Never throws/blocks.
  */
-export function emitNeedsInput(ev: Omit<CompletionEvent, 'status'> & { reason: string }): void {
-  const event = { ts: new Date().toISOString(), status: 'done' as const, ...ev }
+export function emitNeedsInput(ev: Omit<CompletionEvent, 'status'> & { reason: string; turn: EmitTurn }): void {
+  const { turn, ...rest } = ev
+  const event = { ts: new Date().toISOString(), status: 'done' as const, ...rest }
   const line = JSON.stringify({ event: 'needs_input', ...event }) + '\n'
 
   try {
@@ -293,6 +369,7 @@ export function emitNeedsInput(ev: Omit<CompletionEvent, 'status'> & { reason: s
   }
 
   notifyNtfy(event, { needsInput: true, reason: ev.reason })
+  recordForeman('needs_input', rest, turn)
 }
 
 /**
@@ -302,8 +379,9 @@ export function emitNeedsInput(ev: Omit<CompletionEvent, 'status'> & { reason: s
  * reason. This is the one place a device-push is the right primitive: the human
  * is the only node at the top that can actually be woken. Never throws/blocks.
  */
-export function emitEscalation(ev: Omit<CompletionEvent, 'status'> & { reason: string }): void {
-  const event = { ts: new Date().toISOString(), status: 'done' as const, ...ev }
+export function emitEscalation(ev: Omit<CompletionEvent, 'status'> & { reason: string; turn: EmitTurn }): void {
+  const { turn, ...rest } = ev
+  const event = { ts: new Date().toISOString(), status: 'done' as const, ...rest }
   const line = JSON.stringify({ event: 'escalation', ...event }) + '\n'
 
   // 1) Durable local log (tagged so watchers can distinguish from completions).
@@ -329,4 +407,51 @@ export function emitEscalation(ev: Omit<CompletionEvent, 'status'> & { reason: s
 
   // 3) Urgent phone push via ntfy (env-gated, fire-and-forget).
   notifyNtfy(event, { escalation: true, reason: ev.reason })
+  recordForeman('blocked', rest, turn)
+}
+
+/**
+ * Emit a non-completion lifecycle transition: a turn the foreman interrupted, a
+ * session it closed, or a send that failed outright.
+ *
+ * These are foreman-facing bookkeeping, not "your work is ready" news, so they
+ * take the durable sinks (events.log + the foreman inbox) but deliberately do
+ * NOT buzz a phone: the person who pressed interrupt or close already knows,
+ * and an error is surfaced to the caller synchronously as a 500. Never
+ * throws/blocks.
+ */
+export function emitLifecycle(
+  ev: {
+    type: 'session' | 'relay'
+    id: string
+    kind: Extract<ForemanEventKind, 'interrupted' | 'closed' | 'error'>
+    cursor?: number
+    summary?: string
+    reason?: string
+    turn: EmitTurn
+  },
+): void {
+  const { turn, kind, ...rest } = ev
+  const line = JSON.stringify({ event: kind, ts: new Date().toISOString(), ...rest }) + '\n'
+
+  try {
+    appendEventLine(line)
+  } catch {
+    process.stderr.write('[events] lifecycle log write failed\n')
+  }
+
+  const url = process.env.TANDEM_DONE_WEBHOOK
+  if (url) {
+    try {
+      void fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: line,
+      }).catch((e) => logBridge({ event: 'webhook', ok: false, error: String(e) }))
+    } catch (e) {
+      logBridge({ event: 'webhook', ok: false, error: e instanceof Error ? e.message : String(e) })
+    }
+  }
+
+  recordForeman(kind, rest, turn)
 }

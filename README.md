@@ -201,9 +201,36 @@ This writes a local MCP connector under `~/.tandem/desktop/connector.json`. The 
 | `send_to_session` | Give the agent more work or read its latest output. |
 | `interrupt_session` | Stop the current turn while keeping the session alive. |
 | `close_session` | End a Tandem-owned session. |
+| `get_foreman_events` | Catch up on what Tandem work did while the AI was disconnected. |
 | `relay` | Run Tandem's optional persistent Claude lead-and-worker loop. |
 
 Tandem routes remote sessions using stable names such as `studio:review`, so later requests return to the same agent on the same computer.
+
+## Catching up after a disconnect
+
+Tandem sessions keep running when your chat stops. Closing the tab, losing
+context, or starting a new conversation does not stop a worker mid-turn.
+
+So Tandem writes down what actually happened — a turn finished, a worker got
+stuck or asked a question, a turn was interrupted, a session closed, a command
+failed — and keeps that record on your computer. When your AI comes back it
+calls `get_foreman_events` alongside `list_sessions` and picks up where it left
+off, instead of starting a second worker on the same job.
+
+Two things worth knowing:
+
+- **Events are history; `list_sessions` is what is running now.** A "completed"
+  event does not mean the worker shut down.
+- **Nothing can make a chat resume on its own.** No MCP server can wake a
+  dormant conversation in any client today, Tandem included. The record is read
+  on the AI's next turn. If you want to be told at the moment something
+  finishes, point `TANDEM_NTFY_TOPIC` at your phone — that reaches *you*, and
+  you can then go and prompt the AI.
+
+The record holds short, redacted summaries and no paths, prompts, or terminal
+transcripts; it is capped and rotates. See
+[docs/foreman-events.md](docs/foreman-events.md) for the protocol details and
+[SECURITY.md](SECURITY.md) for the exact data boundary.
 
 ## Security in plain language
 
@@ -217,6 +244,7 @@ Tandem controls real coding agents and terminals, so treat access to it like rem
 - Device traffic stays inside your Tailscale network.
 - A device invitation works once and expires if unused. The enrolled device itself does not expire.
 - Default logs exclude prompts, terminal output, project paths, credentials, hostnames, usernames, IP addresses, and Tailscale identity.
+- The foreman event record returns short redacted summaries only — never paths, prompts, or transcripts — and can be reduced to bare transitions with `TANDEM_FOREMAN_EVENT_SUMMARIES=0`.
 
 The folder allowlist controls where a session starts. It is not an operating-system sandbox. Every agent still has the permissions of the OS account running Tandem.
 
@@ -226,7 +254,7 @@ Read [SETUP.md](SETUP.md) for operations and troubleshooting. Read [SECURITY.md]
 
 Tandem works with clients that support remote MCP servers and OAuth. When that capability is available in a browser-based AI product, you can control Tandem directly from that browser conversation. Tandem also works with local MCP clients over stdio.
 
-Tandem provides the agent-control backend. It cannot add MCP support to a third-party interface that does not offer it, and it cannot force a third-party chat to resume on its own.
+Tandem provides the agent-control backend. It cannot add MCP support to a third-party interface that does not offer it, and it cannot force a third-party chat to resume on its own. That last point is a client limitation, not a configuration gap: the MCP protocol as implemented today has no way for a server to wake a dormant conversation, so Tandem records what happened and the assistant reconciles on its next turn. See [docs/foreman-events.md](docs/foreman-events.md).
 
 ## Development
 

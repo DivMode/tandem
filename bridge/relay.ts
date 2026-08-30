@@ -33,7 +33,19 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { TerminalSession, bypassPermissionsEnabled } from './terminal-session.ts'
 import { DEFAULT_CLAUDE_MODEL } from './model-policy.ts'
-import { emitCompletion, emitEscalation, emitNeedsInput } from './events.ts'
+import { emitCompletion, emitEscalation, emitNeedsInput, type EmitTurn } from './events.ts'
+import { currentDeviceId } from './foreman-inbox.ts'
+
+/**
+ * The turn coordinate for a relay event. A relay's `loopId` is minted per loop
+ * and never reused, so the loop IS the incarnation: epoch stays 1 and the task
+ * number is the turn. The two loop-level terminal events (blocked / finished)
+ * use turn 0, are mutually exclusive, and fire at most once per loop, so no
+ * relay event id can collide with another.
+ */
+function relayTurn(taskNum: number): EmitTurn {
+  return { epoch: 1, turn: taskNum, engine: 'claude', device: currentDeviceId() }
+}
 import {
   managerDir,
   initManagerMemory,
@@ -637,7 +649,7 @@ async function runManager(loop: RelayLoop, goal: string, context: string | undef
         } catch {
           /* log may not exist yet */
         }
-        emitNeedsInput({ type: 'relay', id: loop.loopId, cursor, summary: `needs your answer: ${outcome.question}`, reason: outcome.question })
+        emitNeedsInput({ type: 'relay', id: loop.loopId, cursor, summary: `needs your answer: ${outcome.question}`, reason: outcome.question, turn: relayTurn(taskNum) })
         loop.pendingQuestion = outcome.question
         appendDecision(loop.memDir, `task ${taskNum} awaiting human answer · parking`)
         transcript(loop, 'SYS', `task ${taskNum} NEEDS_INPUT · parking ALIVE for the human's answer`)
@@ -655,7 +667,7 @@ async function runManager(loop: RelayLoop, goal: string, context: string | undef
       } catch {
         /* log may not exist yet */
       }
-      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay task ${taskNum} ${taskReason}`, reason: taskReason, silent: true, cwd: loop.cwd })
+      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay task ${taskNum} ${taskReason}`, reason: taskReason, silent: true, cwd: loop.cwd, turn: relayTurn(taskNum) })
       appendDecision(loop.memDir, `task ${taskNum} ${taskReason} · parking`)
       transcript(loop, 'SYS', `task ${taskNum} ${taskReason} · parking for next task`)
     }
@@ -680,10 +692,10 @@ async function runManager(loop: RelayLoop, goal: string, context: string | undef
     if (blockedReason !== null) {
       // Stuck: escalate to the human (urgent push). Terminal event for a block —
       // no duplicate completion ping.
-      emitEscalation({ type: 'relay', id: loop.loopId, cursor, summary: `relay blocked: ${blockedReason}`, reason: blockedReason })
+      emitEscalation({ type: 'relay', id: loop.loopId, cursor, summary: `relay blocked: ${blockedReason}`, reason: blockedReason, turn: relayTurn(0) })
     } else {
       updateState(loop.memDir, { status: 'done', task: 'manager stopped' })
-      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay manager finished: ${endReason}`, reason: endReason, cwd: loop.cwd })
+      emitCompletion({ type: 'relay', id: loop.loopId, cursor, summary: `relay manager finished: ${endReason}`, reason: endReason, cwd: loop.cwd, turn: relayTurn(0), foremanKind: 'closed' })
     }
     // Tear the tmux sessions down so they don't linger.
     await loop.lead.close().catch(() => {})

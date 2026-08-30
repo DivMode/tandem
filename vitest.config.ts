@@ -6,4 +6,10 @@ import { defineConfig } from "vitest/config";
 // This repo has no CSS to process.
 export default defineConfig({
   css: { postcss: { plugins: [] } },
+  test: {
+    // Redirect Tandem's private state root (audit log, completion events, turn
+    // ledger, foreman event store) into a temp directory for every worker, so a
+    // test run can never append to the developer's real ~/.tandem.
+    setupFiles: ["./test/setup-state-dir.ts"],
+  },
 });

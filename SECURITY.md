@@ -68,6 +68,17 @@ Every fleet machine must be controlled by the same operator and permitted by the
 - Setup-generated runtime state lives below `~/.tandem` by default, outside the repository, with directories at mode 0700 and files at mode 0600.
 - Completion events may contain private summaries by design. Webhook and ntfy delivery are explicit opt-ins.
 
+### Foreman event feed
+
+`get_foreman_events` is the one tool that returns locally recorded activity to the connected MCP client, so its data boundary is stated explicitly.
+
+- **What it exposes.** Bounded structured metadata for each lifecycle transition: a stable event id, an ordinal, a timestamp, the kind (`completed`, `blocked`, `needs_input`, `interrupted`, `closed`, `error`), the device id and the composite `device:localName` session name, the engine, an incarnation epoch and turn number, an optional transcript cursor, a `needs_foreman_review` flag, and at most 200 characters each of `summary` and `reason`.
+- **What it never exposes.** No working directory, filesystem path, attach hint, handoff block, git commit or file counts, environment, tool arguments, prompt, or transcript. `summary` and `reason` are stripped of ANSI and control bytes and redacted for credential-shaped runs (API keys, GitHub and Slack tokens, AWS access key ids, JWTs, private-key blocks, `password=`/`token=`-style assignments), absolute and home-relative paths, URLs, and long opaque digests.
+- **Opting out.** Set `TANDEM_FOREMAN_EVENT_SUMMARIES=0` to omit `summary` and `reason` entirely and keep only the structured transition.
+- **Where it lives.** One owner-only file (0600) under the private state directory (0700), replaced atomically, and rejected rather than trusted when its owner, permissions, size, or contents are wrong. Retention is bounded at 400 events and 14 days and enforced on write.
+- **What it is not.** It is a local record for the host's own foreman, not a fleet-wide audit trail and not proof of liveness. Events are recorded on the device that produced them.
+- **No shared read state.** Reading is strictly read-only and marks nothing. Callers carry their own opaque checkpoint, so one client cannot hide events from another. See [docs/foreman-events.md](docs/foreman-events.md).
+
 ## Operator checklist
 
 1. Use narrow project allowlists on every machine.

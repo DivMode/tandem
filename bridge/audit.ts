@@ -7,8 +7,8 @@
  * not silently persist its contents.
  */
 import { appendFileSync, chmodSync, mkdirSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { tandemStateDir } from './state-dir.ts'
 
 const CONTENT_FIELDS = new Set([
   'text',
@@ -44,7 +44,8 @@ const CONTENT_FIELDS = new Set([
 ])
 
 export interface AuditOptions {
-  /** Test seam. Production always uses ~/.tandem. */
+  /** Explicit override. Otherwise the shared state root (./state-dir.ts),
+   *  which is ~/.tandem unless TANDEM_STATE_DIR redirects it. */
   directory?: string
   /** Test seam for observing a failed write without replacing stderr. */
   onError?: (message: string) => void
@@ -69,7 +70,7 @@ export function redactAuditFields(fields: Record<string, unknown>): Record<strin
 }
 
 export function audit(fields: Record<string, unknown>, opts: AuditOptions = {}): void {
-  const directory = opts.directory ?? join(homedir(), '.tandem')
+  const directory = opts.directory ?? tandemStateDir()
   const logPath = join(directory, 'bridge.log')
   let line = ''
   try {

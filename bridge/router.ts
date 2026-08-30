@@ -65,7 +65,9 @@ import {
   listSessions,
 } from './sessions.ts'
 import * as relay from './relay.ts'
-import { emitCompletion, summarize } from './events.ts'
+import { emitCompletion, emitLifecycle, summarize, type EmitTurn } from './events.ts'
+import { defaultTurnLedger } from './turn-ledger.ts'
+import { currentDeviceId, defaultForemanInbox, InvalidCheckpointError } from './foreman-inbox.ts'
 import { audit } from './audit.ts'
 import { terminalBackend, type TerminalEngineId } from './terminal-backend.ts'
 
@@ -156,6 +158,11 @@ export async function route(req: RpcRequest): Promise<RpcResult> {
     return handleOpen(req)
   }
 
+  // GET /foreman/events — read-only reconciliation feed (see foreman-inbox.ts).
+  if (m === 'GET' && parts.length === 2 && parts[0] === 'foreman' && parts[1] === 'events') {
+    return handleForemanEvents(req)
+  }
+
   // .../sessions/:name/<action>
   if (parts.length === 3 && parts[0] === 'sessions') {
     const name = decodeURIComponent(parts[1])
@@ -203,6 +210,70 @@ export async function route(req: RpcRequest): Promise<RpcResult> {
   }
 
   return err(404, `no route for ${m} ${req.path}`)
+}
+
+// ---- foreman reconciliation ----------------------------------------------
+
+/**
+ * Read the durable foreman event feed. STRICTLY READ-ONLY: it opens nothing,
+ * touches no session, and — unlike a server-side acknowledgement — writes
+ * nothing at all. The caller carries its own opaque checkpoint, which is the
+ * only design that can be per-client on a stateless transport with no client
+ * identity (see bridge/foreman-inbox.ts and docs/foreman-events.md).
+ *
+ * The audit line records that a read happened and how much it returned; the
+ * checkpoint is not logged, since it is the caller's cursor, not ours.
+ */
+function handleForemanEvents(req: RpcRequest): RpcResult {
+  const since = req.query.get('since') ?? undefined
+  const rawLimit = req.query.get('limit')
+  const limit = rawLimit !== null && rawLimit !== '' ? Number(rawLimit) : undefined
+  if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) {
+    return err(400, 'limit must be a positive integer')
+  }
+  try {
+    const page = defaultForemanInbox().read({ since, limit })
+    audit({
+      route: 'GET /foreman/events',
+      returned: page.counts.returned,
+      retained: page.counts.retained,
+      truncated: page.truncated,
+      more: page.more,
+    })
+    return ok(page)
+  } catch (e) {
+    if (e instanceof InvalidCheckpointError) {
+      // Explicit, not silent: a checkpoint we cannot read must not be treated
+      // as "start from the beginning" or "start from now" behind the caller's
+      // back — either would misreport what it has already seen.
+      return err(400, `${e.message}; omit "since" to start a fresh checkpoint`)
+    }
+    return err(500, 'failed to read the foreman event feed')
+  }
+}
+
+// ---- turn boundaries ------------------------------------------------------
+
+/**
+ * The identity of the agent currently answering to `name`. A backend that can
+ * report a per-incarnation identity (tmux session id + creation time, Herdr
+ * workspace + terminal id) makes a reopened name distinguishable from the one
+ * it replaced; one that cannot falls back to a name-derived identity, which
+ * still de-duplicates repeated polls and still survives a restart.
+ */
+async function agentIdentityOf(session: DrivableSession): Promise<string> {
+  try {
+    const identity = await session.agentIdentity?.()
+    if (identity) return identity
+  } catch {
+    // A backend that cannot answer must not break the turn it is reporting on.
+  }
+  return `${session.engine}:${session.id}`
+}
+
+/** The EmitTurn carried into events.ts for a session-sourced event. */
+function turnOf(session: DrivableSession, ref: { epoch: number; turnSeq: number }): EmitTurn {
+  return { epoch: ref.epoch, turn: ref.turnSeq, engine: session.engine, device: currentDeviceId() }
 }
 
 // ---- session handlers -----------------------------------------------------
@@ -525,6 +596,13 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
 
   audit({ route: 'POST /sessions/:name/send', name, engine: session.engine, cwd: session.cwd, text, model, effort })
 
+  // Open the turn BEFORE sending. From here on exactly one completion can be
+  // emitted for it — whether it is observed on this call or on a later poll —
+  // because the ledger claims it once and the claim is durable.
+  const identity = await agentIdentityOf(session)
+  const ledger = defaultTurnLedger()
+  ledger.beginTurn(name, identity)
+
   try {
     // session.send() is already BOUNDED by the engine's soft cap (TANDEM_WAIT_MS):
     // it returns status:'done' with the report once idle, or status:'running' at
@@ -534,7 +612,17 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
     const result = await session.send(text, { model, effort })
     if (result.status === 'done') {
       // Turn finished — EMIT a completion event (push), not just return it.
-      emitCompletion({ type: 'session', id: name, cursor: result.cursor, summary: summarize(result.report), cwd: session.cwd })
+      const ref = ledger.completeTurn(name, identity)
+      if (ref) {
+        emitCompletion({
+          type: 'session',
+          id: name,
+          cursor: result.cursor,
+          summary: summarize(result.report),
+          cwd: session.cwd,
+          turn: turnOf(session, ref),
+        })
+      }
     }
     return ok({
       status: result.status,
@@ -545,13 +633,34 @@ async function handleSend(name: string, req: RpcRequest): Promise<RpcResult> {
       attachHint: session.attachHint(),
     })
   } catch (e) {
-    return err(500, `send failed: ${e instanceof Error ? e.message : String(e)}`)
+    // The turn is over and produced nothing: close it out so a later poll does
+    // not report a completion for work that never finished, and tell the
+    // foreman why the session went quiet.
+    const ref = ledger.abortTurn(name, identity)
+    const reason = e instanceof Error ? e.message : String(e)
+    if (ref) emitLifecycle({ type: 'session', id: name, kind: 'error', reason, turn: turnOf(session, ref) })
+    return err(500, `send failed: ${reason}`)
   }
 }
 
-/** Shared read used by GET /sessions/:name/read AND send poll-mode. Emits a
- *  completion event when a previously-running turn is observed to have finished
- *  (now idle AND produced fresh output since the cursor). */
+/**
+ * Shared read used by GET /sessions/:name/read AND send poll-mode. Emits the
+ * completion of a turn Tandem opened, the first time that turn is observed to
+ * have finished.
+ *
+ * WHY NOT THE OBVIOUS CONTENT TEST. This used to read
+ * `if (page.idle && page.text.trim().length > 0)`, which is an observation, not
+ * a boundary. read({cursor}) returns everything newer than `cursor`, so polling
+ * twice with the SAME cursor — the documented recovery move after an
+ * interruption, and what send()-returns-done followed by one confirming poll
+ * amounts to — returned the same text twice and manufactured two completion
+ * events for one turn. Nor did any of it survive a restart.
+ *
+ * The ledger answers the real question instead: is there a turn Tandem opened
+ * and has not yet reported? It says yes exactly once, durably. A session that
+ * is merely idle because a human typed into the TUI is not a turn Tandem drove
+ * and is deliberately not reported as one.
+ */
 async function readSession(name: string, cursor: number): Promise<RpcResult> {
   const session = await getLiveOrAdopt(name)
   if (!session) {
@@ -560,8 +669,19 @@ async function readSession(name: string, cursor: number): Promise<RpcResult> {
   }
   try {
     const page = await session.read({ cursor })
-    if (page.idle && page.text.trim().length > 0) {
-      emitCompletion({ type: 'session', id: name, cursor: page.cursor, summary: summarize(page.text), cwd: session.cwd })
+    if (page.idle) {
+      const identity = await agentIdentityOf(session)
+      const ref = defaultTurnLedger().completeTurn(name, identity)
+      if (ref) {
+        emitCompletion({
+          type: 'session',
+          id: name,
+          cursor: page.cursor,
+          summary: summarize(page.text),
+          cwd: session.cwd,
+          turn: turnOf(session, ref),
+        })
+      }
     }
     return ok({ ...page, live: true, engine: session.engine, attachHint: session.attachHint() })
   } catch (e) {
@@ -579,6 +699,21 @@ async function handleInterrupt(name: string): Promise<RpcResult> {
   if (!session) return err(409, `session "${name}" is not live`)
   audit({ route: 'POST /sessions/:name/interrupt', name, engine: session.engine, cwd: session.cwd })
   await session.interrupt()
+  // The turn in flight is over and will never complete. Close it out so no
+  // later poll reports it as finished, and record the transition — a foreman
+  // resuming after a context loss needs to know this turn was cut short rather
+  // than silently assume the instruction is still running.
+  const identity = await agentIdentityOf(session)
+  const ref = defaultTurnLedger().abortTurn(name, identity)
+  if (ref) {
+    emitLifecycle({
+      type: 'session',
+      id: name,
+      kind: 'interrupted',
+      reason: 'interrupted by the caller',
+      turn: turnOf(session, ref),
+    })
+  }
   return ok({ ok: true, name, engine: session.engine })
 }
 
@@ -604,8 +739,15 @@ async function handleClose(name: string): Promise<RpcResult> {
     return ok({ ok: true, name, alreadyClosed: true })
   }
   audit({ route: 'POST /sessions/:name/close', name, engine: session.engine, cwd: session.cwd })
+  // Take the session coordinate BEFORE closing, while the backend can still
+  // report its identity. The ledger entry is deliberately KEPT after a close:
+  // it is what stops a session reopened under the same name from reusing this
+  // incarnation's event ids.
+  const identity = await agentIdentityOf(session)
+  const ref = defaultTurnLedger().sessionRef(name, identity)
   await session.close()
   unregisterLive(name)
+  emitLifecycle({ type: 'session', id: name, kind: 'closed', turn: turnOf(session, ref) })
   return ok({ ok: true, name, engine: session.engine })
 }
 

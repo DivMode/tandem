@@ -439,6 +439,28 @@ export class TerminalSession {
   }
 
   /**
+   * A stable identity for THIS incarnation of the session, used by
+   * bridge/turn-ledger.ts to tell a reopened `ccm-<name>` apart from the one it
+   * replaced (the name alone cannot: it is reusable by design).
+   *
+   * `#{session_id}` is unique within a tmux server and `#{session_created}` is
+   * the creation instant, so the pair changes on every fresh spawn and is
+   * stable across a Tandem restart — which is exactly the property a durable
+   * de-duplication key needs. Returns undefined rather than throwing when tmux
+   * cannot answer; the ledger then falls back to a name-derived identity.
+   */
+  async agentIdentity(): Promise<string | undefined> {
+    try {
+      const raw = await tmux(['display-message', '-p', '-t', this.tmuxTarget, '#{session_id}\t#{session_created}'])
+      const [sessionId, created] = raw.trim().split('\t')
+      if (!sessionId || !created) return undefined
+      return `tmux:${sessionId}:${created}`
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
    * Spawn a fresh interactive engine (or, for a descriptor with no executable,
    * the pane's default login shell) inside a new tmux session. The cwd is
    * validated against the allowlist (the caller should pass an already-realpath'd

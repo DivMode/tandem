@@ -29,8 +29,23 @@ The general session tools are engine-neutral. The built-in `relay` is intentiona
 5. Permission bypass is off by default. Never assume it is enabled. It applies only to Claude and is required only for the unattended Claude relay.
 6. Call `list_sessions` before `open_session`. Reuse the live worker that already owns the task or issue; open a fresh named session only for a genuinely new, independent task or phase with no usable owner. Duplicate workers on one task diverge and fight over the same files.
 7. Never resend a prompt just because a turn is still running. Poll with an empty `text` and the returned cursor.
-8. Interrupting the caller does not stop an in-flight Tandem turn. After any interruption, disconnect, or new conversation, `list_sessions` first and resume the same worker instead of starting a second one.
+8. Interrupting the caller does not stop an in-flight Tandem turn. After any interruption, disconnect, or new conversation, call `list_sessions` AND `get_foreman_events` first, then resume the same worker instead of starting a second one.
 9. Ask before destructive, irreversible, or materially broader actions. Tandem does not grant authority beyond the user's request.
+
+## Reconcile before you open anything
+
+At the start of substantial engineering work, and again after any interruption, disconnect, new conversation, or context loss, make two calls before opening a session:
+
+1. `get_foreman_events` — what happened while you were away.
+2. `list_sessions` — what is running right now.
+
+They answer different questions and you need both. `get_foreman_events` is HISTORY: a `completed` event does not mean the worker exited, and an empty feed does not mean nothing happened. `list_sessions` is the only LIVENESS truth. Deciding whether to open a session from the event feed alone is how duplicate workers get created.
+
+Pass the previous call's `checkpoint` back as `since` so each transition is seen once. Tandem does not track what you have read — the transport is stateless and has no per-conversation identity, so the checkpoint lives with you. `truncated: true` means older history was dropped or your checkpoint predates the current store; reconcile against `list_sessions` rather than assuming a complete record.
+
+Events are recorded per host: a session driven on a fleet device is recorded on that device. Every event carries `device` and the composite `device:localName`, so never address a worker by a bare local name you read out of the feed.
+
+This is the reconciliation mechanism BECAUSE no MCP server can wake a dormant conversation. Do not tell the user that Tandem will notify their chat when work finishes — it cannot. `TANDEM_NTFY_TOPIC` reaches their phone, not their chat.
 
 ## Start every run with the fleet
 
@@ -83,6 +98,12 @@ Open or attach to one supported engine. Supply:
 
 Report the returned `attachHint` when the user may want to watch locally.
 
+### `get_foreman_events`
+
+Read-only. Returns `{ version, events, checkpoint, more, truncated, counts }`. Each event carries a stable id, an ordinal, a timestamp, its kind (`completed`, `blocked`, `needs_input`, `interrupted`, `closed`, `error`), the device and composite session name, the engine, an incarnation epoch and turn number, an optional cursor, a short redacted summary or reason, and `needs_foreman_review`.
+
+It opens nothing, changes nothing, and marks nothing as read. `more: true` means raise `limit` or call again with the returned checkpoint.
+
 ### `list_sessions`
 
 Use it to inspect sessions Tandem owns on one device. It is not a process scanner and does not return arbitrary tmux sessions or historical sessions.
@@ -131,7 +152,7 @@ Define ownership before sending work. Keep independent assignments separate. Seq
 
 ### Long-running work
 
-Keep the machine awake, use bounded turns, preserve cursors, and checkpoint important state in the project. Notifications can report completion to a webhook, ntfy, or the local event log, but they cannot force a third-party chat client to resume a conversation.
+Keep the machine awake, use bounded turns, preserve cursors, and checkpoint important state in the project. Notifications can report completion to a webhook, ntfy, or the local event log, but they cannot force a third-party chat client to resume a conversation. What survives the disconnect is the durable event record: read it with `get_foreman_events` on your next turn.
 
 ## Completion standard
 
@@ -141,6 +162,6 @@ Tandem is complete for a task only when:
 
 - the requested outcome exists on the intended device;
 - the result was independently verified;
-- no unresolved failure is hidden behind a running or disconnected session;
+- no unresolved failure is hidden behind a running or disconnected session, including a `blocked`, `needs_input`, or `error` event left unread in the foreman feed;
 - sensitive device or authentication data was not exposed;
 - remaining limitations are stated to the user.

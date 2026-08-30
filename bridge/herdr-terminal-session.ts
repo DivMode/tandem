@@ -662,6 +662,19 @@ export class HerdrTerminalSession implements TerminalSessionLike {
     return `${herdrAttachPrefix()} agent attach ${agentTarget(this.agent)}`
   }
 
+  /**
+   * A stable identity for THIS incarnation of the session, used by
+   * bridge/turn-ledger.ts. The workspace and terminal ids are exactly the pair
+   * herdr-cursor-store.ts already treats as "the same agent" when deciding
+   * whether restored cursor state may be trusted, so the two agree by
+   * construction: a Tandem name reopened onto a new Herdr agent gets a new
+   * identity here and a new turn epoch, and cannot inherit the old agent's
+   * event ids.
+   */
+  async agentIdentity(): Promise<string | undefined> {
+    return `herdr:${this.workspaceId}:${this.agent.terminal_id}`
+  }
+
   nativeSessionRef(): HerdrAgentSessionRef | undefined {
     return this.agent.agent_session
   }
