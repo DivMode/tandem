@@ -18,6 +18,7 @@ import {
   claudeLifecycleReadiness,
   claudeTurnEndAfter,
   isClaudeTurnBaseline,
+  recordClaudeLifecycleBoundary,
   type ClaudeTurnBaseline,
 } from '../bridge/claude-completion.ts'
 import { TurnLedger } from '../bridge/turn-ledger.ts'
@@ -142,6 +143,25 @@ describe('claudeTurnEndAfter', () => {
     expect(claudeTurnEndAfter(undefined, store)).toBeUndefined()
   })
 
+  it('never treats a Tandem-synthetic interrupt/close marker as a completion, even after a submit', () => {
+    // Claude's own Stop hook does NOT fire on an interrupt — Tandem writes
+    // these markers itself (see recordClaudeLifecycleBoundary) purely so
+    // claudeLifecycleReadiness has a terminal record to land on. They must
+    // never satisfy THIS function: a turn is only ever "completed" by an
+    // actual stop/stop_failure, closed out any other way via abortTurn.
+    const { store, baseline } = storeWithBaseline()
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'c1' })
+    store.record({ kind: 'interrupt', tandemSession: WORKER, claudeSessionId: 'tandem-synthetic' })
+    expect(claudeTurnEndAfter(baseline, store)).toBeUndefined()
+
+    store.record({ kind: 'close', tandemSession: WORKER, claudeSessionId: 'tandem-synthetic' })
+    expect(claudeTurnEndAfter(baseline, store)).toBeUndefined()
+
+    // The real boundary, once it actually arrives, still resolves normally.
+    store.record({ kind: 'stop', tandemSession: WORKER, claudeSessionId: 'c1', message: 'real completion' })
+    expect(claudeTurnEndAfter(baseline, store)).toMatchObject({ kind: 'stop', message: 'real completion' })
+  })
+
   it('degrades to "no answer" when the store is unreadable rather than failing the poll', () => {
     const directory = dir('tandem-lifecycle-')
     // A store that is not demonstrably ours degrades to empty by design...
@@ -182,6 +202,20 @@ describe('claudeLifecycleReadiness', () => {
     expect(claudeLifecycleReadiness(WORKER, store)).toBe('ready')
   })
 
+  it('is ready when the latest record is a Tandem-synthetic interrupt or close marker', () => {
+    // The real-world bug this exists to fix: Claude's Stop hook does NOT fire
+    // on an interrupt, so without treating these markers as terminal, a
+    // session interrupted mid-turn would read 'busy' forever.
+    const store = new ClaudeLifecycleStore(dir('tandem-lifecycle-'))
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'c1' })
+    store.record({ kind: 'interrupt', tandemSession: WORKER, claudeSessionId: 'tandem-synthetic' })
+    expect(claudeLifecycleReadiness(WORKER, store)).toBe('ready')
+
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'c2' })
+    store.record({ kind: 'close', tandemSession: WORKER, claudeSessionId: 'tandem-synthetic' })
+    expect(claudeLifecycleReadiness(WORKER, store)).toBe('ready')
+  })
+
   it('ignores other sessions entirely', () => {
     const store = new ClaudeLifecycleStore(dir('tandem-lifecycle-'))
     store.record({ kind: 'prompt_submit', tandemSession: OTHER, claudeSessionId: 'c1' })
@@ -195,6 +229,26 @@ describe('claudeLifecycleReadiness', () => {
       },
     } as unknown as ClaudeLifecycleStore
     expect(claudeLifecycleReadiness(WORKER, throwing)).toBe('unknown')
+  })
+})
+
+describe('recordClaudeLifecycleBoundary', () => {
+  it('writes an interrupt/close marker that flips readiness from busy to ready', () => {
+    const store = new ClaudeLifecycleStore(dir('tandem-lifecycle-'))
+    store.record({ kind: 'prompt_submit', tandemSession: WORKER, claudeSessionId: 'c1' })
+    expect(claudeLifecycleReadiness(WORKER, store)).toBe('busy')
+
+    recordClaudeLifecycleBoundary(WORKER, 'interrupt', store)
+    expect(claudeLifecycleReadiness(WORKER, store)).toBe('ready')
+  })
+
+  it('never throws when the store cannot be written', () => {
+    const throwing = {
+      record() {
+        throw new Error('state directory is gone')
+      },
+    } as unknown as ClaudeLifecycleStore
+    expect(() => recordClaudeLifecycleBoundary(WORKER, 'close', throwing)).not.toThrow()
   })
 })
 

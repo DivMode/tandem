@@ -69,6 +69,7 @@ import { emitCompletion, emitLifecycle, summarize, type EmitTurn } from './event
 import {
   claudeLifecycleReadiness,
   claudeTurnEndAfter,
+  recordClaudeLifecycleBoundary,
   type ClaudeTurnBaseline,
   type ClaudeTurnEnd,
 } from './claude-completion.ts'
@@ -927,6 +928,15 @@ async function handleInterrupt(name: string): Promise<RpcResult> {
   if (!session) return err(409, `session "${name}" is not live`)
   audit({ route: 'POST /sessions/:name/interrupt', name, engine: session.engine, cwd: session.cwd })
   await session.interrupt()
+  // Claude's own `Stop` hook does NOT fire on an interrupt — Claude simply
+  // terminates the turn, so no boundary is ever written to the lifecycle
+  // store. Without a substitute, claudeLifecycleReadiness would keep seeing
+  // this turn's `prompt_submit` as the latest record forever and report the
+  // session `'busy'` for good. Write the synthetic marker once the backend
+  // interrupt has actually succeeded.
+  if (session.engine === 'claude') {
+    recordClaudeLifecycleBoundary(tandemSessionIdFor(name), 'interrupt')
+  }
   // The turn in flight is over and will never complete. Close it out so no
   // later poll reports it as finished, and record the transition — a foreman
   // resuming after a context loss needs to know this turn was cut short rather
@@ -975,6 +985,15 @@ async function handleClose(name: string): Promise<RpcResult> {
   const ref = defaultTurnLedger().sessionRef(name, identity)
   await session.close()
   unregisterLive(name)
+  // Written on EVERY close, whether or not a turn was pending: `tandemSession`
+  // is derived purely from `name` (see claude-worker-env.ts's
+  // tandemSessionIdFor), so a session reopened under the same name shares its
+  // predecessor's identity in the lifecycle store. Without this marker, an
+  // unmatched `prompt_submit` left over from this incarnation would make the
+  // REOPENED session look permanently busy to claudeLifecycleReadiness.
+  if (session.engine === 'claude') {
+    recordClaudeLifecycleBoundary(tandemSessionIdFor(name), 'close')
+  }
   emitLifecycle({ type: 'session', id: name, kind: 'closed', turn: turnOf(session, ref) })
   return ok({ ok: true, name, engine: session.engine })
 }

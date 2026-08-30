@@ -246,3 +246,18 @@ It does not make Tandem able to wake a dormant chat client — nothing can; see
 [foreman-events.md](foreman-events.md). And `working` still never justifies
 resending a prompt: delivery on this transport is ambiguous in the other
 direction too, so reconcile before you resend.
+
+**Claude's `Stop` hook does not fire on an interrupt.** When Tandem (or a
+human) interrupts a turn, Claude terminates it without ever running `Stop` —
+there is no hook payload to record. Left alone, that would leave the turn's
+`UserPromptSubmit` as the last thing this session ever reported, and Tandem
+would read it as busy forever, refusing every later `send`. Tandem writes two
+terminal markers of its own into the same store to cover this: `interrupt`,
+right after it has actually stopped the backend process, and `close`, on every
+session close whether or not a turn was pending (a session name's identity in
+the store is derived from the name alone, so a session reopened under the same
+name would otherwise inherit a stale unmatched submit from an incarnation that
+no longer exists). Neither carries a message, and neither is ever treated as a
+completion — completion is still decided purely by `UserPromptSubmit` followed
+by `Stop`/`StopFailure`; these two only unstick the busy/ready readiness a
+future `send` is gated on.

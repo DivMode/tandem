@@ -94,8 +94,36 @@ export const SESSION_ID_ENV = 'TANDEM_SESSION_ID'
  * can be trusted to belong to the turn Tandem opened rather than to a stray
  * record still sitting in this append-only, shared-by-every-worker store (see
  * claude-completion.ts's claudeTurnEndAfter).
+ *
+ * `interrupt` and `close` are a FOURTH kind of record, and unlike the three
+ * above they are never written by Claude's own hook at all — Tandem writes
+ * them itself (see claude-completion.ts's recordClaudeLifecycleBoundary and
+ * its two callers in router.ts). They exist because Claude's `Stop` hook does
+ * NOT fire when a turn is cut short by an interrupt: Claude simply terminates
+ * the turn, and no boundary is ever written to this store. Without a
+ * substitute, claude-completion.ts's claudeLifecycleReadiness would see the
+ * turn's `prompt_submit` as the latest record forever and report the session
+ * `'busy'` for good, blocking every future send to it. `interrupt` is written
+ * once Tandem has actually stopped the backend process; `close` is written on
+ * every session close, REGARDLESS of whether a turn was pending — a session
+ * name is derived deterministically (see claude-worker-env.ts's
+ * tandemSessionIdFor), so a session reopened under the same name shares its
+ * predecessor's tandemSession identity, and without a `close` marker it would
+ * inherit a stale unmatched `prompt_submit` from an incarnation that no
+ * longer exists. Both carry no message, ever, and neither is a completion:
+ * claude-completion.ts's claudeTurnEndAfter only ever matches `stop`/
+ * `stop_failure` after a `prompt_submit`, never these two.
  */
-export type ClaudeLifecycleKind = 'stop' | 'stop_failure' | 'prompt_submit'
+export type ClaudeLifecycleKind = 'stop' | 'stop_failure' | 'prompt_submit' | 'interrupt' | 'close'
+
+/**
+ * The `claudeSessionId` Tandem-authored records (`interrupt`, `close`) use in
+ * place of a real Claude session id — there is no hook payload to take one
+ * from, since Claude did not write these. Opaque, constant, and satisfies
+ * `isOpaqueIdentity`; it carries no information beyond "this record did not
+ * come from Claude's own hook."
+ */
+export const SYNTHETIC_CLAUDE_SESSION_ID = 'tandem-synthetic'
 
 export interface ClaudeLifecycleEvent {
   v: number
@@ -112,8 +140,9 @@ export interface ClaudeLifecycleEvent {
   tandemSession: string
   /** Claude's own opaque session id, straight from the hook payload. */
   claudeSessionId: string
-  /** Sanitised, clamped last assistant message (`Stop` only, when present).
-   *  A `prompt_submit` record NEVER carries one — see `record()`. */
+  /** Sanitised, clamped last assistant message (`stop` only, when present).
+   *  `stop_failure`, `prompt_submit`, `interrupt` and `close` NEVER carry one
+   *  — see `record()`. */
   message?: string
   /** The message was longer than the clamp and was cut. */
   messageTruncated?: boolean
@@ -192,7 +221,11 @@ function isEvent(value: unknown): value is ClaudeLifecycleEvent {
     Number.isSafeInteger(c.seq) &&
     c.seq > 0 &&
     typeof c.ts === 'string' &&
-    (c.kind === 'stop' || c.kind === 'stop_failure' || c.kind === 'prompt_submit') &&
+    (c.kind === 'stop' ||
+      c.kind === 'stop_failure' ||
+      c.kind === 'prompt_submit' ||
+      c.kind === 'interrupt' ||
+      c.kind === 'close') &&
     isOpaqueIdentity(c.tandemSession) &&
     isOpaqueIdentity(c.claudeSessionId) &&
     (c.message === undefined || typeof c.message === 'string')
@@ -310,7 +343,15 @@ export class ClaudeLifecycleStore {
    */
   record(input: ClaudeLifecycleInput): ClaudeLifecycleEvent | undefined {
     try {
-      if (input.kind !== 'stop' && input.kind !== 'stop_failure' && input.kind !== 'prompt_submit') return undefined
+      if (
+        input.kind !== 'stop' &&
+        input.kind !== 'stop_failure' &&
+        input.kind !== 'prompt_submit' &&
+        input.kind !== 'interrupt' &&
+        input.kind !== 'close'
+      ) {
+        return undefined
+      }
       if (!isOpaqueIdentity(input.tandemSession)) return undefined
       if (!isOpaqueIdentity(input.claudeSessionId)) return undefined
 
@@ -328,11 +369,13 @@ export class ClaudeLifecycleStore {
           .digest('hex')
           .slice(0, 20)
 
-      // A prompt_submit record carries NO message, unconditionally — this is a
-      // hard invariant, not merely "usually omitted": the hook that deposits it
-      // must never be relied on to have withheld the prompt text; this store
-      // enforces it independently, even if a future hook edit passed one through.
-      const raw = input.kind !== 'prompt_submit' && typeof input.message === 'string' ? input.message : undefined
+      // Only `stop` ever carries a message. `stop_failure` has none to carry;
+      // `prompt_submit`, `interrupt` and `close` carry NONE, unconditionally —
+      // this is a hard invariant, not merely "usually omitted": neither the
+      // hook (prompt_submit) nor Tandem itself (interrupt/close) is trusted to
+      // have withheld content on the caller's side. This store enforces it
+      // independently, even if a future caller passed one through by mistake.
+      const raw = input.kind === 'stop' && typeof input.message === 'string' ? input.message : undefined
       const message = raw ? sanitizeEventText(raw, MAX_MESSAGE_CHARS) : undefined
       // "Truncated" is about the CLAMP, not about redaction: the sanitiser also
       // shortens text by replacing secrets, and calling that truncation would

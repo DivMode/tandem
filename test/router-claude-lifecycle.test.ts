@@ -391,6 +391,78 @@ describe('interrupt, close and supersede stay authoritative', () => {
     const allowed = await send(name, 'now it is Tandem\'s turn')
     expect(allowed.status).toBe(200)
   })
+
+  // THE REAL BUG: Claude's own Stop hook does NOT fire on an interrupt —
+  // Claude simply terminates the turn, so no boundary is ever written to the
+  // lifecycle store. Before the Tandem-synthetic `interrupt` marker, turn A's
+  // `prompt_submit` would remain the latest record for this session FOREVER,
+  // and claudeLifecycleReadiness would report it 'busy' forever, permanently
+  // rejecting every future send as an "external prompt in progress" even
+  // though Tandem itself is the one that ended the turn.
+  it('an interrupt unblocks the session immediately, without ever waiting for a Stop that will never arrive', async () => {
+    const { name } = newSession('interrupt-unblocks')
+    await send(name, 'first instruction')
+    hookSubmits(name) // turn A's own submit lands: hook evidence exists
+
+    await routeForTest('POST', `/sessions/${name}/interrupt`)
+
+    // Turn A's Stop NEVER arrives — that is the point. Without the synthetic
+    // marker this send would be rejected 409 forever.
+    const second = await send(name, 'second instruction')
+    expect(second.status).toBe(200)
+
+    // Turn A's stray Stop can still land late, after B's baseline but before
+    // B's own submit — it must not be mistaken for B's boundary.
+    hookReports(name, 'stop', 'stray stop from the interrupted turn A')
+    expect((await poll(name)).body).not.toHaveProperty('turnEnded')
+    expect(transitions(name).map((t) => t.kind)).toEqual(['interrupted'])
+
+    hookSubmits(name)
+    hookReports(name, 'stop', 'answering B, for real')
+    const res = await poll(name)
+    expect(res.body).toMatchObject({ turnEnded: 'stop', finalMessage: 'answering B, for real' })
+    expect(transitions(name).map((t) => t.kind)).toEqual(['interrupted', 'completed'])
+  })
+
+  // Same bug, external-prompt flavour: a human's prompt_submit at the TUI with
+  // no Tandem turn ever opened, and no Stop ever arriving. The `send` guard
+  // for THIS case blocks correctly, but nothing should be able to clear it
+  // except a Tandem interrupt (there is no Tandem turn to resolve the way a
+  // stale-pending-turn's own Stop would).
+  it('a manual/external unmatched prompt_submit still blocks every send until a Tandem interrupt clears it', async () => {
+    const { name } = newSession('external-interrupt')
+    hookSubmits(name) // simulates a human typing directly into the Claude TUI; no Stop ever follows
+
+    expect((await send(name, 'blocked')).status).toBe(409)
+    // Repeated sends stay blocked — this is not a one-shot rejection.
+    expect((await send(name, 'still blocked')).status).toBe(409)
+
+    await routeForTest('POST', `/sessions/${name}/interrupt`)
+
+    const allowed = await send(name, 'now it works')
+    expect(allowed.status).toBe(200)
+  })
+
+  // Close must write the same kind of marker, unconditionally, because
+  // tandemSessionIdFor(name) is derived purely from the name: a session
+  // reopened under the same name shares its predecessor's identity in the
+  // lifecycle store, and would otherwise inherit a stale unmatched
+  // prompt_submit from an incarnation that no longer exists.
+  it('closing and reopening the same name clears a stale unmatched prompt_submit via the close marker', async () => {
+    const { name } = newSession('close-reopen')
+    hookSubmits(name) // a human typed directly into the TUI; no Tandem turn ever opened, no Stop ever arrives
+
+    expect((await send(name, 'blocked')).status).toBe(409)
+
+    await routeForTest('POST', `/sessions/${name}/close`)
+
+    // A fresh incarnation opens under the SAME name: new backend state, same
+    // tandemSessionIdFor(name) identity in the lifecycle store.
+    fake(name)
+
+    const reopened = await send(name, 'now it should work')
+    expect(reopened.status).toBe(200)
+  })
 })
 
 describe('with no hook installed, nothing changes', () => {

@@ -36,6 +36,7 @@
  */
 import {
   MAX_RETAINED_EVENTS,
+  SYNTHETIC_CLAUDE_SESSION_ID,
   defaultClaudeLifecycleStore,
   type ClaudeLifecycleKind,
   type ClaudeLifecycleStore,
@@ -122,6 +123,10 @@ export function claudeTurnEndAfter(
     const own = page.events.filter((e) => e.seq > baseline.seq && e.tandemSession === baseline.session)
     const submit = own.find((e) => e.kind === 'prompt_submit')
     if (!submit) return undefined
+    // Deliberately `stop`/`stop_failure` only: `interrupt` and `close` are
+    // Tandem-authored terminal markers (see recordClaudeLifecycleBoundary
+    // below), never a claim from Claude that a turn COMPLETED. router.ts
+    // closes those turns out itself via abortTurn, not through this function.
     const event = own.find((e) => e.seq > submit.seq && (e.kind === 'stop' || e.kind === 'stop_failure'))
     if (!event) return undefined
     return {
@@ -153,7 +158,13 @@ export type ClaudeLifecycleReadiness = 'ready' | 'busy' | 'unknown'
  * running. Tandem has no baseline for that turn (it never opened one), so
  * `claudeTurnEndAfter` has nothing to say about it; this does.
  *
- * 'ready'   — the latest record is a `stop`/`stop_failure`: nothing pending.
+ * 'ready'   — the latest record is `stop`/`stop_failure`/`interrupt`/`close`:
+ *             nothing pending. The last three never come from Claude's own
+ *             hook (Claude does not fire `Stop` on an interrupt at all) — they
+ *             are Tandem's own terminal markers, see
+ *             recordClaudeLifecycleBoundary below, and count as `'ready'` for
+ *             exactly the same reason a real `stop` does: nothing is left
+ *             mid-turn once one of them is the last thing recorded.
  * 'busy'    — the latest record is a `prompt_submit`: something is mid-turn.
  * 'unknown' — no record at all for this session; no lifecycle signal either way.
  *
@@ -171,5 +182,35 @@ export function claudeLifecycleReadiness(
     return latest.kind === 'prompt_submit' ? 'busy' : 'ready'
   } catch {
     return 'unknown'
+  }
+}
+
+/**
+ * Deposit a Tandem-authored terminal lifecycle marker: `interrupt` (Tandem
+ * just stopped the backend process, and Claude's `Stop` hook will not fire
+ * for it) or `close` (the session is going away, whether or not a turn was
+ * pending — see the `ClaudeLifecycleKind` doc comment for why this is written
+ * unconditionally on every close).
+ *
+ * Never a completion: this never makes `claudeTurnEndAfter` resolve a
+ * pending turn (see the comment there). It exists solely so
+ * `claudeLifecycleReadiness` has a terminal record to land on when Claude's
+ * own hook cannot supply one, so a session Tandem itself ended is never
+ * reported `'busy'` forever.
+ *
+ * Never throws: `store.record` already never throws, but this is wrapped
+ * defensively anyway, consistent with the rest of this module — a failure to
+ * record a marker must never break the interrupt/close it is describing.
+ */
+export function recordClaudeLifecycleBoundary(
+  tandemSession: string,
+  kind: 'interrupt' | 'close',
+  store: ClaudeLifecycleStore = defaultClaudeLifecycleStore(),
+): void {
+  try {
+    store.record({ kind, tandemSession, claudeSessionId: SYNTHETIC_CLAUDE_SESSION_ID })
+  } catch {
+    // Best-effort: a lost marker degrades readiness back to whatever it was,
+    // never breaks the interrupt/close the caller is already committed to.
   }
 }

@@ -7,6 +7,7 @@ import {
   CLAUDE_LIFECYCLE_VERSION,
   MAX_MESSAGE_CHARS,
   MAX_RETAINED_EVENTS,
+  SYNTHETIC_CLAUDE_SESSION_ID,
   isOpaqueIdentity,
   tandemSessionIdentity,
 } from "../bridge/claude-lifecycle-store.ts";
@@ -81,6 +82,37 @@ describe("recording turn boundaries", () => {
     expect(event).toMatchObject({ kind: "prompt_submit", seq: 1 });
     expect(event!.message).toBeUndefined();
     expect(event!.messageTruncated).toBeUndefined();
+  });
+
+  it("records Tandem-synthetic interrupt/close markers, which NEVER carry a message even if one is supplied", () => {
+    const store = new ClaudeLifecycleStore(freshDir());
+    for (const kind of ["interrupt", "close"] as const) {
+      const event = store.record({
+        kind,
+        tandemSession: TANDEM_SESSION,
+        claudeSessionId: SYNTHETIC_CLAUDE_SESSION_ID,
+        // Neither Tandem nor a future caller mistake is trusted to have
+        // withheld this — the store enforces it independently.
+        message: "should never reach disk",
+      });
+      expect(event).toMatchObject({ kind, claudeSessionId: SYNTHETIC_CLAUDE_SESSION_ID });
+      expect(event!.message).toBeUndefined();
+      expect(event!.messageTruncated).toBeUndefined();
+    }
+  });
+
+  it("round-trips interrupt/close through readAfter, surviving a restart", () => {
+    const directory = freshDir();
+    const first = new ClaudeLifecycleStore(directory);
+    first.record({ kind: "prompt_submit", tandemSession: TANDEM_SESSION, claudeSessionId: CLAUDE_SESSION });
+    first.record({ kind: "interrupt", tandemSession: TANDEM_SESSION, claudeSessionId: SYNTHETIC_CLAUDE_SESSION_ID });
+    first.record({ kind: "close", tandemSession: TANDEM_SESSION, claudeSessionId: SYNTHETIC_CLAUDE_SESSION_ID });
+
+    // A new instance over the same directory is exactly what a restarted
+    // bridge (or the next hook invocation) gets.
+    const reopened = new ClaudeLifecycleStore(directory);
+    const page = reopened.readAfter(0);
+    expect(page.events.map((e) => e.kind)).toEqual(["prompt_submit", "interrupt", "close"]);
   });
 
   it("keeps two identical consecutive turns apart", () => {
