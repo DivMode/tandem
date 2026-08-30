@@ -50,7 +50,7 @@ Every fleet machine must be controlled by the same operator and permitted by the
 - Only sessions with Tandem's exact engine and installation ownership tags may be driven after restart.
 - Arbitrary tmux panes are never adopted.
 - With `TANDEM_TERMINAL_BACKEND=herdr`, Tandem uses Herdr's local Unix-socket API directly. It creates no-focus workspaces, starts only Claude or Codex agents, and rediscovers only workspaces carrying this installation's owner/session/engine metadata. Reads, semantic waits, interrupts, native agent-session identity, and persistence remain Herdr-owned. Tandem never focuses or adopts unrelated Herdr workspaces.
-- The configured Herdr API path must be an owner-matching Unix socket. The selected Herdr server must already be running; Tandem never resets or reloads its configuration.
+- The configured Herdr API path must be an owner-matching Unix socket. Tandem drives its own named Herdr session (`tandem` by default), which it may start headlessly against its own config file under `~/.tandem`. It never starts, stops, or configures the `default` session, a session excluded with `TANDEM_HERDR_MANAGED_SESSION=0`, or any server it did not start, and it never reloads the configuration of a running Herdr server, its own included. It refuses to write a Herdr config file it does not own, including the personal `~/.config/herdr/config.toml`.
 - Claude permission bypass is off. Only exact `TANDEM_ALLOW_BYPASS=1` enables it.
 - The unattended relay requires that explicit bypass and remains Claude-only.
 - Codex, shell, and Hermes are disabled unless explicitly enabled.

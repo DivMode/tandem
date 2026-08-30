@@ -102,10 +102,23 @@ validate_setup_values() {
       fi
       TANDEM_HERDR_BIN="${TANDEM_HERDR_BIN:-$(command -v herdr || true)}"
       [ -n "$TANDEM_HERDR_BIN" ] && [ -x "$TANDEM_HERDR_BIN" ] || die "Herdr is required for TANDEM_TERMINAL_BACKEND=herdr."
-      TANDEM_HERDR_SESSION="${TANDEM_HERDR_SESSION:-default}"
+      # Tandem drives its OWN named Herdr session by default, not the human's
+      # `default` one: Tandem's agents run in the background, and Herdr's
+      # toasts and sounds belong to the panes the human is actually watching.
+      TANDEM_HERDR_SESSION="${TANDEM_HERDR_SESSION:-tandem}"
       case "$TANDEM_HERDR_SESSION" in
         ''|*[!A-Za-z0-9._-]*|[-._]*) die "TANDEM_HERDR_SESSION is invalid." ;;
       esac
+      case "${TANDEM_HERDR_MANAGED_SESSION:-}" in
+        ''|0|1) ;;
+        *) die "TANDEM_HERDR_MANAGED_SESSION must be 0 or 1." ;;
+      esac
+      if [ -n "${TANDEM_HERDR_CONFIG:-}" ]; then
+        case "$TANDEM_HERDR_CONFIG" in
+          /*) ;;
+          *) die "TANDEM_HERDR_CONFIG must be an absolute path." ;;
+        esac
+      fi
       if [ -n "${TANDEM_HERDR_WORKSPACE_PATH:-}" ]; then
         TANDEM_VALIDATE_HERDR_PATH="$TANDEM_HERDR_WORKSPACE_PATH" node -e '
           const fs = require("node:fs"); const path = require("node:path");
@@ -113,18 +126,32 @@ validate_setup_values() {
           if (!entries.length || entries.some((entry) => !entry || !path.isAbsolute(entry) || !fs.statSync(entry).isDirectory())) process.exit(1);
         ' || die "TANDEM_HERDR_WORKSPACE_PATH must contain only existing absolute directories."
       fi
-      "$TANDEM_HERDR_BIN" session list --json | TANDEM_SETUP_HERDR_SESSION="$TANDEM_HERDR_SESSION" node -e '
-        const fs=require("node:fs");
-        try {
-          const j=JSON.parse(fs.readFileSync(0,"utf8"));
-          const s=j.sessions?.find((x)=>x.name===process.env.TANDEM_SETUP_HERDR_SESSION);
-          if (!s?.running || typeof s.socket_path!=="string") process.exit(1);
-        } catch { process.exit(1); }
-      ' || die "The selected Herdr session is not running."
+      # One source for this: bridge/herdr-session.ts decides the session name,
+      # the Tandem-owned config path, and whether Tandem may start it. A
+      # session Tandem manages is created here (silent, headless). The human's
+      # `default` session, or a named session with
+      # TANDEM_HERDR_MANAGED_SESSION=0, must already be running and is used
+      # exactly as its operator started it — never started, stopped, or
+      # reconfigured by Tandem.
+      TANDEM_HERDR_RESOLVED_SOCKET="$(
+        TANDEM_HERDR_BIN="$TANDEM_HERDR_BIN" \
+        TANDEM_HERDR_SESSION="$TANDEM_HERDR_SESSION" \
+        TANDEM_HERDR_CONFIG="${TANDEM_HERDR_CONFIG:-}" \
+        TANDEM_HERDR_MANAGED_SESSION="${TANDEM_HERDR_MANAGED_SESSION:-}" \
+        TANDEM_HERDR_SOCKET="${TANDEM_HERDR_SOCKET:-}" \
+        TANDEM_STATE_DIR="$STATE_ROOT" \
+        node --experimental-strip-types --input-type=module -e '
+          import { ensureHerdrSessionSocket } from "./bridge/herdr-session.ts";
+          process.stdout.write(await ensureHerdrSessionSocket());
+        '
+      )" || die "Could not prepare the Herdr session ${TANDEM_HERDR_SESSION}."
+      [ -n "$TANDEM_HERDR_RESOLVED_SOCKET" ] || die "Could not prepare the Herdr session ${TANDEM_HERDR_SESSION}."
+      say "Herdr session ${TANDEM_HERDR_SESSION} ready at ${TANDEM_HERDR_RESOLVED_SOCKET}"
       ;;
     *) die "TANDEM_TERMINAL_BACKEND must be tmux or herdr." ;;
   esac
   export TANDEM_TERMINAL_BACKEND TANDEM_HERDR_BIN TANDEM_HERDR_SESSION TANDEM_HERDR_WORKSPACE_PATH
+  export TANDEM_HERDR_CONFIG TANDEM_HERDR_MANAGED_SESSION
 }
 
 generate_secret() {
@@ -209,6 +236,8 @@ setup_desktop() {
   TANDEM_CONFIG_VALUE_TANDEM_TERMINAL_BACKEND="$TANDEM_TERMINAL_BACKEND" \
   TANDEM_CONFIG_VALUE_TANDEM_HERDR_BIN="${TANDEM_HERDR_BIN:-}" \
   TANDEM_CONFIG_VALUE_TANDEM_HERDR_SESSION="${TANDEM_HERDR_SESSION:-}" \
+  TANDEM_CONFIG_VALUE_TANDEM_HERDR_CONFIG="${TANDEM_HERDR_CONFIG:-}" \
+  TANDEM_CONFIG_VALUE_TANDEM_HERDR_MANAGED_SESSION="${TANDEM_HERDR_MANAGED_SESSION:-}" \
   TANDEM_CONFIG_VALUE_TANDEM_HERDR_WORKSPACE_PATH="${TANDEM_HERDR_WORKSPACE_PATH:-}" \
     write_config_from_env "${desktop_dir}/config.json"
   TANDEM_CONNECTOR_FILE="$connector" TANDEM_STDIO_PATH="${ROOT}/src/stdio-server.ts" TANDEM_CONFIG_FILE="${desktop_dir}/config.json" node --experimental-strip-types --input-type=module -e '
@@ -272,6 +301,8 @@ setup_hub() {
   TANDEM_CONFIG_VALUE_TANDEM_TERMINAL_BACKEND="$TANDEM_TERMINAL_BACKEND" \
   TANDEM_CONFIG_VALUE_TANDEM_HERDR_BIN="${TANDEM_HERDR_BIN:-}" \
   TANDEM_CONFIG_VALUE_TANDEM_HERDR_SESSION="${TANDEM_HERDR_SESSION:-}" \
+  TANDEM_CONFIG_VALUE_TANDEM_HERDR_CONFIG="${TANDEM_HERDR_CONFIG:-}" \
+  TANDEM_CONFIG_VALUE_TANDEM_HERDR_MANAGED_SESSION="${TANDEM_HERDR_MANAGED_SESSION:-}" \
   TANDEM_CONFIG_VALUE_TANDEM_HERDR_WORKSPACE_PATH="${TANDEM_HERDR_WORKSPACE_PATH:-}" \
   TANDEM_CONFIG_VALUE_TANDEM_FLEET_TOKEN="$fleet_token" \
   TANDEM_CONFIG_VALUE_TANDEM_FLEET_HOST="$FLEET_HOST" \

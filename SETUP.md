@@ -5,7 +5,7 @@ The normal installation has one Tailscale hub and zero or more outbound device b
 ## Requirements
 
 - Node.js 22.6 or newer
-- tmux
+- tmux, or Herdr for `TANDEM_TERMINAL_BACKEND=herdr`
 - the standalone Tailscale app or CLI
 - `tailscale up` completed on each machine
 - Claude Code, or an explicitly enabled supported engine
@@ -91,6 +91,39 @@ TANDEM_CWD_ALLOWLIST=/absolute/project ./setup.sh desktop
 ```
 
 This writes `~/.tandem/desktop/connector.json` and starts nothing. The MCP client launches Tandem over stdio.
+
+## Herdr terminal backend
+
+`TANDEM_TERMINAL_BACKEND=herdr` runs Claude and Codex sessions as native Herdr
+agents instead of tmux panes.
+
+```bash
+TANDEM_CWD_ALLOWLIST=/absolute/project TANDEM_TERMINAL_BACKEND=herdr ./setup.sh desktop
+```
+
+Tandem drives its own named Herdr session, `tandem`, and starts it headlessly
+against its own config file at `~/.tandem/herdr/tandem.toml`, which turns
+Herdr's toasts and sounds off. Tandem's agents work in the background, so their
+state changes are reported through the Tandem API; a Herdr notification keeps
+meaning that a pane you are watching yourself needs you. Your personal
+`~/.config/herdr/config.toml` and your `default` session are never read,
+written, started, stopped, or reloaded.
+
+| Variable | Effect |
+|---|---|
+| `TANDEM_HERDR_SESSION` | Named session for Tandem's agents. Default `tandem`. `default` shares your personal session, which Tandem then uses exactly as you started it. |
+| `TANDEM_HERDR_CONFIG` | Absolute path of the Tandem-owned Herdr config. Default `~/.tandem/herdr/<session>.toml`. Setup refuses your personal Herdr config path, and refuses to overwrite any config file Tandem did not write. |
+| `TANDEM_HERDR_MANAGED_SESSION` | Exact `0` stops Tandem creating, starting, or configuring the session. It must then already be running. |
+| `TANDEM_HERDR_BIN` | Herdr executable. Defaults to `herdr` on `PATH`. |
+| `TANDEM_HERDR_SOCKET` | Exact socket path, skipping session discovery entirely. |
+| `TANDEM_HERDR_WORKSPACE_PATH` | `PATH` for Tandem-owned Herdr workspaces. Every entry must be absolute. |
+
+Attach to a Tandem session with the `attachHint` each call returns, for example
+`herdr --session tandem agent attach tandem-1a2b3c4d5e6f`.
+
+Editing the Tandem config file changes that session the next time it starts
+(`herdr session stop tandem`), because Tandem never reloads the configuration
+of a running Herdr server.
 
 ## Long-running processes
 
