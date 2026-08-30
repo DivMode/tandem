@@ -28,11 +28,13 @@ import {
 } from "../bridge/model-policy.ts";
 
 /** Bump on any change to the policy text or rules below. */
-export const ORCHESTRATION_POLICY_VERSION = "1.1.0";
+export const ORCHESTRATION_POLICY_VERSION = "1.2.0";
 
 export interface OrchestrationPolicy {
   readonly version: string;
   readonly roles: readonly { readonly actor: string; readonly role: string }[];
+  readonly reviewAuthority: readonly string[];
+  readonly monitoring: readonly string[];
   readonly sessionDiscipline: readonly string[];
   readonly interruptionModel: readonly string[];
   readonly pollingProtocol: readonly string[];
@@ -55,7 +57,7 @@ export const ORCHESTRATION_POLICY: OrchestrationPolicy = {
     {
       actor: "ChatGPT (the connected client)",
       role:
-        "Foreman. Plans the work, splits it, delegates it to Tandem workers, reviews what comes back, and decides what happens next. The foreman does not do the engineering itself — it drives the workers that do.",
+        "Foreman. Plans the work, splits it, delegates it to Tandem workers, reviews what comes back, and decides what happens next. The foreman does not do the engineering itself — it drives the workers that do. It is also the reviewer of record and the merge authority for orchestrated engineering work: implementation workers supply code, tests and evidence, and it decides what merges.",
     },
     {
       actor: "GitHub",
@@ -67,6 +69,17 @@ export const ORCHESTRATION_POLICY: OrchestrationPolicy = {
       role:
         "Execution and session bus. It owns the live interactive engine sessions on real machines and is the only route to them. It is a bus, not a memory: it holds running work, not the project's history.",
     },
+  ],
+  reviewAuthority: [
+    "You are the reviewer of record and the merge authority for orchestrated engineering work. Implementation workers supply code, tests and evidence; you decide what merges.",
+    "Implementation workers do not self-approve. A worker's own account of its work is not an independent review and must never be the only one — review the diff against the original requirement, not the worker's summary of itself.",
+    "A separate Claude reviewer is optional, not mandatory. Open one when risk, complexity, or local execution earns a genuinely independent read: security, protocol and MCP behaviour, Nix and system state, migrations, concurrency and shared state, large refactors.",
+    "A separate reviewer's verdict is evidence for you, not a substitute for your review and merge decision. Skip the extra reviewer for small, low-risk, plainly correct work — and say that you skipped it.",
+  ],
+  monitoring: [
+    "Never open a session solely to watch another one. A monitoring worker costs a model, learns nothing the cursor does not already carry, and creates exactly the duplicate ownership the session rules exist to prevent.",
+    "Routine progress comes from list_sessions, polling the session that owns the work with empty text and its cursor, and reconciling get_foreman_events. That is the whole mechanism; nothing else needs to be running to observe a worker.",
+    "A short read-only health probe is exceptional. It is justified only when the semantic state itself looks inconsistent or stuck — not merely because a turn is taking a while — and the session it opens must be closed immediately afterwards.",
   ],
   sessionDiscipline: [
     "Call list_sessions BEFORE open_session. A worker you started earlier is very likely still alive and still holding the context you need.",
@@ -133,6 +146,18 @@ export const ORCHESTRATION_INSTRUCTIONS = [
   "ROLES",
   bullets(ORCHESTRATION_POLICY.roles.map((r) => `${r.actor}: ${r.role}`)),
   "",
+  "REVIEW — you are the reviewer of record and the merge authority",
+  bullets([
+    "Implementation workers supply code, tests and evidence and do NOT self-approve; you decide what merges. Review the diff against the original requirement, not a worker's summary of itself.",
+    "A separate Claude reviewer is OPTIONAL: open one when risk, complexity, or local execution earns a genuinely independent read (security, protocol/MCP, Nix and system state, migrations, concurrency, large refactors). Its verdict is evidence for you, never a substitute for your own review and merge decision.",
+  ]),
+  "",
+  "MONITORING — never open a session just to watch one",
+  bullets([
+    "Routine progress is list_sessions + polling the owning session with empty text and its cursor + get_foreman_events. A watcher session costs a model, learns nothing new, and duplicates ownership.",
+    "A short read-only health probe is exceptional — only when the semantic state itself looks inconsistent or stuck — and must be closed immediately.",
+  ]),
+  "",
   "SESSIONS — list and reuse before you open",
   bullets(ORCHESTRATION_POLICY.sessionDiscipline),
   "",
@@ -166,7 +191,7 @@ export const TOOL_GUIDANCE = {
   listSessions:
     "ORCHESTRATION: call this BEFORE open_session and reuse a matching live worker instead of opening a duplicate. Call it again first thing after any interruption, reconnect, or new conversation — in-flight Tandem work survives the client stopping, so resume the same worker rather than starting a second one.",
   openSession:
-    `ORCHESTRATION: list_sessions first and reuse a live worker; a name already live is returned with reused: true rather than opened twice. MODEL: omit model to get the "${DEFAULT_CLAUDE_MODEL}" default (Opus 5) for real engineering work; pick sonnet deliberately for narrow, read-only, or mechanical helpers; haiku only for trivial cases.`,
+    `ORCHESTRATION: list_sessions first and reuse a live worker; a name already live is returned with reused: true rather than opened twice. Never open a session solely to WATCH another one — use list_sessions, cursor polling, and get_foreman_events instead; a read-only health probe is exceptional and must be closed immediately. A separate reviewer session is optional, for work whose risk earns an independent read, and its verdict is evidence for you rather than the merge decision. MODEL: omit model to get the "${DEFAULT_CLAUDE_MODEL}" default (Opus 5) for real engineering work; pick sonnet deliberately for narrow, read-only, or mechanical helpers; haiku only for trivial cases.`,
   sendToSession:
     'ORCHESTRATION: status "running" with a cursor means the turn is STILL EXECUTING — poll the same session with empty text and that cursor. NEVER resend the instruction to a running session; a resend queues a second instruction into a live turn. Interrupting the client does not stop this turn.',
   fableParam:
@@ -174,5 +199,5 @@ export const TOOL_GUIDANCE = {
   foremanEvents:
     "ORCHESTRATION: call this together with list_sessions when you start substantial engineering work and after any interruption, reconnect, or context loss — before opening a session, so you do not duplicate a worker whose result is already here. This is HISTORY, not liveness: list_sessions says what is running now. Pass the previous call's `checkpoint` as `since` to see each transition once; the server does not track what you have read.",
   policyTool:
-    `Read-only. Returns the full versioned Tandem orchestration policy (v${ORCHESTRATION_POLICY_VERSION}): roles (client = foreman, GitHub = durable truth, Tandem = execution/session bus), session reuse discipline, the interruption model, the running/cursor polling protocol, and model routing including the explicit-user-only Fable rule. Opens nothing, changes nothing, and touches no session. The same policy is offered as the MCP initialize instructions; call this when those were not surfaced or when you need the full text.`,
+    `Read-only. Returns the full versioned Tandem orchestration policy (v${ORCHESTRATION_POLICY_VERSION}): roles (client = foreman and reviewer of record, GitHub = durable truth, Tandem = execution/session bus), review and merge authority, the no-monitoring-session rule, session reuse discipline, the interruption model, the running/cursor polling protocol, event reconciliation, and model routing including the explicit-user-only Fable rule. Opens nothing, changes nothing, and touches no session. The same policy is offered as the MCP initialize instructions; call this when those were not surfaced or when you need the full text.`,
 } as const;
