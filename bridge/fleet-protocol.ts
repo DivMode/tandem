@@ -77,6 +77,7 @@ const opPayloadSchemas = {
       cwd: cwdSchema.optional(),
       model: modelSchema.optional(),
       effort: effortSchema.optional(),
+      user_requested_fable: z.boolean().optional(),
     })
     .strict(),
   send: z
@@ -86,6 +87,7 @@ const opPayloadSchemas = {
       cursor: cursorSchema.optional(),
       model: modelSchema.optional(),
       effort: effortSchema.optional(),
+      user_requested_fable: z.boolean().optional(),
     })
     .strict(),
   read: z.object({ sessionId: localNameSchema, cursor: cursorSchema.optional() }).strict(),

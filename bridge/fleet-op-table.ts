@@ -24,6 +24,10 @@ export interface LocalOpPayload {
   cwd?: string
   model?: string
   effort?: string
+  /** Explicit user consent for a Fable model (see bridge/model-policy.ts).
+   *  Carried verbatim so the DEVICE's own router enforces the gate — the hub
+   *  never becomes a place where the guard can be skipped. */
+  user_requested_fable?: boolean
   sessionId?: string
   text?: string
   cursor?: number
@@ -46,6 +50,7 @@ export async function executeLocalOp(op: FleetOp, payload: LocalOpPayload): Prom
         cwd: payload.cwd,
         model: payload.model,
         effort: payload.effort,
+        user_requested_fable: payload.user_requested_fable,
       })
     case 'send':
       return routeForTest('POST', `/sessions/${encodeURIComponent(payload.sessionId ?? '')}/send`, {
@@ -53,6 +58,7 @@ export async function executeLocalOp(op: FleetOp, payload: LocalOpPayload): Prom
         cursor: payload.cursor,
         model: payload.model,
         effort: payload.effort,
+        user_requested_fable: payload.user_requested_fable,
       })
     case 'read':
       return routeForTest(

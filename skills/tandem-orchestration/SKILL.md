@@ -27,9 +27,10 @@ The general session tools are engine-neutral. The built-in `relay` is intentiona
 3. Never reveal tokens, paths, usernames, hostnames, tailnet identity, nonces, or raw fleet connection data in chat or reports.
 4. Use `shell` only when the user explicitly enabled it and the caller is trusted with arbitrary OS-user command execution.
 5. Permission bypass is off by default. Never assume it is enabled. It applies only to Claude and is required only for the unattended Claude relay.
-6. Prefer a fresh named session for a new task or phase. Reuse a session only when continuity is valuable and its current state has been inspected.
+6. Call `list_sessions` before `open_session`. Reuse the live worker that already owns the task or issue; open a fresh named session only for a genuinely new, independent task or phase with no usable owner. Duplicate workers on one task diverge and fight over the same files.
 7. Never resend a prompt just because a turn is still running. Poll with an empty `text` and the returned cursor.
-8. Ask before destructive, irreversible, or materially broader actions. Tandem does not grant authority beyond the user's request.
+8. Interrupting the caller does not stop an in-flight Tandem turn. After any interruption, disconnect, or new conversation, `list_sessions` first and resume the same worker instead of starting a second one.
+9. Ask before destructive, irreversible, or materially broader actions. Tandem does not grant authority beyond the user's request.
 
 ## Start every run with the fleet
 

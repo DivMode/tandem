@@ -32,6 +32,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { TerminalSession, bypassPermissionsEnabled } from './terminal-session.ts'
+import { DEFAULT_CLAUDE_MODEL } from './model-policy.ts'
 import { emitCompletion, emitEscalation, emitNeedsInput } from './events.ts'
 import {
   managerDir,
@@ -264,10 +265,31 @@ export async function startRelay(opts: StartRelayOptions): Promise<StartRelayRes
   // INSIDE TerminalSession.spawn (per the shared contract). allowBypass is
   // passed explicitly (true) since the guard above already confirmed it — the
   // relay must never fall back to a silent per-spawn env re-read.
-  const lead = await TerminalSession.spawn({ name: leadName, cwd: opts.cwd, allowlist, allowBypass: true })
+  //
+  // The model is passed explicitly for the same reason. These are new Claude
+  // sessions, so the default-model policy applies to them exactly as it does to
+  // open_session — and relay sessions run UNATTENDED, which is the last place a
+  // silent downgrade to whatever the host CLI happens to default to should be
+  // tolerated. DEFAULT_CLAUDE_MODEL is the one canonical constant
+  // (./model-policy.ts), so the relay cannot drift from the routed path.
+  // Nothing else changes: the relay stays Claude-only and tmux-only, and the
+  // bypass/allowlist semantics above are untouched.
+  const lead = await TerminalSession.spawn({
+    name: leadName,
+    cwd: opts.cwd,
+    allowlist,
+    allowBypass: true,
+    model: DEFAULT_CLAUDE_MODEL,
+  })
   let worker: TerminalSession
   try {
-    worker = await TerminalSession.spawn({ name: workerName, cwd: opts.cwd, allowlist, allowBypass: true })
+    worker = await TerminalSession.spawn({
+      name: workerName,
+      cwd: opts.cwd,
+      allowlist,
+      allowBypass: true,
+      model: DEFAULT_CLAUDE_MODEL,
+    })
   } catch (e) {
     // Don't leak the lead session if the worker fails to come up.
     await lead.close().catch(() => {})

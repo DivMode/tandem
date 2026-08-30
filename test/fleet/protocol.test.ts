@@ -157,3 +157,50 @@ describe("fleet-protocol: size and malformed-input bounds", () => {
     expect(() => encodeResponseFrame(generateRequestId(), true, 200, huge)).toThrow(FrameTooLargeError);
   });
 });
+
+/**
+ * The Fable consent flag has to survive the fleet hop intact: the payload
+ * schemas are `.strict()`, so an unlisted field is a frame-level rejection and
+ * a remote worker would silently lose the user's explicit consent — turning a
+ * legitimate Fable request into a 400 the user could never satisfy. The flag is
+ * carried, never interpreted, on the wire: the EXECUTING device's own router
+ * enforces the gate (bridge/model-policy.ts), so the hub is not a place the
+ * guard can be skipped.
+ */
+describe("fleet-protocol: user_requested_fable rides the wire", () => {
+  it("accepts the boolean consent flag on open_session", () => {
+    const frame = parseFrame(
+      encodeRequestFrame(generateRequestId(), "open_session", {
+        name: "x",
+        engine: "claude",
+        model: "fable",
+        user_requested_fable: true,
+      }),
+    );
+    expect(frame).toMatchObject({ op: "open_session", payload: { model: "fable", user_requested_fable: true } });
+  });
+
+  it("accepts the boolean consent flag on a per-turn send", () => {
+    const frame = parseFrame(
+      encodeRequestFrame(generateRequestId(), "send", {
+        sessionId: "x",
+        text: "go",
+        model: "claude-fable-5",
+        user_requested_fable: true,
+      }),
+    );
+    expect(frame).toMatchObject({ op: "send", payload: { model: "claude-fable-5", user_requested_fable: true } });
+  });
+
+  it("rejects a non-boolean consent flag at the frame boundary", () => {
+    expect(() =>
+      parseFrame(
+        encodeRequestFrame(generateRequestId(), "open_session", {
+          name: "x",
+          engine: "claude",
+          user_requested_fable: "true",
+        } as never),
+      ),
+    ).toThrow(FrameInvalidError);
+  });
+});
