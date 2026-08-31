@@ -11,6 +11,7 @@ import { createConnection } from 'node:net'
 import { delimiter as pathDelimiter, isAbsolute } from 'node:path'
 import type { EngineId } from './drivable.ts'
 import type { TerminalSessionLike } from './engines/terminal-adapter.ts'
+import { claudeWorkerArgv, claudeWorkerEnvironment, claudeWorkerSpawn, type ClaudeWorkerSpawn } from './claude-worker-env.ts'
 import { isCwdAllowed, safeResolve } from './cwd-allowlist.ts'
 import { FileHerdrCursorStore, type HerdrCursorState, type HerdrCursorStore, type HerdrSessionIdentity }
   from './herdr-cursor-store.ts'
@@ -564,6 +565,12 @@ export class HerdrTerminalSession implements TerminalSessionLike {
     if (!isCwdAllowed(opts.cwd, opts.allowlist)) throw new Error(`cwd not allowed: ${opts.cwd}`)
     const cwd = safeResolve(opts.cwd)
     if (!isCwdAllowed(cwd, opts.allowlist)) throw new Error(`cwd not allowed: ${opts.cwd}`)
+    // Tandem-owned Claude workers only, and only when the host configured a
+    // settings file: the lifecycle hook's registration and the opaque identity
+    // it stamps records with. Resolved BEFORE the workspace exists so a
+    // misconfigured path fails without leaving one behind.
+    const claudeWorker: ClaudeWorkerSpawn | undefined =
+      opts.engine === 'claude' ? claudeWorkerSpawn(opts.name) : undefined
     const ownerIdProvider = opts.ownerIdProvider ?? makeOwnerIdProvider()
     const owner = await ownerIdProvider()
     const agentName = agentNameFor(opts.name)
@@ -571,7 +578,7 @@ export class HerdrTerminalSession implements TerminalSessionLike {
       cwd,
       focus: false,
       label: `Tandem ${opts.name}`,
-      env: herdrWorkspaceEnvironment(),
+      env: { ...herdrWorkspaceEnvironment(), ...claudeWorkerEnvironment(claudeWorker) },
     })
     const workspace = resultObject<HerdrWorkspaceInfo>(created, 'workspace')
     const rootPane = resultObject<HerdrPaneInfo>(created, 'root_pane')
@@ -588,6 +595,7 @@ export class HerdrTerminalSession implements TerminalSessionLike {
         seq: 1,
       })
       const args: string[] = []
+      args.push(...claudeWorkerArgv(claudeWorker))
       if (opts.engine === 'claude' && opts.model) args.push('--model', opts.model)
       if (opts.engine === 'claude' && opts.effort) args.push('--effort', opts.effort)
       const started = await startAgentAfterShellReady(client, {

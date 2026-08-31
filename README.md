@@ -8,7 +8,7 @@
   <a href="https://github.com/Maxmedawar/tandem/actions/workflows/ci.yml"><img src="https://github.com/Maxmedawar/tandem/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/Maxmedawar/tandem/releases"><img src="https://img.shields.io/github/v/release/Maxmedawar/tandem?color=E8643C" alt="Release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-E8643C.svg" alt="MIT License"></a>
-  <img src="https://img.shields.io/badge/node-%3E%3D22.6-339933" alt="Node >=22.6">
+  <img src="https://img.shields.io/badge/node-%3E%3D22.13-339933" alt="Node >=22.13">
   <a href="https://github.com/Maxmedawar/tandem/stargazers"><img src="https://img.shields.io/github/stars/Maxmedawar/tandem?color=E8643C" alt="Stars"></a>
   <img src="https://img.shields.io/badge/PRs-welcome-E8643C.svg" alt="PRs welcome">
 </p>
@@ -90,7 +90,7 @@ Safety rules:
 - Stop if a verification fails. Do not report partial setup as success.
 
 Steps:
-1. Check for Node.js 22.6+, tmux, Tailscale, and at least one supported coding
+1. Check for Node.js 22.13+, tmux, Tailscale, and at least one supported coding
    agent. Install missing prerequisites with the normal package manager when safe.
    If an install needs administrator approval, ask me first.
 2. Check whether Tailscale is running and connected. If I must sign in or enable
@@ -137,7 +137,7 @@ Shell access is powerful. It gives an approved caller command execution as the T
 
 You need:
 
-- Node.js 22.6 or newer
+- Node.js 22.13 or newer (Node 23.0-23.3 excluded)
 - tmux
 - Tailscale, connected with `tailscale up`
 - at least one supported agent installed
@@ -196,7 +196,7 @@ This writes a local MCP connector under `~/.tandem/desktop/connector.json`. The 
 | Tool | What it lets the AI do |
 |---|---|
 | `list_devices` | See your connected computers and their available engines. |
-| `list_sessions` | See live Tandem sessions on a computer. |
+| `list_sessions` | See live Tandem sessions on a computer, plus a short preview of the most recent finished work. |
 | `open_session` | Start or reattach to an agent session. |
 | `send_to_session` | Give the agent more work or read its latest output. |
 | `interrupt_session` | Stop the current turn while keeping the session alive. |
@@ -221,6 +221,11 @@ Two things worth knowing:
 
 - **Events are history; `list_sessions` is what is running now.** A "completed"
   event does not mean the worker shut down.
+- **`list_sessions` also returns a short `recent_events` preview** — at most
+  five recent transitions, newest first. It is there so a chat that was already
+  open before Tandem gained `get_foreman_events` can still notice that work
+  finished, because a client caches the tool list for the life of a
+  conversation. It is history too, and no substitute for the checkpointed feed.
 - **Nothing can make a chat resume on its own.** No MCP server can wake a
   dormant conversation in any client today, Tandem included. The record is read
   on the AI's next turn. If you want to be told at the moment something
@@ -239,6 +244,16 @@ Each computer keeps its own record. Ask another one by passing its device id.
 
 See [docs/foreman-events.md](docs/foreman-events.md) for the protocol details
 and [SECURITY.md](SECURITY.md) for the exact data boundary.
+
+### Letting Claude report its own completion
+
+By default Tandem *infers* that a turn ended by watching the terminal, and a
+wrong inference leaves a finished worker reporting `working`. Claude can instead
+report its own turn boundary through its `Stop` lifecycle hook. It is optional,
+off unless you configure it, and your personal `~/.claude/settings.json` is never
+read or changed. See
+[docs/claude-completion-hook.md](docs/claude-completion-hook.md) for the exact
+settings file, the `TANDEM_CLAUDE_SETTINGS_PATH` wiring, and a Nix example.
 
 ## Security in plain language
 

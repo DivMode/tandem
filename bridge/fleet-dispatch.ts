@@ -155,7 +155,32 @@ function rewriteListSessionsResponse(result: DispatchResult, deviceId: string): 
     const localName = rec.id as string
     return { ...rec, id: `${deviceId}:${localName}`, device: deviceId, localName }
   })
-  return { status: result.status, body: { ...body, sessions } }
+  return rewriteRecentEvents({ status: result.status, body: { ...body, sessions } }, deviceId)
+}
+
+/**
+ * Put the additive `recent_events` preview on the HUB's routing identity,
+ * exactly as rewriteForemanPage does for the event feed.
+ *
+ * IDENTITY IS THE HUB'S, for the same reason it is there: a device reports its
+ * events under whatever TANDEM_DEVICE_ID it was configured with, which the hub
+ * has no reason to trust and no way to verify. Rewriting to the id the hub
+ * actually routed to is what makes the composite name in a preview safe to
+ * address a worker with — including on the local path, where the feed already
+ * reports "local:<name>" and a preview that disagreed would be a second,
+ * conflicting way to name the same session.
+ */
+function rewriteRecentEvents(result: DispatchResult, deviceId: string): DispatchResult {
+  if (result.status < 200 || result.status >= 300) return result
+  const body = result.body as { recent_events?: unknown } | undefined
+  const preview = body?.recent_events as { events?: unknown } | undefined
+  if (!body || !preview || typeof preview !== 'object' || !Array.isArray(preview.events)) return result
+  const events = (preview.events as Array<Record<string, unknown>>).map((event) => {
+    if (typeof event !== 'object' || event === null) return event
+    const localName = typeof event.localName === 'string' ? event.localName : ''
+    return { ...event, device: deviceId, session: `${deviceId}:${localName}` }
+  })
+  return { status: result.status, body: { ...body, recent_events: { ...preview, events } } }
 }
 
 async function maybeScheduled(runtime: FleetRuntime, op: FleetOp, key: string, run: () => Promise<DispatchResult>): Promise<DispatchResult> {
@@ -270,7 +295,12 @@ export async function dispatchListSessions(
 ): Promise<DispatchResult> {
   if (explicitDevice === undefined || explicitDevice === 'local') {
     const result = await executeLocalOp('list_sessions', payload)
-    return explicitDevice === 'local' ? rewriteListSessionsResponse(result, 'local') : result
+    // `sessions` keeps its pre-fleet shape on a bare local call — bare names
+    // stay bare. The preview is still put on the hub's routing identity, so a
+    // composite name read out of it always addresses the right worker.
+    return explicitDevice === 'local'
+      ? rewriteListSessionsResponse(result, LOCAL_DEVICE_KEY)
+      : rewriteRecentEvents(result, LOCAL_DEVICE_KEY)
   }
   if (!runtime.registry.isOnline(explicitDevice)) {
     return { status: 404, body: { error: `device "${explicitDevice}" is not online` } }

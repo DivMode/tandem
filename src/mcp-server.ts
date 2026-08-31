@@ -166,6 +166,8 @@ ${TOOL_GUIDANCE.openSession}`,
     "list_sessions",
     `${BLAST_RADIUS}\n\nRead-only. List live sessions Tandem owns and can drive on the local hub or one selected device. Tandem does not scan arbitrary tmux sessions or return history. Remote ids are rewritten as stable "<deviceId>:<localName>" names and include device and localName fields.
 
+Returns { sessions, recent_events }. \`sessions\` is unchanged. \`recent_events\` is an additive, bounded preview of at most 5 recent lifecycle transitions, newest first, with { version, events, checkpoint, older, counts, note } — the same event shape get_foreman_events returns. It is HISTORY (\`sessions\` is the liveness truth), it carries no checkpoint of yours and cannot be paged, and its \`checkpoint\` is the store position AT the newest event shown, so passing it to get_foreman_events as \`since\` skips everything at or before it. get_foreman_events remains the preferred surface for checkpointed, once-only history.
+
 ${TOOL_GUIDANCE.listSessions}`,
     {
       limit: z.number().int().positive().optional(),

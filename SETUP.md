@@ -4,7 +4,7 @@ The normal installation has one Tailscale hub and zero or more outbound device b
 
 ## Requirements
 
-- Node.js 22.6 or newer
+- Node.js 22.13 or newer (Node 23.0-23.3 excluded)
 - tmux, or Herdr for `TANDEM_TERMINAL_BACKEND=herdr`
 - the standalone Tailscale app or CLI
 - `tailscale up` completed on each machine

@@ -52,6 +52,7 @@ import { existsSync, realpathSync, statSync } from 'node:fs'
 import { open, mkdir } from 'node:fs/promises'
 import { cpus, homedir, loadavg } from 'node:os'
 import { join, sep } from 'node:path'
+import { claudeWorkerArgv, claudeWorkerEnvironment, claudeWorkerSpawn, type ClaudeWorkerSpawn } from './claude-worker-env.ts'
 import { CLAUDE_DESCRIPTOR, type EngineDescriptor } from './drivable.ts'
 import { makeOwnerIdProvider, type OwnerIdProvider } from './ownership.ts'
 
@@ -516,12 +517,21 @@ export class TerminalSession {
     // pre-spawn, so a bad value fails clearly instead of launching a
     // misconfigured session.
     const engineArgv: string[] = []
+    // Tandem-owned Claude workers only: the operator's own settings file (which
+    // is what registers the lifecycle hook) and the opaque session identity the
+    // hook stamps its records with. Both are absent unless the host configured
+    // TANDEM_CLAUDE_SETTINGS_PATH, and a configured-but-untrustworthy path
+    // throws HERE — before any tmux state exists — rather than silently
+    // producing a worker whose completions are still only guessed at.
+    let claudeWorker: ClaudeWorkerSpawn | undefined
     if (descriptor.executable) {
       engineArgv.push(descriptor.executable)
       if (descriptor.id === 'claude') {
         warnLegacySkipPermissionsIfSet()
+        claudeWorker = claudeWorkerSpawn(name)
         const skip = opts.allowBypass ?? bypassPermissionsEnabled()
         if (skip) engineArgv.push('--dangerously-skip-permissions')
+        engineArgv.push(...claudeWorkerArgv(claudeWorker))
         if (opts.model !== undefined) engineArgv.push('--model', validateModel(opts.model))
         if (opts.effort !== undefined) engineArgv.push('--effort', validateEffort(opts.effort))
       }
@@ -536,6 +546,13 @@ export class TerminalSession {
     // Inject text injection-safe — but here the args are all bridge-controlled
     // (constants + validated flags), so this is a normal new-session. The engine
     // binary (or login shell) runs INSIDE the pane; the cwd is set via -c.
+    // `-e` (tmux >= 3.0) sets the new session's environment. Nothing is added
+    // unless a Claude settings file is configured, so an unconfigured host
+    // spawns exactly the argv it always did.
+    const environmentArgv = Object.entries(claudeWorkerEnvironment(claudeWorker)).flatMap(([key, value]) => [
+      '-e',
+      `${key}=${value}`,
+    ])
     await tmux([
       'new-session',
       '-d',
@@ -547,6 +564,7 @@ export class TerminalSession {
       String(PANE_HEIGHT),
       '-c',
       cwd,
+      ...environmentArgv,
       ...engineArgv,
     ])
 

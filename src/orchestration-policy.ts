@@ -28,7 +28,7 @@ import {
 } from "../bridge/model-policy.ts";
 
 /** Bump on any change to the policy text or rules below. */
-export const ORCHESTRATION_POLICY_VERSION = "1.2.0";
+export const ORCHESTRATION_POLICY_VERSION = "1.3.0";
 
 export interface OrchestrationPolicy {
   readonly version: string;
@@ -38,7 +38,9 @@ export interface OrchestrationPolicy {
   readonly sessionDiscipline: readonly string[];
   readonly interruptionModel: readonly string[];
   readonly pollingProtocol: readonly string[];
+  readonly deliveryAmbiguity: readonly string[];
   readonly reconciliation: readonly string[];
+  readonly completionBarrier: readonly string[];
   readonly modelRouting: {
     readonly defaultModel: string;
     readonly rules: readonly string[];
@@ -100,6 +102,12 @@ export const ORCHESTRATION_POLICY: OrchestrationPolicy = {
     "NEVER resend the instruction to a running session. A resend queues a second instruction into a live turn and corrupts the worker's state.",
     "Keep polling with the newest returned cursor until the result reports idle/done. Polling is cheap; a duplicated instruction is not.",
   ],
+  deliveryAmbiguity: [
+    "DELIVERY IS AMBIGUOUS, MEASURED. A send can come back reporting no state change while the instruction DID in fact land in the worker. The absence of an observable change is NOT evidence the prompt was lost.",
+    "So an unacknowledged send is NEVER a reason to resend on its own. Reconcile first: list_sessions for liveness, then poll the SAME session with empty text and the newest cursor, then check the foreman events. Only send again once reconciliation shows the worker never received it.",
+    "A resend that lands on a worker which already had the instruction queues a second instruction into a live turn. That is the failure this rule exists to prevent, and it is worse than waiting.",
+    "A terminal pane whose worker has actually finished can keep reporting `working`, because that state is inferred from outside the worker. Where the host configures Claude's Tandem lifecycle hook, Claude's own Stop ends the turn and this no longer strands it; where it is not configured, the turn stays `working` until you reconcile. Either way, `working` alone never justifies a resend.",
+  ],
   reconciliation: [
     "Tandem work finishes whether or not a foreman is connected. Every real lifecycle transition — a turn completed, a worker blocked or asking a question, a turn interrupted, a session closed, a send that errored — is written to a durable local feed on the host.",
     "At the START of substantial engineering work, and again after ANY interruption, reconnect, new conversation, or context loss: call list_sessions AND get_foreman_events, before opening anything.",
@@ -108,6 +116,14 @@ export const ORCHESTRATION_POLICY: OrchestrationPolicy = {
     "`more: true` is pagination — unread events remain, so call again with the returned checkpoint. `truncated: true` is loss — events you never saw were dropped by retention, or your checkpoint predates the current store — so reconcile against list_sessions rather than assuming a full record.",
     "Each device keeps its own events, recorded where the work ran. Omit `device` for the hub; to cover a fleet, call list_devices and then get_foreman_events once per device. One call never reads more than one device, and an offline device is reported explicitly rather than looking like silence.",
     "This feed is the reconciliation mechanism BECAUSE no MCP server can wake a dormant conversation. Nothing Tandem does will make a chat client resume on its own; you must ask on your next turn.",
+  ],
+  completionBarrier: [
+    "COMPLETION BARRIER. Before you declare an orchestrated engineering task done, or end an orchestration turn on it, reconcile the workers that own the CURRENT task: call list_sessions, and read the foreman events available to you.",
+    "Read the events with get_foreman_events and your checkpoint. If your client's cached tool schema predates that tool, list_sessions also returns a bounded `recent_events` preview of the most recent transitions — enough to see that something finished, never a substitute for the checkpointed feed.",
+    "Never conclude while a worker that owns part of the current task is still running, or has produced a terminal result you have not processed. A `completed`, `blocked`, `needs_input`, `interrupted`, or `error` you have not read is unfinished work, not finished work.",
+    "Process each terminal result before concluding: read the worker's actual output, judge it against the original requirement, and act on it. A `blocked` or `needs_input` left unanswered means the task is stalled, not delivered.",
+    "If a current-task worker is still running, say so plainly and keep polling. Do not report the task complete \"pending the worker\" — that is the report that loses the result.",
+    "This barrier is about the CURRENT task only. An unrelated worker running on another job is not a reason to hold this turn open.",
   ],
   modelRouting: {
     defaultModel: DEFAULT_CLAUDE_MODEL,
@@ -165,7 +181,11 @@ export const ORCHESTRATION_INSTRUCTIONS = [
   bullets(ORCHESTRATION_POLICY.interruptionModel),
   "",
   "POLLING — running + cursor means poll, never resend",
-  bullets(ORCHESTRATION_POLICY.pollingProtocol),
+  bullets([
+    ...ORCHESTRATION_POLICY.pollingProtocol,
+    "Delivery is ambiguous: a send can return with no observable state change even though the instruction landed. Absence of change is NOT evidence it was lost, so never auto-resend on it — reconcile first (list_sessions, an empty-text poll on the newest cursor, the foreman events) and resend only once that shows it never arrived.",
+    "A finished worker's pane can still report `working`, because that state is inferred from outside the worker; Claude's Tandem lifecycle hook ends such a turn where the host configures it. `working` alone never justifies a resend.",
+  ]),
   "",
   "RECONCILE — events are history, list_sessions is liveness",
   bullets([
@@ -173,6 +193,13 @@ export const ORCHESTRATION_INSTRUCTIONS = [
     "get_foreman_events reports what happened while you were away; list_sessions is the only truth about what is still running. Never treat an event as proof a worker is or is not alive.",
     "Keep the returned `checkpoint` and pass it back next time — the server does not remember what you have read.",
     "No MCP server can wake a dormant conversation, so this reconciliation on your next turn is the mechanism, not a fallback.",
+  ]),
+  "",
+  "BEFORE YOU CALL IT DONE — the completion barrier",
+  bullets([
+    "Before declaring an orchestrated task done, or ending an orchestration turn on it: call list_sessions AND read the foreman events, and reconcile both against the workers that own the CURRENT task.",
+    "Never conclude while a current-task worker is still running or has an unprocessed terminal result — a completed/blocked/needs_input/interrupted/error you have not read is unfinished work. Process each against the original requirement first.",
+    "If a worker is still running, say so and keep polling; never report the task done \"pending the worker\". If your cached tool schema predates get_foreman_events, list_sessions also returns a bounded `recent_events` preview.",
   ]),
   "",
   "MODEL ROUTING",
@@ -189,15 +216,15 @@ export const ORCHESTRATION_INSTRUCTIONS = [
 
 export const TOOL_GUIDANCE = {
   listSessions:
-    "ORCHESTRATION: call this BEFORE open_session and reuse a matching live worker instead of opening a duplicate. Call it again first thing after any interruption, reconnect, or new conversation — in-flight Tandem work survives the client stopping, so resume the same worker rather than starting a second one.",
+    "ORCHESTRATION: call this BEFORE open_session and reuse a matching live worker instead of opening a duplicate. Call it again first thing after any interruption, reconnect, or new conversation — in-flight Tandem work survives the client stopping, so resume the same worker rather than starting a second one. Call it AGAIN before you declare an orchestrated task done: never conclude while a worker that owns part of the current task is still running or has a terminal result you have not processed. The additive `recent_events` field previews at most 5 recent transitions, newest first — history, not liveness, and no substitute for get_foreman_events with your own checkpoint.",
   openSession:
     `ORCHESTRATION: list_sessions first and reuse a live worker; a name already live is returned with reused: true rather than opened twice. Never open a session solely to WATCH another one — use list_sessions, cursor polling, and get_foreman_events instead; a read-only health probe is exceptional and must be closed immediately. A separate reviewer session is optional, for work whose risk earns an independent read, and its verdict is evidence for you rather than the merge decision. MODEL: omit model to get the "${DEFAULT_CLAUDE_MODEL}" default (Opus 5) for real engineering work; pick sonnet deliberately for narrow, read-only, or mechanical helpers; haiku only for trivial cases.`,
   sendToSession:
-    'ORCHESTRATION: status "running" with a cursor means the turn is STILL EXECUTING — poll the same session with empty text and that cursor. NEVER resend the instruction to a running session; a resend queues a second instruction into a live turn. Interrupting the client does not stop this turn.',
+    'ORCHESTRATION: status "running" with a cursor means the turn is STILL EXECUTING — poll the same session with empty text and that cursor. NEVER resend the instruction to a running session; a resend queues a second instruction into a live turn. Interrupting the client does not stop this turn. Delivery is ambiguous: a send can return with no observable state change even though the instruction landed, so never auto-resend on that basis — reconcile with list_sessions, an empty-text poll on the newest cursor, and the foreman events first.',
   fableParam:
     `Set true ONLY when the user's current instruction explicitly requested Fable. Never infer it — not from earlier turns, a stored preference, the task's shape, or your own judgement. Required for the "${FABLE_ALIAS}" alias or a "${FABLE_FULL_MODEL_ID}" id; without it the call is rejected (400) and no model is substituted.`,
   foremanEvents:
-    "ORCHESTRATION: call this together with list_sessions when you start substantial engineering work and after any interruption, reconnect, or context loss — before opening a session, so you do not duplicate a worker whose result is already here. This is HISTORY, not liveness: list_sessions says what is running now. Pass the previous call's `checkpoint` as `since` to see each transition once; the server does not track what you have read.",
+    "ORCHESTRATION: call this together with list_sessions when you start substantial engineering work, before you declare an orchestrated task done, and after any interruption, reconnect, or context loss — before opening a session, so you do not duplicate a worker whose result is already here. This is HISTORY, not liveness: list_sessions says what is running now. Pass the previous call's `checkpoint` as `since` to see each transition once; the server does not track what you have read.",
   policyTool:
-    `Read-only. Returns the full versioned Tandem orchestration policy (v${ORCHESTRATION_POLICY_VERSION}): roles (client = foreman and reviewer of record, GitHub = durable truth, Tandem = execution/session bus), review and merge authority, the no-monitoring-session rule, session reuse discipline, the interruption model, the running/cursor polling protocol, event reconciliation, and model routing including the explicit-user-only Fable rule. Opens nothing, changes nothing, and touches no session. The same policy is offered as the MCP initialize instructions; call this when those were not surfaced or when you need the full text.`,
+    `Read-only. Returns the full versioned Tandem orchestration policy (v${ORCHESTRATION_POLICY_VERSION}): roles (client = foreman and reviewer of record, GitHub = durable truth, Tandem = execution/session bus), review and merge authority, the no-monitoring-session rule, session reuse discipline, the interruption model, the running/cursor polling protocol, ambiguous delivery and the never-auto-resend rule, event reconciliation, the completion barrier, and model routing including the explicit-user-only Fable rule. Opens nothing, changes nothing, and touches no session. The same policy is offered as the MCP initialize instructions; call this when those were not surfaced or when you need the full text.`,
 } as const;

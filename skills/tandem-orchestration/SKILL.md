@@ -28,11 +28,12 @@ The general session tools are engine-neutral. The built-in `relay` is intentiona
 4. Use `shell` only when the user explicitly enabled it and the caller is trusted with arbitrary OS-user command execution.
 5. Permission bypass is off by default. Never assume it is enabled. It applies only to Claude and is required only for the unattended Claude relay.
 6. Call `list_sessions` before `open_session`. Reuse the live worker that already owns the task or issue; open a fresh named session only for a genuinely new, independent task or phase with no usable owner. Duplicate workers on one task diverge and fight over the same files.
-7. Never resend a prompt just because a turn is still running. Poll with an empty `text` and the returned cursor.
+7. Never resend a prompt just because a turn is still running. Poll with an empty `text` and the returned cursor. Delivery is ambiguous: a send can return with no observable state change even though the instruction landed, so an unacknowledged send is never on its own a reason to resend.
 8. Interrupting the caller does not stop an in-flight Tandem turn. After any interruption, disconnect, or new conversation, call `list_sessions` AND `get_foreman_events` first, then resume the same worker instead of starting a second one.
 9. Ask before destructive, irreversible, or materially broader actions. Tandem does not grant authority beyond the user's request.
 10. Implementation workers do not self-approve. A worker's account of its own work is not an independent review; the caller acting as foreman is the reviewer of record and the merge authority, and reviews the diff against the original requirement.
 11. Never open a session solely to watch another one. Routine progress comes from `list_sessions`, cursor polling of the session that owns the work, and `get_foreman_events`. A short read-only health probe is exceptional — only when the semantic state itself looks inconsistent or stuck — and is closed immediately afterwards.
+12. Never declare an orchestrated engineering task done, or end an orchestration turn on it, while a worker that owns part of that task is still running or has a terminal result you have not processed. Reconcile first — see "Before you call it done".
 
 ## Review authority
 
@@ -70,6 +71,35 @@ Events are recorded per host: a session driven on a fleet device is recorded on 
 `more: true` is pagination — unread events remain; call again with the returned checkpoint. `truncated: true` is loss — events you never saw were rotated away, or your checkpoint predates the current store.
 
 This is the reconciliation mechanism BECAUSE no MCP server can wake a dormant conversation. Do not tell the user that Tandem will notify their chat when work finishes — it cannot. `TANDEM_NTFY_TOPIC` reaches their phone, not their chat.
+
+## Delivery is ambiguous — never auto-resend
+
+Measured on this transport: **a send can return reporting no state change even though the instruction did land in the worker.** The absence of an observable change is not evidence the prompt was lost.
+
+So an unacknowledged send is never on its own a reason to send again. Reconcile first:
+
+1. `list_sessions` — is the worker still alive?
+2. `send_to_session` with an empty `text` and the newest cursor — did the turn actually start, and what has it produced?
+3. `get_foreman_events` — did it already finish, block, or error?
+
+Send the instruction again only once reconciliation shows it never arrived. A resend that lands on a worker which already had the instruction queues a second instruction into a live turn, which is worse than waiting.
+
+Related, and measured the same way: **a pane whose worker has finished can keep reporting `working`**, because that state is inferred from outside the worker rather than reported by it. Where the host configures Claude's Tandem lifecycle hook, Claude's own `Stop` ends the turn and it is no longer stranded; where it is not configured, the turn stays `working` until you reconcile. Either way, `working` alone never justifies a resend.
+
+## Before you call it done
+
+Before you declare an orchestrated engineering task done — and before you end an orchestration turn on it — reconcile the workers that own the **current** task:
+
+1. `list_sessions` — which of them are still running.
+2. The foreman events available to you — what any of them finished, blocked on, or failed at.
+
+Then: **never conclude while a current-task worker is still running, or has a terminal result you have not processed.** A `completed`, `blocked`, `needs_input`, `interrupted`, or `error` you have not read is unfinished work, not finished work. Read the worker's actual output, judge it against the original requirement, and act on it.
+
+If a worker is still running, say so plainly and keep polling. Do not report the task complete "pending the worker" — that is the report that loses the result.
+
+Read the events with `get_foreman_events` and your own checkpoint. If your client's cached tool schema predates that tool, `list_sessions` also returns a bounded `recent_events` preview of the most recent transitions — enough to notice that something finished, never a substitute for the checkpointed feed.
+
+This barrier is about the current task only. An unrelated worker running on another job is not a reason to hold this turn open.
 
 ## Start every run with the fleet
 
@@ -132,6 +162,8 @@ It opens nothing, changes nothing, and marks nothing as read. Accepts an optiona
 
 Use it to inspect sessions Tandem owns on one device. It is not a process scanner and does not return arbitrary tmux sessions or historical sessions.
 
+Returns `{ sessions, recent_events }`. `sessions` is the liveness truth. `recent_events` is an additive, bounded preview — at most five recent lifecycle transitions, newest first, as `{ version, events, checkpoint, older, counts, note }`, with the same event shape `get_foreman_events` returns. It exists so a conversation whose cached tool schema predates `get_foreman_events` can still see that work finished. It is HISTORY, it takes no checkpoint of yours and cannot be paged, and its `checkpoint` is the store position *at the newest event shown* — handing that to `get_foreman_events` as `since` deliberately skips everything at or before it. Use `get_foreman_events` for complete, once-only history.
+
 ### `send_to_session`
 
 Send one clear assignment at a time. A running result is not a failure. Poll by omitting or emptying `text`, preserving `cursor`, until the turn is idle or the user chooses to interrupt it.
@@ -187,5 +219,6 @@ Tandem is complete for a task only when:
 - the requested outcome exists on the intended device;
 - the result was independently verified;
 - no unresolved failure is hidden behind a running or disconnected session, including a `blocked`, `needs_input`, or `error` event left unread in the foreman feed;
+- the completion barrier above was actually run: `list_sessions` and the available foreman events were reconciled against the workers that own this task, and no current-task worker is still running or unprocessed;
 - sensitive device or authentication data was not exposed;
 - remaining limitations are stated to the user.

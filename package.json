@@ -27,8 +27,12 @@
   "bugs": {
     "url": "https://github.com/Maxmedawar/tandem/issues"
   },
+  "bin": {
+    "tandem-claude-stop-hook": "bin/tandem-claude-stop-hook.mjs"
+  },
   "files": [
     ".env.example",
+    "bin",
     "bridge",
     "docs",
     "src",
@@ -41,12 +45,13 @@
     "SETUP-PROMPT.md"
   ],
   "engines": {
-    "node": ">=22.6"
+    "node": ">=22.13.0 <23 || >=23.4.0"
   },
   "scripts": {
     "start": "node --experimental-strip-types src/server.ts",
     "start:stdio": "node --experimental-strip-types src/stdio-server.ts",
     "start:device": "node --experimental-strip-types src/device-server.ts",
+    "hook:claude-stop": "node bin/tandem-claude-stop-hook.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
